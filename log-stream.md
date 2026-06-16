@@ -148,7 +148,32 @@ if o.SinceTime != "" {
 - `Follow=false` 时，Kubernetes API 不会保持连接，读取完历史数据后立即返回 EOF
 - `readLogs()` 收到 `io.EOF` → emit 残余行 → 返回 `streamEOF`
 - `tailLogs()` goroutine 收到 `streamEOF` 后直接 return，不重试
-- 最终 LogChan 被关闭，Model 层 `updateLogs()` 循环结束
+- 最终 LogChan 被 close，Model 层 `updateLogs()` 读到 channel 关闭后退出循环
+
+**⚠️ 代码事实校准点 1：Head 结束显示的是错误项而非结束提示**
+
+真实事件链：
+1. `readLogs()`（[pod.go#L516-L524](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/dao/pod.go#L516-L524)）遇到 io.EOF 时，除了 emit 残余行，还会主动发送一条 **错误 LogItem**：
+   ```go
+   out <- opts.ToErrLogItem(fmt.Errorf("stream closed: %w for %s", err, opts.Info()))
+   ```
+   这条 LogItem 的 `IsError=true`，渲染时会显示橙色文字（如：`2026-06-17Txx:xx:xx stream closed: EOF for ns/pod (container1)`）
+
+2. `tailLogs()`（[pod.go#L430-L434](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/dao/pod.go#L430-L434)）收到 `streamEOF` 后直接 return，不重试，也**不会向 channel 写入 `dao.ItemEOF` 哨兵值**
+
+3. `wg.Wait()` → `close(out)` 关闭 LogChan
+
+4. Model 层 `updateLogs()`（[model/log.go#L284-L288](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L284-L288)）读 channel 时：
+   - 消费完正常日志行 + 那条错误 LogItem
+   - 最后读到 `ok=false`（channel 关闭），`item` 为 `nil`
+   - 调用 `l.Append(nil)` → 因 `line==nil` 被 `IsEmpty()` 过滤掉，不写入缓冲
+   - 调用 `l.Notify()` 最后一次刷新
+   - goroutine return
+
+**最终显示内容：** 日志末尾是一条**橙色错误提示行**（如 `stream closed: EOF for ...`），而不是 "🏁 Stream exited! No more logs..."。原因：
+- `dao.ItemEOF` 哨兵值在代码中仅被声明（[log_item.go#L13](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/dao/log_item.go#L13)），**没有任何地方将其写入 channel**
+- 因此 `item == dao.ItemEOF` 判断永远为 false，`fireCanceled()`（[model/log.go#L289-L293](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L289-L293)）永远不会被触发
+- 对应的 View 层 `LogCanceled()`（显示"🏁 Stream exited!"）是死代码路径，实际运行中不会被调用
 
 ---
 
@@ -404,7 +429,7 @@ func (l *Log) SetSinceSeconds(ctx context.Context, i int64) {
 
 ## 八、Restart 流程与持续流衔接
 
-### 8.1 Restart 四步曲
+### 8.1 Restart 四步曲（真实事件链校准）
 
 `Restart()`（[model/log.go#L155-L160](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L155-L160)）是所有时间范围/容器切换的统一入口：
 
@@ -412,29 +437,81 @@ func (l *Log) SetSinceSeconds(ctx context.Context, i int64) {
 func (l *Log) Restart(ctx context.Context) {
     l.Stop()          // 1. 停止旧流：调用 cancel() 取消旧 ctx
     l.Clear()         // 2. 清空缓冲：lines 清空，lastSent=0，通知 View Clear
-    l.fireLogResume() // 3. 通知 View 恢复更新：cancelUpdates = false
+    l.fireLogResume() // 3. 通知 View：cancelUpdates = false
     l.Start(ctx)      // 4. 启动新流：重新 load → TailLogs → 建新 goroutine
 }
 ```
 
 **Step 1 - Stop()**：
-- 调用 `cancel()` 设置 `cancelFn()` 取消旧的 context
-- 所有正在运行的 `tailLogs` / `updateLogs` goroutine 收到 `ctx.Done()` 后退出
+- 调用 `cancel()` 设置 `cancelFn()` 取消旧的 context（[model/log.go#L209-L216](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L209-L216)）
+- **⚠️ 代码事实校准点 2：没有 fireLogStop() 方法！** 虽然 `LogsListener` 接口定义了 `LogStop()`（[model/log.go#L32-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L32-L33)），View 层也实现了 `cancelUpdates=true` 的逻辑（[view/log.go#L125-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L125-L132)），但 **Model 层没有 fireLogStop()，LogStop 永远不会被调用**。这意味着 `cancelUpdates` 在 Restart 期间永远不会被设置为 true
 
-**Step 2 - Clear()**：
+**Step 2 - Clear()（真正的隔离机制）**：
 - `l.lines.Clear()` 清空缓冲切片
 - `l.lastSent = 0` 重置增量指针
-- 调用 `fireLogCleared()` 通知 View 清空 TextView
+- 调用 `fireLogCleared()` 通知 View 清空 TextView（[view/log.go#L143-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L143-L147)）
+- **这是新旧流数据真正隔离的关键步骤：Model 缓冲和 View 显示被同时清空**
 
 **Step 3 - fireLogResume()**：
 - 通知 View 层 `LogResume()` → 设置 `cancelUpdates = false`
-- 确保新流的数据不会被丢弃
+- 由于 Step 1 从未设置 cancelUpdates=true，这一步在当前实现中是冗余的
 
 **Step 4 - Start()**：
 - 调用 `load(ctx)` → `Pod.TailLogs()` 启动新的日志流 goroutine
 - 使用新的 `LogOptions`（Head/ SinceSeconds 已更新）
 
-### 8.2 requestOneRefresh：强制刷新标志
+---
+
+### 8.2 旧流残余数据的真实处理（竞态分析）
+
+由于 `LogStop()` 未被触发，`cancelUpdates` 闸门机制实际不生效，旧流数据隔离依赖于以下时序保证：
+
+```
+时间线（从 sinceCmd 被调用开始）：
+
+t0: sinceCmd() 执行
+      ├── l.logs.Clear()             // 先清空 TextView（View 层同步操作）
+      ├── l.requestOneRefresh = true // 强制刷新标志
+      └── 调用 model.Head() / SetSinceSeconds()
+
+t1: Restart() 开始执行
+
+t2: Stop() → cancel() 取消旧 ctx
+      ├── 旧 tailLogs goroutine 下一次 select ctx.Done() 时退出
+      └── 旧 updateLogs goroutine 下一次 select ctx.Done() 时退出
+      * 注意：如果旧 goroutine 正在 Append() 中间，它可能完成这次 Append
+
+t3: Clear() 执行
+      ├── l.lines.Clear()            // 清空 Model 层缓冲（关键隔离点）
+      ├── l.lastSent = 0
+      └── fireLogCleared()           // 通知 View 再次清空 TextView
+
+t4: fireLogResume() → cancelUpdates = false（无效，本来就是 false）
+
+t5: Start() → load() 启动新流 goroutine
+      * 此时新流开始写入已清空的 lines 缓冲
+```
+
+**真实隔离机制总结：**
+
+| 机制 | 实际是否生效 | 说明 |
+|------|-------------|------|
+| `cancel()` 取消旧 ctx | ✅ 生效 | 旧 goroutine 在下一次 select 时快速退出 |
+| `Clear()` 清空 Model 缓冲 | ✅ 生效 | **核心隔离点**，清除所有旧数据 |
+| `fireLogCleared()` 清空 View | ✅ 生效 | 与 Model 清空同步 |
+| `cancelUpdates` 闸门 | ❌ 不生效 | fireLogStop 未实现，标志位永远为 false |
+| `LogStop()` 暂停更新 | ❌ 不生效 | Model 层没有对应的 fire 方法 |
+
+**残余数据竞态窗口：** 极端情况下，`t2` 时刻取消 ctx 后，如果某个旧 `updateLogs` goroutine 恰好在 `Clear()` 之后、新流数据写入之前完成一次 `Append()`，这条旧数据可能会短暂混入缓冲。但由于：
+1. ctx 取消后 goroutine 很快退出
+2. channel 关闭后剩余数据量非常有限（最多 LogBufferSize=50 条）
+3. `Clear()` 之后旧 goroutine 被调度的时间窗口极短
+
+因此在实际运行中极少出现新旧数据混杂。`cancelUpdates` 闸门机制可以看作是**设计意图存在但实现未完成**的代码路径。
+
+---
+
+### 8.3 requestOneRefresh：强制刷新标志
 
 `requestOneRefresh` 是 View 层的关键标志（[log.go#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L53)），解决 head 模式下的显示问题。
 
@@ -469,69 +546,86 @@ func (l *Log) Flush(lines [][]byte) {
 - 如果用户之前关闭了 AutoScroll，正常情况下数据不会被 Flush 出来
 - `requestOneRefresh` 保证切换时间范围后，即使 AutoScroll=off，至少把拉到的历史数据显示一次
 
-### 8.3 Head → Tail 切换的完整衔接
+### 8.4 Head → Tail 切换的完整衔接
 
-从 head（按键 1）切回 tail（按键 0）的完整流程：
+从 head（按键 1）切回 tail（按键 0）的完整流程（按真实事件链校准）：
 
 ```
 用户按键 0
   ↓
 view.sinceCmd(-1)
-  → l.logs.Clear()  // 清空 UI
-  → l.requestOneRefresh = true
+  → l.logs.Clear()                      // t0: 先同步清空 TextView
+  → l.requestOneRefresh = true          // t0: 强制刷新一次（解决 AutoScroll=off）
   → model.SetSinceSeconds(ctx, -1)
-    → opts.SinceSeconds = -1, opts.Head = false
+    → opts.SinceSeconds = -1, opts.Head = false   // 互斥设置
     → Restart(ctx)
-      → Stop() 取消旧 head 流 ctx
-      → Clear() 清空缓冲，通知 View Clear
-      → fireLogResume() 恢复更新
-      → Start(ctx)
-        → load(ctx) → Pod.TailLogs()
-          → ToPodLogOptions() 转换：Follow=true, TailLines=&Lines
-          → 每个容器启动 tailLogs goroutine
-            → req.Stream(ctx) 建立新的 Follow=true 连接
-            → readLogs() 循环读取，持续写入 LogChan
+        ├── Stop() → cancel()
+        │     └── 旧 head 流 ctx 被取消，goroutine 即将退出
+        │     └── ⚠️ 不会触发 fireLogStop → cancelUpdates 仍为 false
+        ├── Clear()
+        │     ├── lines.Clear()         // t3: Model 缓冲清空（核心隔离点）
+        │     ├── lastSent = 0
+        │     └── fireLogCleared()      // t3: TextView 再次清空
+        ├── fireLogResume()             // t4: cancelUpdates = false（冗余）
+        └── Start(ctx)
+              └── load() → Pod.TailLogs()
+                    ├── ToPodLogOptions(): Follow=true, TailLines=&Lines
+                    └── 每个容器启动新 tailLogs goroutine
+                          ├── req.Stream() 建立新 Follow 连接
+                          └── readLogs() 循环读取 → 持续写入新 LogChan
   ↓
-model.updateLogs() 消费新流
-  → Append() 写入环形缓冲
+model.updateLogs()（新 goroutine）
+  → Append() 写入已清空的环形缓冲
   → 50ms 超时或溢出 → Notify()
-  → fireLogChanged(lines)
+  → fireLogBuffChanged(lastSent=0) 全量渲染
   ↓
 view.LogChanged(lines)
-  → QueueUpdateDraw
-  → Flush(lines)：requestOneRefresh=true，即使 AutoScroll=off 也显示
-  → 写入 TextView，follow=true 时 ScrollToEnd()
+  → QueueUpdateDraw 排队到 UI 线程
+  → Flush(lines)
+       ├── requestOneRefresh=true → 绕过 AutoScroll 判断
+       ├── requestOneRefresh=false → 消费标志
+       ├── ansiWriter.Write(lines)
+       └── follow=true → ScrollToEnd()
 ```
 
-### 8.4 cancelUpdates：暂停更新机制
+### 8.5 cancelUpdates：设计意图存在但未完成的闸门
 
-View 层 `cancelUpdates` 标志用于 Restart 期间丢弃旧流的残余数据：
+View 层 `cancelUpdates` 标志（[log.go#L49](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L49)）虽然在代码中存在，但其完整的触发链路是**断裂**的：
 
 ```go
-// Model 层 Stop 时触发
+// View 层 LogStop（存在但永远不会被 Model 调用）
 func (l *Log) LogStop() {
-    l.mx.Lock()
-    defer l.mx.Unlock()
-    l.cancelUpdates = true  // 暂停更新
+    l.cancelUpdates = true   // 闸门关闭（设计意图）
 }
 
-// Model 层 Restart 第三步 fireLogResume 触发
+// View 层 LogResume（Restart 时会被调用）
 func (l *Log) LogResume() {
-    l.mx.Lock()
-    defer l.mx.Unlock()
-    l.cancelUpdates = false  // 恢复更新
+    l.cancelUpdates = false  // 闸门打开（实际会执行，但前提从未为 true）
 }
 
-// Flush 时判断
+// Flush 中的闸门判断（永远不会命中）
 if l.cancelUpdates {
-    return  // 丢弃数据
+    return  // 设计意图：闸门关闭时丢弃旧流数据
 }
 ```
 
-**为什么需要这个机制？**
-- 旧流被 cancel 后，可能还有一些数据在 channel 中未消费
-- 如果不暂停，这些旧数据可能在新流启动后混杂进来
-- `cancelUpdates` 作为一道闸门，确保新旧流数据完全隔离
+**链路断裂点**：
+- `LogsListener` 接口定义了 `LogStop()`（[model/log.go#L32-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L32-L33)）
+- View 层实现了 `LogStop()`，会设置 `cancelUpdates = true`
+- **但 Model 层从未实现 `fireLogStop()` 方法**，也没有任何地方调用 `listener.LogStop()`
+- 全代码库搜索：不存在 `fireLogStop` 字符串
+
+**Flush 的 defer 副作用**（[view/log.go#L350-L354](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L350-L354)）：
+```go
+defer func() {
+    if l.cancelUpdates {
+        l.cancelUpdates = false  // 设计意图：闸门关闭后，至多丢弃一次 Flush
+    }
+}()
+```
+这段逻辑也印证了设计意图：闸门关闭后，允许丢弃至多一次 Flush 的数据（旧流残余），然后自动复位避免卡死。但由于上游触发点缺失，这部分逻辑同样无法生效。
+
+**结论**：`cancelUpdates` / `LogStop` 是一套**设计意图存在但实现未完成**的闸门机制，当前版本中真实的隔离依赖于 `Clear()` 清空缓冲 + `cancel()` 取消 goroutine 的组合。
 
 ---
 
@@ -558,7 +652,7 @@ LogsExtender.logsCmd(prev=true/false)
       → model.AddListener(l) 注册观察者
 ```
 
-### 9.2 时间范围切换（用户按键 0~6）
+### 9.2 时间范围切换（用户按键 0~6）（已校准）
 
 ```
 用户按数字键 N (0~6)
@@ -569,14 +663,17 @@ view.sinceCmd(n)  // n=-1/0/60/300/900/1800/3600
   → n==0 ? model.Head(ctx) : model.SetSinceSeconds(ctx, n)
     → 更新 logOptions.Head / SinceSeconds，互斥设置
     → Restart(ctx) 四步曲
-      ├── Stop() → cancel() 取消旧 ctx → view.LogStop() → cancelUpdates=true
+      ├── Stop() → cancel() 取消旧 ctx
+      │     ⚠️ 没有 fireLogStop → view.LogStop() 不会被调用
+      │     ⚠️ cancelUpdates 不会被设置为 true，闸门机制不生效
       ├── Clear() → 清空 lines、lastSent=0 → fireLogCleared() → UI Clear
-      ├── fireLogResume() → view.LogResume() → cancelUpdates=false
+      │     ✅ 这是新旧数据真正隔离的关键步骤
+      ├── fireLogResume() → view.LogResume() → cancelUpdates=false（冗余）
       └── Start(ctx) → load() → 用新参数重建 tailLogs goroutine
   → l.updateTitle() 更新标题显示当前模式 (tail/head/1m/5m...)
 ```
 
-### 9.3 Head 模式流结束
+### 9.3 Head 模式流结束（已校准：错误项 vs 结束提示）
 
 ```
 head 模式 (Follow=false)
@@ -585,22 +682,30 @@ Kubernetes API 返回 5000 字节后主动关闭连接
   ↓
 readLogs() 收到 io.EOF
   → emit 残余行（如果有）
-  → out <- ToErrLogItem("stream closed")
+  → out <- ToErrLogItem("stream closed: EOF for ns/pod (cont1)")   // ⚠️ 是错误项！
   → return streamEOF
   ↓
 tailLogs() 收到 streamEOF → 直接 return，不重试
+  ⚠️ 不会发送 dao.ItemEOF 到 channel
   ↓
 wg.Wait() → close(out) 关闭 LogChan
   ↓
-model.updateLogs() 收到 channel 关闭
-  → Append(itemEOF) → Notify()
+model.updateLogs() 收到 channel 关闭 ok=false
+  → 先消费完所有已写入 channel 的数据（含错误项）
+  → Append(错误项) ✅ → IsError=true 渲染为橙色文字
+  → 再读时 ok=false，item=nil → Append(nil) ❌ 被 IsEmpty 过滤
+  → Notify() 最后一次刷新
   → 退出 for 循环，goroutine 结束
+  ⚠️ ItemEOF 从未写入 channel，item == dao.ItemEOF 判断永远 false
+  ⚠️ fireCanceled() 不会被调用
   ↓
-model.fireCanceled() → view.LogCanceled()
-  → 显示 "🏁 Stream exited! No more logs..."
+最终显示：
+  ...正常 Head 日志...
+  [橙色] 2026-06-17Txx:xx:xx stream closed: EOF for ns/pod (container1)
+  ⚠️ 不会显示 "🏁 Stream exited! No more logs..."（死代码路径）
 ```
 
-### 9.4 持续流缓冲展示（Tail 模式）
+### 9.4 持续流缓冲展示（Tail 模式）（已校准）
 
 ```
 readLogs() 按行读取 → 写入 LogChan (带背压丢弃)
@@ -617,13 +722,14 @@ readLogs() 按行读取 → 写入 LogChan (带背压丢弃)
   view.LogChanged(lines)
     → QueueUpdateDraw 排队到 UI 线程
     → Flush(lines)
-        ├── 检查 !requestOneRefresh && !AutoScroll && cancelUpdates ?
+        ├── 检查 !requestOneRefresh && !AutoScroll ?
+        │     ⚠️ cancelUpdates 永远为 false，不构成实际判断条件
         ├── 是 → return 丢弃
         └── 否 → ansiWriter.Write(lines) 写入 TextView
             → follow=true ? ScrollToEnd() : 停留在当前位置
 ```
 
-### 9.5 多容器切换（按键 A）
+### 9.5 多容器切换（按键 A）（已校准）
 
 ```
 用户按 A 键
@@ -637,5 +743,9 @@ view.toggleAllContainers()
         ├── 进入多容器：DefaultContainer, Container = Container, ""
         └── 退出多容器：有 DefaultContainer ? Container = DefaultContainer
     → Restart(ctx) 四步曲，重建所有日志流
+        ├── Stop() → cancel() 取消旧 ctx（无 fireLogStop）
+        ├── Clear() → 真正清空 Model 和 View 层数据
+        ├── fireLogResume() → cancelUpdates=false（冗余）
+        └── Start(ctx) → 按新 AllContainers 模式启动 N/M 个 tailLogs goroutine
   → updateTitle()
 ```
