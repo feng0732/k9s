@@ -281,18 +281,58 @@ func (l *Log) Notify() {
 }
 ```
 
-### 4.3 触发 Notify 的两种时机
+### 4.3 触发 Notify 的两种时机（⚠️ 校准点 5：积压行数触发即时刷新永远不会发生）
 
-`updateLogs` 循环（[model/log.go#L281-L308](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L281-L308)）中有两个条件会触发 Notify：
+`updateLogs` 循环（[model/log.go#L281-L308](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L281-L308)）中代码声明了两个条件，但实际上只有一个真正生效：
 
-1. **溢出触发**：当未发送的积压行数超过 `Lines` 阈值时立即刷新
-   ```go
-   overflow = int64(l.lines.Len()-l.lastSent) > l.logOptions.Lines
-   ```
+```go
+case item, ok := <-c:
+    ...
+    l.Append(item)
+    var overflow bool
+    l.mx.RLock()
+    overflow = int64(l.lines.Len()-l.lastSent) > l.logOptions.Lines  // ⚠️ 条件 A
+    l.mx.RUnlock()
+    if overflow {
+        l.Notify()
+    }
+case <-time.After(l.flushTimeout):
+    l.Notify()  // 条件 B：超时兜底，唯一实际生效的
+```
 
-2. **定时触发**：`flushTimeout`（默认 50ms）超时后刷新，保证日志延迟在 50ms 以内
+**条件 A（积压行数 overflow）的数学证明：永远为 false**
 
-这种双条件策略平衡了 **吞吐量**（批量刷新减少 UI 重绘）和 **实时性**（超时兜底保证用户看到最新日志）。
+要理解这个条件为何永远无法满足，需要结合 `Append` 中环形缓冲的长度约束：
+
+```go
+// Append 的逻辑（model/log.go#L246-L262）
+func (l *Log) Append(line *dao.LogItem) {
+    ...
+    if l.lines.Len() < int(l.logOptions.Lines) {
+        l.lines.Add(line)       // 未满时追加，此时 Len < Lines
+        return
+    }
+    l.lines.Shift(line)         // 已满时环形替换，此时 Len == Lines（不改变长度）
+    l.lastSent--
+    if l.lastSent < 0 { l.lastSent = 0 }
+}
+```
+
+| 阶段 | `lines.Len()` 范围 | `lastSent` 最小取值 | 差值 = Len - lastSent | `差值 > Lines`？ |
+|------|-------------------|--------------------|----------------------|-----------------|
+| 缓冲未满阶段 | `0` ~ `Lines-1` | `0` | 最大 `Lines-1` | ❌ 永远 false |
+| 缓冲已满阶段 | `Lines` | `0`（Shift 时 lastSent≥0） | 最大 `Lines` | ❌ `Lines > Lines` 为 false |
+
+**数学上的上界证明**：
+- 缓冲未满时：Len() ≤ Lines-1，lastSent ≥ 0，差值 ≤ Lines-1 → **< Lines**
+- 缓冲已满时：Len() == Lines，lastSent ≥ 0，差值 ≤ Lines → **≤ Lines**，严格大于永远不成立
+- 因此 `int64(l.lines.Len()-l.lastSent) > l.logOptions.Lines` 恒为 false
+
+**条件 B（超时兜底）：唯一真正生效的机制**
+
+只有 `flushTimeout`（默认 50ms）超时路径会触发 Notify，保证日志延迟不超过 50ms。所谓「积压行数触发即时刷新」在代码中虽有声明，但由于环形缓冲的容量限制导致差值上界恰好等于 Lines，严格大于条件无法成立。如果要让积压触发生效，应将 `>` 改为 `>=`，或将阈值改为 `Lines/2` 等更小的值。
+
+**实际表现**：无论日志量多大（即使一秒几千行），UI 刷新率稳定在 ~20Hz（1000ms/50ms），不会因为积压而提升刷新频率。
 
 ### 4.4 续传重连：SinceTime
 
@@ -511,40 +551,79 @@ t5: Start() → load() 启动新流 goroutine
 
 ---
 
-### 8.3 requestOneRefresh：强制刷新标志
+### 8.3 requestOneRefresh：强制刷新标志（真实设置顺序校准）
 
-`requestOneRefresh` 是 View 层的关键标志（[log.go#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L53)），解决 head 模式下的显示问题。
+`requestOneRefresh` 是 View 层的标志（[log.go#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L53)），解决 head/时间范围切换后 AutoScroll=off 时数据不显示的问题。
 
-在 `sinceCmd()` 中设置：
+**⚠️ 校准点 3：真实设置顺序——标志在 Restart 重建流**之后**设置**
+
+`sinceCmd`（[view/log.go#L381-L395](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L381-L395)）的执行顺序：
+
 ```go
-func (l *Log) sinceCmd(n int) func(...) {
-    return func(...) {
-        l.logs.Clear()
-        // ... 调用 model.Head/SetSinceSeconds
-        l.requestOneRefresh = true  // 标记强制刷新一次
+func (l *Log) sinceCmd(n int) func(...) *tcell.EventKey {
+    return func(...) *tcell.EventKey {
+        l.logs.Clear()                       // 第 1 步：同步清空 TextView
+        if n == 0 {
+            l.model.Head(ctx)                // 第 2 步：内部同步调用 Restart()
+        } else {
+            l.model.SetSinceSeconds(ctx, n)  // 第 2 步：内部同步调用 Restart()
+        }
+        // Restart() 此时已经执行完毕（Stop→Clear→fireLogResume→Start→load→TailLogs）
+        // load() 中的 Pod.TailLogs() 已返回，新 goroutine 已启动但尚未收到数据
+        l.requestOneRefresh = true           // 第 3 步：设置强制刷新标志 ★
         l.updateTitle()
+        return nil
     }
 }
 ```
 
-在 `Flush()` 中使用：
+**为什么这个顺序是安全的，第一批内容不会被跳过？**
+
+虽然标志在 Restart 之后才设置，但由于 Restart 内部的异步特性，时间上不会漏：
+
+```
+时间线：
+t0: sinceCmd 开始
+t1:   Clear() - TextView 清空
+t2:   model.Head() 执行 Restart
+t2.1:   Stop() - cancel 旧 ctx
+t2.2:   Clear() - Model 缓冲清空 + fireLogCleared
+t2.3:   fireLogResume()
+t2.4:   Start() - load() - Pod.TailLogs()
+          └── 返回 cc（LogChan slice），为每个 channel 启动 updateLogs goroutine
+          └── tailLogs goroutine 调用 req.Stream() 发起 K8s API 请求
+          └── 此时 API 请求有网络延迟，第一批数据尚未到达
+t3:   requestOneRefresh = true     ★ 标志设置
+t4:   updateTitle()
+t5: sinceCmd 返回（UI 线程释放）
+
+t6: K8s API 响应到达（通常几十 ms ~ 几百 ms 之后）
+t7: tailLogs readLogs() 写入 channel
+t8: updateLogs goroutine 消费 → Append → Notify → fireLogChanged
+t9: view.LogChanged() → QueueUpdateDraw
+t10: Flush() 执行
+       └── requestOneRefresh 此时为 true
+       └── 绕过 !AutoScroll 判断
+       └── 显示第一批数据 ✅
+```
+
+**结论**：虽然代码顺序上标志在 Restart 之后，但由于 K8s API 的固有网络延迟，第一批数据到达时标志早已设置完成，AutoScroll=off 下第一批内容**不会被跳过**。但这是依赖时序的隐式保证，而非代码顺序上的显式保证。
+
+**⚠️ 校准点 4：toggleAllContainers（按键A）未设置 requestOneRefresh，存在漏显示风险**
+
+对比 `toggleAllContainers`（[view/log.go#L397-L406](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L397-L406)）：
+
 ```go
-func (l *Log) Flush(lines [][]byte) {
-    // 关键判断：即使 AutoScroll=false，只要 requestOneRefresh=true 也显示
-    if len(lines) == 0 || (!l.requestOneRefresh && !l.indicator.AutoScroll()) || l.cancelUpdates {
-        return
-    }
-    if l.requestOneRefresh {
-        l.requestOneRefresh = false  // 消费掉标志
-    }
-    // ... 写入 TextView
+func (l *Log) toggleAllContainers(evt *tcell.EventKey) *tcell.EventKey {
+    l.indicator.ToggleAllContainers()
+    l.model.ToggleAllContainers(l.getContext())  // 内部 Restart
+    l.updateTitle()
+    // ⚠️ 没有设置 requestOneRefresh = true！
+    return evt
 }
 ```
 
-**为什么需要这个标志？**
-- head 模式下 `Follow=false`，数据一次性拉取完成后流就结束了
-- 如果用户之前关闭了 AutoScroll，正常情况下数据不会被 Flush 出来
-- `requestOneRefresh` 保证切换时间范围后，即使 AutoScroll=off，至少把拉到的历史数据显示一次
+如果用户此时处于 AutoScroll=off 状态，切换 AllContainers 后新拉取的第一批日志**不会被 Flush 出来**，用户需要手动滚动才能看到内容。这是与 sinceCmd 行为不一致的地方。
 
 ### 8.4 Head → Tail 切换的完整衔接
 
@@ -713,9 +792,10 @@ readLogs() 按行读取 → 写入 LogChan (带背压丢弃)
   model.updateLogs() goroutine 消费 channel
     ├── Append(line) 写入环形缓冲 (Shift 策略)
     │   └── 更新 SinceTime = 最新日志时间戳
-    ├── 检查 overflow = 未发送行数 > Lines 阈值 ?
-    ├── 或 flushTimeout (50ms) 超时 ?
-    └── 满足任一 → Notify()
+    ├── 检查 overflow = (Len-lastSent) > Lines ?
+    │     ⚠️ 数学上恒为 false（环形缓冲导致差值上界 = Lines，严格大于不成立）
+    │     ⚠️ 这条路径永远不会触发 Notify()
+    └── 依赖 flushTimeout (50ms) 超时 → Notify()  ★ 唯一刷新触发点
         ├── fireLogBuffChanged(lastSent) 渲染增量
         └── lastSent = lines.Len() 更新指针
     ↓
