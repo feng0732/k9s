@@ -10,53 +10,77 @@ K9s 的 exec/attach 终端会话采用「外挂 kubectl 二进制 + TUI 挂起�
 
 exec/attach 并非只能从 Pod/Container 列表视图触发，K9s 在多个视图中都暴露了相关入口。
 
-### 1.1 完整入口矩阵
+### 1.1 主路径入口矩阵
 
-| 视图类型 | 视图文件 | 按键 | GVR 类型 | 处理函数 | Feature Gate 依赖 |
-|----------|----------|------|----------|----------|------------------|
-| **Pod 列表** | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L126-L135) | `s` | Pod | [shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L222-L238) | 非只读 |
-| **Pod 列表** | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L126-L135) | `a` | Pod | [attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L240-L256) | 非只读 |
-| **Container 列表** | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L83-L94) | `s` | Container | [shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L158-L181) | 非只读 |
-| **Container 列表** | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L83-L94) | `a` | Container | [attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L183-L194) | 非只读 |
-| **Xray 拓扑图** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L207-L232) | `s` | Pod/Container | [xray.shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362) | 非只读 |
-| **Xray 拓扑图** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L207-L232) | `a` | Pod | [xray.attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L364-L385) | 非只读 |
-| **Node 列表** | [node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L75-L77) | `s` | Node | [sshCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L179-L191) | NodeShell + ShellPod 配置 |
-| **热键/插件** | [actions.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go#L60-L106) | 用户自定义 | 任意 | `gotoCmd` 跳转或直接调用 runK | 插件 Scopes 配置匹配 |
+> **⚠️ 热键/插件不属于 exec/attach 主路径**，详见 1.4 节分析。
 
-### 1.2 Xray 拓扑图入口（资源详情视图）
+| 视图类型 | 视图文件 | 按键 | 节点 GVR 类型 | 处理函数 | Feature Gate 依赖 |
+|----------|----------|------|--------------|----------|------------------|
+| **Pod 列表** | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L126-L135) | `s` | PodGVR | [shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L222-L238) | 非只读 |
+| **Pod 列表** | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L126-L135) | `a` | PodGVR | [attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L240-L256) | 非只读 |
+| **Container 列表** | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L83-L94) | `s` | CoGVR | [shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L158-L181) | 非只读 |
+| **Container 列表** | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L83-L94) | `a` | CoGVR | [attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L183-L194) | 非只读 |
+| **Xray 拓扑图（Pod 节点）** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L214-L232) | `s` | PodGVR | [xray.shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362) | 非只读 |
+| **Xray 拓扑图（Pod 节点）** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L214-L232) | `a` | PodGVR | [xray.attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L364-L385) | 非只读 |
+| **Xray 拓扑图（Container 节点）** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L201-L213) | `s` | CoGVR | [xray.shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362) | 非只读 |
+| **Xray 拓扑图（Container 节点）** | - | `a` | CoGVR | - | **未绑定** |
+| **Node 列表** | [node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L75-L77) | `s` | NodeGVR | [sshCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L179-L191) | NodeShell + ShellPod 配置 |
 
-在 Xray 视图中，当选中 Pod 或 Container 节点时按 `s` 或 `a` 可直接触发终端会话。
+### 1.2 Xray 拓扑图 Pod/Container 节点按键区别（资源详情视图）
 
-**快捷键绑定** [xray.go:207-L232](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L207-L232)：
+**⚠️ 关键区别：Container 节点只有 `s` 键，没有 `a` 键（Attach 根本没绑定）。**
+
+在 Xray 视图中，按键绑定根据当前选中节点的 GVR 类型动态设置：
+
+**快捷键绑定逻辑** [xray.go:198-L233](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L198-L233)：
 ```go
-case client.CoGVR:  // Container GVR
+switch gvr {
+case client.CoGVR:  // 选中 Container 节点时
+    x.Actions().Delete(tcell.KeyEnter)
+    aa.Bulk(ui.KeyMap{
+        ui.KeyL: ui.NewKeyAction("Logs", x.logsCmd(false), true),
+        ui.KeyP: ui.NewKeyAction("Logs Previous", x.logsCmd(true), true),
+    })
     if !x.app.Config.IsReadOnly() {
+        // ⚠️ 只有 s 键（Shell），没有 a 键（Attach）！
         aa.Add(ui.KeyS, ui.NewKeyActionWithOpts("Shell", x.shellCmd,
             ui.ActionOpts{Visible: true, Dangerous: true}))
     }
-case client.PodGVR:  // Pod GVR
+case client.PodGVR:  // 选中 Pod 节点时
+    aa.Bulk(ui.KeyMap{
+        ui.KeyL: ui.NewKeyAction("Logs", x.logsCmd(false), true),
+        ui.KeyP: ui.NewKeyAction("Logs Previous", x.logsCmd(true), true),
+    })
     if !x.app.Config.IsReadOnly() {
+        // ✅ s 键和 a 键都有
         aa.Bulk(ui.KeyMap{
             ui.KeyS: ui.NewKeyActionWithOpts("Shell", x.shellCmd, ...),
             ui.KeyA: ui.NewKeyActionWithOpts("Attach", x.attachCmd, ...),
         })
     }
+}
 ```
 
-**Xray shellCmd 处理流程** [xray.go:340-L362](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362)：
+---
+
+### 1.3 Xray shellCmd/attachCmd 处理逻辑区别
+
+**shellCmd 对 Pod/Container 节点的不同处理** [xray.go:340-L362](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362)：
 ```go
 func (x *Xray) shellCmd(*tcell.EventKey) *tcell.EventKey {
     spec := x.selectedSpec()
-    if spec.Status() != "ok" {  // 检查节点状态是否运行中
+    if spec.Status() != "ok" {
         x.app.Flash().Errf("%s is not in a running state", spec.Path())
         return nil
     }
+
     path, co := spec.Path(), ""
     if spec.GVR() == client.CoGVR {
-        // 若选中的是 Container 节点，需提取父路径作为 Pod 路径
-        _, co = client.Namespaced(spec.Path())
-        path = *spec.ParentPath()
+        // ✅ Container 节点：正确提取 Pod 路径和容器名
+        _, co = client.Namespaced(spec.Path())  // co = 容器名
+        path = *spec.ParentPath()                // path = 父节点 Pod 路径
     }
+    // Pod 节点：path = Pod 路径，co = ""（将弹出容器选择器）
     if err := containerShellIn(x.app, x, path, co); err != nil {
         x.app.Flash().Err(err)
     }
@@ -64,7 +88,101 @@ func (x *Xray) shellCmd(*tcell.EventKey) *tcell.EventKey {
 }
 ```
 
-### 1.3 Node Shell 入口（特殊场景）
+**attachCmd 对 Pod/Container 节点的不同处理** [xray.go:364-L385](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L364-L385)：
+```go
+func (x *Xray) attachCmd(*tcell.EventKey) *tcell.EventKey {
+    spec := x.selectedSpec()
+    if spec.Status() != "ok" { return nil }
+
+    path, co := spec.Path(), ""
+    if spec.GVR() == client.CoGVR {
+        // ⚠️ 这段代码实际上是死代码！
+        // CoGVR 节点根本没有绑定 a 键，永远不会执行到这里
+        // 而且代码有缺陷：只设置 path，没有提取 co！
+        path = *spec.ParentPath()
+        // 缺少：_, co = client.Namespaced(spec.Path())
+    }
+    // Pod 节点：path = Pod 路径，co = ""（将弹出容器选择器）
+    if err := containerAttachIn(x.app, x, path, co); err != nil {
+        x.app.Flash().Err(err)
+    }
+    return nil
+}
+```
+
+**Xray 节点类型与按键行为对比表：**
+
+| 节点类型 | `s` 键（Shell） | `a` 键（Attach） | shellCmd 处理 | attachCmd 处理 |
+|----------|-----------------|-----------------|--------------|----------------|
+| **PodGVR** | ✅ 有绑定 | ✅ 有绑定 | path=Pod路径, co="" → 弹出容器选择器 | path=Pod路径, co="" → 弹出容器选择器 |
+| **CoGVR** | ✅ 有绑定 | ❌ **未绑定** | path=ParentPath, co=容器名 → 直接进入指定容器 | 代码为死代码（且有缺陷） |
+
+---
+
+### 1.4 热键与插件入口分析：不属于 exec/attach 主路径
+
+#### 1.4.1 热键（HotKey）：纯导航，不执行 exec/attach
+
+**代码路径** [actions.go:60-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go#L60-L106)：
+```go
+func hotKeyActions(r Runner, aa *ui.KeyActions) error {
+    // ... 加载 hotkey 配置
+    for k, hk := range hh.HotKey {
+        // ... 环境变量替换
+        command, err := r.EnvFn()().Substitute(hk.Command)
+        aa.Add(key, ui.NewKeyActionWithOpts(
+            hk.Description,
+            gotoCmd(r, command, "", !hk.KeepHistory),  // ⚠️ 只调用 gotoCmd
+            ui.ActionOpts{Shared: true, HotKey: true},
+        ))
+    }
+}
+
+func gotoCmd(r Runner, cmd, path string, clearStack bool) ui.ActionHandler {
+    return func(*tcell.EventKey) *tcell.EventKey {
+        r.App().gotoResource(cmd, path, clearStack, true)  // 纯视图跳转
+        return nil
+    }
+}
+```
+
+**结论**：热键只是调用 `gotoResource()` 进行视图跳转，不直接执行 exec/attach 命令。
+
+#### 1.4.2 插件（Plugin）：通用命令执行，exec/attach 只是其中一种可能
+
+**代码路径** [actions.go:115-L265](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go#L115-L265)：
+
+插件确实会调用 `run()` 进入终端执行流程：
+```go
+func executePlugin(r Runner, p *config.Plugin, inputValues dialog.PluginInputValues) {
+    // ... 参数替换
+    cb := func() {
+        opts := shellOpts{
+            binary:     p.Command,     // ⚠️ 可以是任意命令，不只是 kubectl
+            background: p.Background,
+            pipes:      p.Pipes,
+            args:       args,
+        }
+        suspend, errChan, statusChan := run(r.App(), &opts)  // 调用 run()
+    }
+    // ... 确认对话框
+}
+```
+
+**但插件不属于 exec/attach 主路径的原因：**
+
+| 原因 | 说明 |
+|------|------|
+| **命令不固定** | `p.Command` 可以是 `kubectl`，也可以是 `helm`、`curl` 等任意命令，exec/attach 只是众多可能之一 |
+| **用户自定义** | 插件完全由用户配置，不是 k9s 内置的 exec/attach 流程 |
+| **缺少上下文** | 插件没有 Pod/Container 选择逻辑，完全依赖用户在配置中通过环境变量（如 `$NAMESPACE`、`$NAME`、`$CONTAINER`）构建参数 |
+| **定位不同** | 插件是通用扩展机制，而非专门的 exec/attach 入口 |
+
+**主路径定义**：k9s 内置的、从资源视图按键触发的、包含完整 Pod/Container 上下文选择的 exec/attach 流程才是主路径。
+
+---
+
+### 1.5 Node Shell 入口（特殊场景）
 
 Node 列表的 `s` 键不会直接 exec 到 Node（Node 不是 Pod），而是启动一个**特权 Pod** 来访问节点宿主机。
 
