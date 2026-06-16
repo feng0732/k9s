@@ -109,6 +109,47 @@ default:
 
 **EOF 处理**：遇到 `io.EOF` 时，如果还有残余字节（尾部不完整行），先 emit 出去，再发送一条错误 LogItem，最后返回 `streamEOF`。
 
+### 2.4 Head 模式 vs Tail 模式
+
+`ToPodLogOptions()`（[log_options.go#L83-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/dao/log_options.go#L83-L115)）根据 `LogOptions` 生成 Kubernetes 实际的 `PodLogOptions`，是回看逻辑的核心转换：
+
+| 模式 | Head | SinceSeconds | Follow | TailLines | LimitBytes | 含义 |
+|------|------|--------------|--------|-----------|------------|------|
+| Tail | false | -1 | true | &Lines | nil | 持续跟随最新日志（默认） |
+| Head | true | 0 | false | nil | 5000 | 只拉日志开头 5000 字节，不拉新日志 |
+| 时间范围 | false | >0 | true | &Lines | nil | 拉最近 N 秒的历史日志，之后继续跟随 |
+| 断点续传 | false | 0 | true | &Lines | nil | 从 SinceTime 时间戳开始拉 |
+
+```go
+// Head 模式关键转换
+if o.Head {
+    var maxBytes int64 = 5000
+    opts.Follow = false
+    opts.TailLines, opts.SinceSeconds, opts.SinceTime = nil, nil, nil
+    opts.LimitBytes = &maxBytes
+    return &opts
+}
+
+// SinceSeconds > 0 时间范围
+if o.SinceSeconds != 0 {
+    opts.SinceSeconds, opts.SinceTime = &o.SinceSeconds, nil
+    return &opts
+}
+
+// SinceTime 断点续传
+if o.SinceTime != "" {
+    if t, err := time.Parse(time.RFC3339, o.SinceTime); err == nil {
+        opts.SinceTime = &metav1.Time{Time: t.Add(time.Second)}
+    }
+}
+```
+
+**Head 模式流自动停止机制**：
+- `Follow=false` 时，Kubernetes API 不会保持连接，读取完历史数据后立即返回 EOF
+- `readLogs()` 收到 `io.EOF` → emit 残余行 → 返回 `streamEOF`
+- `tailLogs()` goroutine 收到 `streamEOF` 后直接 return，不重试
+- 最终 LogChan 被关闭，Model 层 `updateLogs()` 循环结束
+
 ---
 
 ## 三、多容器切换机制
@@ -272,35 +313,329 @@ Model 层通过 `fireLogChanged / fireLogCleared / fireLogFailed / fireLogResume
 
 ---
 
-## 六、完整调用链总结
+## 七、历史输出入口与时间范围回看
 
-用户按键查看日志：
+### 7.1 初始入口：LogOptions 构建
+
+有两个入口构建初始 `LogOptions`：
+
+**1. LogsExtender.buildLogOpts()**（[logs_extender.go#L81-L96](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/logs_extender.go#L81-L96)）
+
+从资源列表页（如 Deployment、StatefulSet 列表）按 L/P 键查看日志时调用：
+
+```go
+func (l *LogsExtender) buildLogOpts(path, co string, prevLogs bool) *dao.LogOptions {
+    cfg := l.App().Config.K9s.Logger
+    opts := dao.LogOptions{
+        Path:          path,
+        Container:     co,
+        Lines:         cfg.TailCount,
+        Previous:      prevLogs,
+        ShowTimestamp: cfg.ShowTime,
+        LogBufferSize: cfg.LogBufferSize,
+    }
+    if opts.Container == "" {
+        opts.AllContainers = true  // 未指定容器 → 默认为所有容器
+    }
+    return &opts
+}
+```
+
+**2. podLogOptions()**（[logs_extender.go#L98-L121](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/logs_extender.go#L98-L121)）
+
+从 Pod 详情页查看日志时调用，会优先使用默认容器注解：
+
+```go
+func podLogOptions(app *App, fqn string, prev bool, m *metav1.ObjectMeta, spec *v1.PodSpec) *dao.LogOptions {
+    opts := dao.LogOptions{
+        Path:            fqn,
+        Lines:           cfg.TailCount,
+        SinceSeconds:    cfg.SinceSeconds,  // 配置中的默认时间范围
+        SingleContainer: len(cc) == 1,
+        ShowTimestamp:   cfg.ShowTime,
+        Previous:        prev,
+    }
+    if c, ok := dao.GetDefaultContainer(m, spec); ok {
+        opts.Container, opts.DefaultContainer = c, c
+    } else if len(cc) == 1 {
+        opts.Container = cc[0]
+    } else {
+        opts.AllContainers = true  // 多容器且无默认 → 所有容器
+    }
+    return &opts
+}
+```
+
+### 7.2 按键与时间范围映射
+
+View 层初始化时绑定数字键 0~6（[log.go#L250-L256](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L250-L256)）：
+
+| 按键 | 调用 | 参数 | 模式 |
+|------|------|------|------|
+| `0` | `sinceCmd(-1)` | `SinceSeconds=-1, Head=false` | Tail 模式，跟随最新 |
+| `1` | `sinceCmd(0)` | `Head=true` | Head 模式，只拉开头 5000 字节 |
+| `2` | `sinceCmd(60)` | `SinceSeconds=60` | 最近 1 分钟 + 持续跟随 |
+| `3` | `sinceCmd(300)` | `SinceSeconds=300` | 最近 5 分钟 + 持续跟随 |
+| `4` | `sinceCmd(900)` | `SinceSeconds=900` | 最近 15 分钟 + 持续跟随 |
+| `5` | `sinceCmd(1800)` | `SinceSeconds=1800` | 最近 30 分钟 + 持续跟随 |
+| `6` | `sinceCmd(3600)` | `SinceSeconds=3600` | 最近 1 小时 + 持续跟随 |
+
+### 7.3 Model 层切换入口
+
+**Head()**（[model/log.go#L96-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L96-L101)）：
+```go
+func (l *Log) Head(ctx context.Context) {
+    l.mx.Lock()
+    l.logOptions.Head = true
+    l.mx.Unlock()
+    l.Restart(ctx)  // 重建流
+}
+```
+
+**SetSinceSeconds()**（[model/log.go#L104-L107](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L104-L107)）：
+```go
+func (l *Log) SetSinceSeconds(ctx context.Context, i int64) {
+    l.logOptions.SinceSeconds, l.logOptions.Head = i, false  // 互斥设置
+    l.Restart(ctx)  // 重建流
+}
+```
+
+---
+
+## 八、Restart 流程与持续流衔接
+
+### 8.1 Restart 四步曲
+
+`Restart()`（[model/log.go#L155-L160](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/model/log.go#L155-L160)）是所有时间范围/容器切换的统一入口：
+
+```go
+func (l *Log) Restart(ctx context.Context) {
+    l.Stop()          // 1. 停止旧流：调用 cancel() 取消旧 ctx
+    l.Clear()         // 2. 清空缓冲：lines 清空，lastSent=0，通知 View Clear
+    l.fireLogResume() // 3. 通知 View 恢复更新：cancelUpdates = false
+    l.Start(ctx)      // 4. 启动新流：重新 load → TailLogs → 建新 goroutine
+}
+```
+
+**Step 1 - Stop()**：
+- 调用 `cancel()` 设置 `cancelFn()` 取消旧的 context
+- 所有正在运行的 `tailLogs` / `updateLogs` goroutine 收到 `ctx.Done()` 后退出
+
+**Step 2 - Clear()**：
+- `l.lines.Clear()` 清空缓冲切片
+- `l.lastSent = 0` 重置增量指针
+- 调用 `fireLogCleared()` 通知 View 清空 TextView
+
+**Step 3 - fireLogResume()**：
+- 通知 View 层 `LogResume()` → 设置 `cancelUpdates = false`
+- 确保新流的数据不会被丢弃
+
+**Step 4 - Start()**：
+- 调用 `load(ctx)` → `Pod.TailLogs()` 启动新的日志流 goroutine
+- 使用新的 `LogOptions`（Head/ SinceSeconds 已更新）
+
+### 8.2 requestOneRefresh：强制刷新标志
+
+`requestOneRefresh` 是 View 层的关键标志（[log.go#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L53)），解决 head 模式下的显示问题。
+
+在 `sinceCmd()` 中设置：
+```go
+func (l *Log) sinceCmd(n int) func(...) {
+    return func(...) {
+        l.logs.Clear()
+        // ... 调用 model.Head/SetSinceSeconds
+        l.requestOneRefresh = true  // 标记强制刷新一次
+        l.updateTitle()
+    }
+}
+```
+
+在 `Flush()` 中使用：
+```go
+func (l *Log) Flush(lines [][]byte) {
+    // 关键判断：即使 AutoScroll=false，只要 requestOneRefresh=true 也显示
+    if len(lines) == 0 || (!l.requestOneRefresh && !l.indicator.AutoScroll()) || l.cancelUpdates {
+        return
+    }
+    if l.requestOneRefresh {
+        l.requestOneRefresh = false  // 消费掉标志
+    }
+    // ... 写入 TextView
+}
+```
+
+**为什么需要这个标志？**
+- head 模式下 `Follow=false`，数据一次性拉取完成后流就结束了
+- 如果用户之前关闭了 AutoScroll，正常情况下数据不会被 Flush 出来
+- `requestOneRefresh` 保证切换时间范围后，即使 AutoScroll=off，至少把拉到的历史数据显示一次
+
+### 8.3 Head → Tail 切换的完整衔接
+
+从 head（按键 1）切回 tail（按键 0）的完整流程：
 
 ```
-LogsExtender.logsCmd()
-  → buildLogOpts() 构造 LogOptions
+用户按键 0
+  ↓
+view.sinceCmd(-1)
+  → l.logs.Clear()  // 清空 UI
+  → l.requestOneRefresh = true
+  → model.SetSinceSeconds(ctx, -1)
+    → opts.SinceSeconds = -1, opts.Head = false
+    → Restart(ctx)
+      → Stop() 取消旧 head 流 ctx
+      → Clear() 清空缓冲，通知 View Clear
+      → fireLogResume() 恢复更新
+      → Start(ctx)
+        → load(ctx) → Pod.TailLogs()
+          → ToPodLogOptions() 转换：Follow=true, TailLines=&Lines
+          → 每个容器启动 tailLogs goroutine
+            → req.Stream(ctx) 建立新的 Follow=true 连接
+            → readLogs() 循环读取，持续写入 LogChan
+  ↓
+model.updateLogs() 消费新流
+  → Append() 写入环形缓冲
+  → 50ms 超时或溢出 → Notify()
+  → fireLogChanged(lines)
+  ↓
+view.LogChanged(lines)
+  → QueueUpdateDraw
+  → Flush(lines)：requestOneRefresh=true，即使 AutoScroll=off 也显示
+  → 写入 TextView，follow=true 时 ScrollToEnd()
+```
+
+### 8.4 cancelUpdates：暂停更新机制
+
+View 层 `cancelUpdates` 标志用于 Restart 期间丢弃旧流的残余数据：
+
+```go
+// Model 层 Stop 时触发
+func (l *Log) LogStop() {
+    l.mx.Lock()
+    defer l.mx.Unlock()
+    l.cancelUpdates = true  // 暂停更新
+}
+
+// Model 层 Restart 第三步 fireLogResume 触发
+func (l *Log) LogResume() {
+    l.mx.Lock()
+    defer l.mx.Unlock()
+    l.cancelUpdates = false  // 恢复更新
+}
+
+// Flush 时判断
+if l.cancelUpdates {
+    return  // 丢弃数据
+}
+```
+
+**为什么需要这个机制？**
+- 旧流被 cancel 后，可能还有一些数据在 channel 中未消费
+- 如果不暂停，这些旧数据可能在新流启动后混杂进来
+- `cancelUpdates` 作为一道闸门，确保新旧流数据完全隔离
+
+---
+
+## 九、完整调用链总结
+
+### 9.1 初始查看日志
+
+```
+用户按 L/P 键查看日志
+  ↓
+LogsExtender.logsCmd(prev=true/false)
+  → buildLogOpts() 或 podLogOptions() 构造 LogOptions
+    → 未指定 Container 时 AllContainers=true
+    → 有默认容器注解时 Container/DefaultContainer=注解值
   → NewLog(gvr, opts) 创建 View
   → App.inject() 注入组件
-    → Log.Init(ctx) 初始化 UI、Model、绑定按键
+    → Log.Init(ctx) 初始化 UI、Model、绑定 0~6 数字键
     → Log.Start()
       → model.Start(ctx)
         → load(ctx)
           → Pod.TailLogs(ctx, opts)
-            → 每个容器启动 tailLogs() goroutine
-              → 循环重试：req.Stream() → readLogs() → LogChan
+            → 根据容器数量启动 N 个 tailLogs() goroutine
+              → 指数退避循环重试：req.Stream() → readLogs() → LogChan
       → model.AddListener(l) 注册观察者
+```
 
-日志持续流动：
-  readLogs() 按行读取 → 写入 LogChan
+### 9.2 时间范围切换（用户按键 0~6）
+
+```
+用户按数字键 N (0~6)
+  ↓
+view.sinceCmd(n)  // n=-1/0/60/300/900/1800/3600
+  → l.logs.Clear()  // 清空 TextView
+  → l.requestOneRefresh = true  // 强制刷新一次
+  → n==0 ? model.Head(ctx) : model.SetSinceSeconds(ctx, n)
+    → 更新 logOptions.Head / SinceSeconds，互斥设置
+    → Restart(ctx) 四步曲
+      ├── Stop() → cancel() 取消旧 ctx → view.LogStop() → cancelUpdates=true
+      ├── Clear() → 清空 lines、lastSent=0 → fireLogCleared() → UI Clear
+      ├── fireLogResume() → view.LogResume() → cancelUpdates=false
+      └── Start(ctx) → load() → 用新参数重建 tailLogs goroutine
+  → l.updateTitle() 更新标题显示当前模式 (tail/head/1m/5m...)
+```
+
+### 9.3 Head 模式流结束
+
+```
+head 模式 (Follow=false)
+  ↓
+Kubernetes API 返回 5000 字节后主动关闭连接
+  ↓
+readLogs() 收到 io.EOF
+  → emit 残余行（如果有）
+  → out <- ToErrLogItem("stream closed")
+  → return streamEOF
+  ↓
+tailLogs() 收到 streamEOF → 直接 return，不重试
+  ↓
+wg.Wait() → close(out) 关闭 LogChan
+  ↓
+model.updateLogs() 收到 channel 关闭
+  → Append(itemEOF) → Notify()
+  → 退出 for 循环，goroutine 结束
+  ↓
+model.fireCanceled() → view.LogCanceled()
+  → 显示 "🏁 Stream exited! No more logs..."
+```
+
+### 9.4 持续流缓冲展示（Tail 模式）
+
+```
+readLogs() 按行读取 → 写入 LogChan (带背压丢弃)
     ↓
   model.updateLogs() goroutine 消费 channel
-    → Append() 写入环形缓冲
-    → 溢出或 50ms 超时 → Notify()
-    → fireLogBuffChanged(lastSent)
-    → fireLogChanged(lines)
+    ├── Append(line) 写入环形缓冲 (Shift 策略)
+    │   └── 更新 SinceTime = 最新日志时间戳
+    ├── 检查 overflow = 未发送行数 > Lines 阈值 ?
+    ├── 或 flushTimeout (50ms) 超时 ?
+    └── 满足任一 → Notify()
+        ├── fireLogBuffChanged(lastSent) 渲染增量
+        └── lastSent = lines.Len() 更新指针
     ↓
   view.LogChanged(lines)
     → QueueUpdateDraw 排队到 UI 线程
-    → Flush(lines) 写入 ANSIWriter
-    → follow=true 时 ScrollToEnd()
+    → Flush(lines)
+        ├── 检查 !requestOneRefresh && !AutoScroll && cancelUpdates ?
+        ├── 是 → return 丢弃
+        └── 否 → ansiWriter.Write(lines) 写入 TextView
+            → follow=true ? ScrollToEnd() : 停留在当前位置
+```
+
+### 9.5 多容器切换（按键 A）
+
+```
+用户按 A 键
+  ↓
+view.toggleAllContainers()
+  → indicator.ToggleAllContainers() 更新 UI 显示
+  → model.ToggleAllContainers(ctx)
+    → LogOptions.ToggleAllContainers()
+        ├── SingleContainer ? return 不允许切换
+        ├── AllContainers = !AllContainers
+        ├── 进入多容器：DefaultContainer, Container = Container, ""
+        └── 退出多容器：有 DefaultContainer ? Container = DefaultContainer
+    → Restart(ctx) 四步曲，重建所有日志流
+  → updateTitle()
 ```
