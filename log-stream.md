@@ -551,65 +551,63 @@ t5: Start() → load() 启动新流 goroutine
 
 ---
 
-### 8.3 requestOneRefresh：强制刷新标志（真实设置顺序校准）
+### 8.3 requestOneRefresh：强制刷新标志（真实执行顺序校准）
 
 `requestOneRefresh` 是 View 层的标志（[log.go#L53](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L53)），解决 head/时间范围切换后 AutoScroll=off 时数据不显示的问题。
 
-**⚠️ 校准点 3：真实设置顺序——标志在 Restart 重建流**之后**设置**
+**⚠️ 校准点 3（修正）：标志在 Restart 之后设置，但由 tview 串行主循环保证安全性**
 
 `sinceCmd`（[view/log.go#L381-L395](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L381-L395)）的执行顺序：
 
 ```go
 func (l *Log) sinceCmd(n int) func(...) *tcell.EventKey {
     return func(...) *tcell.EventKey {
-        l.logs.Clear()                       // 第 1 步：同步清空 TextView
+        l.logs.Clear()                       // ① 同步清空 TextView
         if n == 0 {
-            l.model.Head(ctx)                // 第 2 步：内部同步调用 Restart()
+            l.model.Head(ctx)                // ② 同步调用 Restart()
         } else {
-            l.model.SetSinceSeconds(ctx, n)  // 第 2 步：内部同步调用 Restart()
+            l.model.SetSinceSeconds(ctx, n)  // ② 同步调用 Restart()
         }
-        // Restart() 此时已经执行完毕（Stop→Clear→fireLogResume→Start→load→TailLogs）
-        // load() 中的 Pod.TailLogs() 已返回，新 goroutine 已启动但尚未收到数据
-        l.requestOneRefresh = true           // 第 3 步：设置强制刷新标志 ★
+        l.requestOneRefresh = true           // ③ 设置标志 ★
         l.updateTitle()
         return nil
     }
 }
 ```
 
-**为什么这个顺序是安全的，第一批内容不会被跳过？**
+**之前的错误结论**：标志在 Restart 之后设置，依赖 K8s API 网络延迟保证安全性（「隐式保证」）。
 
-虽然标志在 Restart 之后才设置，但由于 Restart 内部的异步特性，时间上不会漏：
+**正确结论**：安全性由 tview 串行主循环保证，与网络延迟无关。原因如下：
+
+tview 运行模型中所有 UI 操作都在同一个 goroutine（主循环）上串行执行：
+- `sinceCmd` 是按键回调，在主循环上执行
+- `LogChanged` 通过 `QueueUpdateDraw`（[app.go#L75-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/ui/app.go#L75-L82)）将 `Flush` 回调排队到主循环
+- 主循环是串行的：**必须等 sinceCmd 返回后，才会从队列中取出 QueueUpdateDraw 的回调执行**
 
 ```
-时间线：
-t0: sinceCmd 开始
-t1:   Clear() - TextView 清空
-t2:   model.Head() 执行 Restart
-t2.1:   Stop() - cancel 旧 ctx
-t2.2:   Clear() - Model 缓冲清空 + fireLogCleared
-t2.3:   fireLogResume()
-t2.4:   Start() - load() - Pod.TailLogs()
-          └── 返回 cc（LogChan slice），为每个 channel 启动 updateLogs goroutine
-          └── tailLogs goroutine 调用 req.Stream() 发起 K8s API 请求
-          └── 此时 API 请求有网络延迟，第一批数据尚未到达
-t3:   requestOneRefresh = true     ★ 标志设置
-t4:   updateTitle()
-t5: sinceCmd 返回（UI 线程释放）
+tview 主循环（单线程串行）时间线：
 
-t6: K8s API 响应到达（通常几十 ms ~ 几百 ms 之后）
-t7: tailLogs readLogs() 写入 channel
-t8: updateLogs goroutine 消费 → Append → Notify → fireLogChanged
-t9: view.LogChanged() → QueueUpdateDraw
-t10: Flush() 执行
-       └── requestOneRefresh 此时为 true
+[主循环正在执行 sinceCmd 按键回调]
+  ① l.logs.Clear()
+  ② model.Head() → Restart() → Stop → Clear → Start
+       └── load() 启动新 goroutine（非阻塞，立即返回）
+       └── 新 updateLogs goroutine 可能在后台运行
+       └── 如果数据已到达，fireLogChanged → LogChanged
+           → QueueUpdateDraw(Flush) ← 排入队列，但不会立即执行！
+  ③ l.requestOneRefresh = true    ★ 标志设置
+  ④ l.updateTitle()
+  ⑤ return nil → sinceCmd 返回
+
+[主循环取出队列中的回调]
+  ⑥ Flush(lines) 执行
+       └── requestOneRefresh 此时已是 true ✅
        └── 绕过 !AutoScroll 判断
-       └── 显示第一批数据 ✅
+       └── 写入第一批数据
 ```
 
-**结论**：虽然代码顺序上标志在 Restart 之后，但由于 K8s API 的固有网络延迟，第一批数据到达时标志早已设置完成，AutoScroll=off 下第一批内容**不会被跳过**。但这是依赖时序的隐式保证，而非代码顺序上的显式保证。
+**结论**：`requestOneRefresh` 的安全性**不依赖**网络延迟的时序假设，而是由 tview 主循环的串行执行模型保证：按键回调返回前，`QueueUpdateDraw` 排队的回调不会执行。无论数据多快到达，`Flush` 必定在 `requestOneRefresh = true` 之后执行。
 
-**⚠️ 校准点 4：toggleAllContainers（按键A）未设置 requestOneRefresh，存在漏显示风险**
+**⚠️ 校准点 4：toggleAllContainers（按键A）未设置 requestOneRefresh，AutoScroll=off 时确实存在漏显示**
 
 对比 `toggleAllContainers`（[view/log.go#L397-L406](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L397-L406)）：
 
@@ -623,47 +621,72 @@ func (l *Log) toggleAllContainers(evt *tcell.EventKey) *tcell.EventKey {
 }
 ```
 
-如果用户此时处于 AutoScroll=off 状态，切换 AllContainers 后新拉取的第一批日志**不会被 Flush 出来**，用户需要手动滚动才能看到内容。这是与 sinceCmd 行为不一致的地方。
+`Flush` 的判断逻辑（[view/log.go#L356-L358](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L356-L358)）：
+```go
+if len(lines) == 0 || (!l.requestOneRefresh && !l.indicator.AutoScroll()) || l.cancelUpdates {
+    return
+}
+```
+
+当 AutoScroll=off 且 requestOneRefresh=false 时，Flush 直接 return，新数据不会被写入 TextView。
+
+**但实际风险程度需要区分两个变量**：
+
+| 变量 | 控制什么 | 谁来设置 |
+|------|---------|---------|
+| `l.follow` | Flush 后是否 ScrollToEnd() | `toggleAutoScrollCmd`（按键 S） |
+| `l.indicator.AutoScroll()` | Flush 是否跳过 | `toggleAutoScrollCmd`（按键 S） |
+
+两者在 `toggleAutoScrollCmd` 中同步更新（[view/log.go#L511-L512](file:///d:/fz/0601-2/solo-dogfeeding/code/2-k9s/internal/view/log.go#L511-L512)）：
+```go
+l.indicator.ToggleAutoScroll()
+l.follow = l.indicator.AutoScroll()
+```
+
+当 AutoScroll=off 时：
+- `Flush` 中 `!l.indicator.AutoScroll() == true`，且 `!l.requestOneRefresh == true`（toggleAllContainers 不设置此标志）
+- **Flush 直接 return，所有新数据被丢弃**
+- 用户只能通过按 S 重新开启 AutoScroll，或手动滚动来看到数据
+- 这与 sinceCmd（按键 0~6）的行为不一致：sinceCmd 会设置 requestOneRefresh 绕过一次判断
 
 ### 8.4 Head → Tail 切换的完整衔接
 
 从 head（按键 1）切回 tail（按键 0）的完整流程（按真实事件链校准）：
 
 ```
-用户按键 0
+用户按键 0 → tview 主循环执行 sinceCmd
   ↓
-view.sinceCmd(-1)
-  → l.logs.Clear()                      // t0: 先同步清空 TextView
-  → l.requestOneRefresh = true          // t0: 强制刷新一次（解决 AutoScroll=off）
-  → model.SetSinceSeconds(ctx, -1)
-    → opts.SinceSeconds = -1, opts.Head = false   // 互斥设置
+view.sinceCmd(-1)                              // 在 tview 主循环上
+  ① l.logs.Clear()                             // 同步清空 TextView
+  ② model.SetSinceSeconds(ctx, -1)
+    → opts.SinceSeconds = -1, opts.Head = false // 互斥设置
     → Restart(ctx)
         ├── Stop() → cancel()
-        │     └── 旧 head 流 ctx 被取消，goroutine 即将退出
+        │     └── 旧 head 流 ctx 被取消
         │     └── ⚠️ 不会触发 fireLogStop → cancelUpdates 仍为 false
         ├── Clear()
-        │     ├── lines.Clear()         // t3: Model 缓冲清空（核心隔离点）
+        │     ├── lines.Clear()                 // Model 缓冲清空（核心隔离点）
         │     ├── lastSent = 0
-        │     └── fireLogCleared()      // t3: TextView 再次清空
-        ├── fireLogResume()             // t4: cancelUpdates = false（冗余）
+        │     └── fireLogCleared()              // TextView 再次清空
+        ├── fireLogResume()                     // cancelUpdates = false（冗余）
         └── Start(ctx)
-              └── load() → Pod.TailLogs()
+              └── load() → Pod.TailLogs()       // 非阻塞，新 goroutine 后台启动
                     ├── ToPodLogOptions(): Follow=true, TailLines=&Lines
                     └── 每个容器启动新 tailLogs goroutine
-                          ├── req.Stream() 建立新 Follow 连接
-                          └── readLogs() 循环读取 → 持续写入新 LogChan
-  ↓
-model.updateLogs()（新 goroutine）
+  ③ l.requestOneRefresh = true                 ★ 标志设置（在 sinceCmd 返回前）
+  ④ l.updateTitle()
+  ⑤ return nil → sinceCmd 返回，主循环释放
+
+[后台 goroutine] model.updateLogs()
   → Append() 写入已清空的环形缓冲
-  → 50ms 超时或溢出 → Notify()
+  → 50ms 超时 → Notify()（overflow 路径恒为 false，不触发）
   → fireLogBuffChanged(lastSent=0) 全量渲染
-  ↓
-view.LogChanged(lines)
-  → QueueUpdateDraw 排队到 UI 线程
+
+[主循环从队列取出回调] view.LogChanged → QueueUpdateDraw
   → Flush(lines)
-       ├── requestOneRefresh=true → 绕过 AutoScroll 判断
+       ├── requestOneRefresh=true → 绕过 !AutoScroll 判断 ✅
        ├── requestOneRefresh=false → 消费标志
-       ├── ansiWriter.Write(lines)
+       ├── ansiWriter.Write(lines) 写入 TextView
        └── follow=true → ScrollToEnd()
 ```
 
@@ -734,22 +757,29 @@ LogsExtender.logsCmd(prev=true/false)
 ### 9.2 时间范围切换（用户按键 0~6）（已校准）
 
 ```
-用户按数字键 N (0~6)
+用户按数字键 N (0~6) → tview 主循环执行 sinceCmd
   ↓
 view.sinceCmd(n)  // n=-1/0/60/300/900/1800/3600
-  → l.logs.Clear()  // 清空 TextView
-  → l.requestOneRefresh = true  // 强制刷新一次
-  → n==0 ? model.Head(ctx) : model.SetSinceSeconds(ctx, n)
+  ① l.logs.Clear()  // 清空 TextView
+  ② n==0 ? model.Head(ctx) : model.SetSinceSeconds(ctx, n)
     → 更新 logOptions.Head / SinceSeconds，互斥设置
     → Restart(ctx) 四步曲
       ├── Stop() → cancel() 取消旧 ctx
-      │     ⚠️ 没有 fireLogStop → view.LogStop() 不会被调用
-      │     ⚠️ cancelUpdates 不会被设置为 true，闸门机制不生效
+      │     ⚠️ 没有 fireLogStop → cancelUpdates 不会被设置为 true
       ├── Clear() → 清空 lines、lastSent=0 → fireLogCleared() → UI Clear
       │     ✅ 这是新旧数据真正隔离的关键步骤
       ├── fireLogResume() → view.LogResume() → cancelUpdates=false（冗余）
       └── Start(ctx) → load() → 用新参数重建 tailLogs goroutine
-  → l.updateTitle() 更新标题显示当前模式 (tail/head/1m/5m...)
+           └── 非阻塞：新 goroutine 在后台启动
+  ③ l.requestOneRefresh = true   ★ 在 sinceCmd 返回前设置
+  ④ l.updateTitle() 更新标题显示当前模式 (tail/head/1m/5m...)
+  ⑤ return nil → sinceCmd 返回，主循环释放
+
+[主循环从队列取出 QueueUpdateDraw 回调]
+  ⑥ Flush(lines) 执行
+       └── requestOneRefresh 此时已是 true ✅（tview 串行主循环保证）
+       └── 绕过 !AutoScroll 判断
+       └── 写入数据
 ```
 
 ### 9.3 Head 模式流结束（已校准：错误项 vs 结束提示）
@@ -799,8 +829,10 @@ readLogs() 按行读取 → 写入 LogChan (带背压丢弃)
         ├── fireLogBuffChanged(lastSent) 渲染增量
         └── lastSent = lines.Len() 更新指针
     ↓
-  view.LogChanged(lines)
-    → QueueUpdateDraw 排队到 UI 线程
+  view.LogChanged(lines)                         // 在 updateLogs goroutine 上
+    → QueueUpdateDraw(func(){ Flush(lines) })    // 排队到 tview 主循环
+    ↓
+  [tview 主循环取出回调]
     → Flush(lines)
         ├── 检查 !requestOneRefresh && !AutoScroll ?
         │     ⚠️ cancelUpdates 永远为 false，不构成实际判断条件
@@ -812,7 +844,7 @@ readLogs() 按行读取 → 写入 LogChan (带背压丢弃)
 ### 9.5 多容器切换（按键 A）（已校准）
 
 ```
-用户按 A 键
+用户按 A 键 → tview 主循环执行 toggleAllContainers
   ↓
 view.toggleAllContainers()
   → indicator.ToggleAllContainers() 更新 UI 显示
@@ -822,10 +854,13 @@ view.toggleAllContainers()
         ├── AllContainers = !AllContainers
         ├── 进入多容器：DefaultContainer, Container = Container, ""
         └── 退出多容器：有 DefaultContainer ? Container = DefaultContainer
-    → Restart(ctx) 四步曲，重建所有日志流
+    → Restart(ctx) 四步曲
         ├── Stop() → cancel() 取消旧 ctx（无 fireLogStop）
         ├── Clear() → 真正清空 Model 和 View 层数据
         ├── fireLogResume() → cancelUpdates=false（冗余）
         └── Start(ctx) → 按新 AllContainers 模式启动 N/M 个 tailLogs goroutine
   → updateTitle()
+  ⚠️ 没有设置 requestOneRefresh = true
+  ⚠️ 如果 AutoScroll=off，后续 Flush 会 return，新数据不显示
+  ⚠️ 需要用户按 S 开启 AutoScroll 或手动滚动才能看到内容
 ```
