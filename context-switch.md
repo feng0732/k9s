@@ -148,7 +148,7 @@ func (a *APIClient) SwitchContext(name string) error {
 }
 ```
 
-### 4.1 `Config.SwitchContext` — 重建 ConfigFlags
+### 4.1 `Config.SwitchContext` — 重建 ConfigFlags（**无锁**）
 
 文件：[config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/config.go#L91-L111)
 
@@ -158,12 +158,9 @@ func (c *Config) SwitchContext(name string) error {
     if err != nil {
         return fmt.Errorf("context %q does not exist", name)
     }
-
-    // 创建全新的 ConfigFlags，设置新的 Context 和 ClusterName
+    // !!BOZO!! Do you need to reset the flags?
     flags := genericclioptions.NewConfigFlags(UsePersistentConfig)
     flags.Context, flags.ClusterName = &name, &ct.Cluster
-
-    // 保留原有的 Namespace、Timeout、KubeConfig、Impersonate 等设置
     flags.Namespace = c.flags.Namespace
     flags.Timeout = c.flags.Timeout
     flags.KubeConfig = c.flags.KubeConfig
@@ -173,47 +170,97 @@ func (c *Config) SwitchContext(name string) error {
     flags.Insecure = c.flags.Insecure
     flags.BearerToken = c.flags.BearerToken
 
-    c.flags = flags
+    c.flags = flags   // ❌ 直接赋值指针，无 Config.mx 保护
+
     return nil
 }
 ```
 
-**关键设计**：不是修改现有 flags，而是 `NewConfigFlags(UsePersistentConfig=true)` 创建全新实例。`UsePersistentConfig=true` 表示使用持久化配置缓存，避免反复加载 kubeconfig 文件。
+**锁边界事实**：整个 `SwitchContext` 方法 **完全没有持有 `Config.mx`**。`c.flags = flags` 是裸指针替换。同样：
+- 读取 `c.flags.Namespace` / `c.flags.Timeout` 等字段也是**裸读**
+- 唯一使用 `Config.mx` 的方法是 `ConfigAccess()`（RLock）和...没有其他方法了
 
-### 4.2 `APIClient.reset` — 彻底清空
+`Config.mx` 这个 RWMutex 几乎是虚设的：在整个文件中，只有 `ConfigAccess()` 方法加了 `RLock`（[config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/config.go#L348-L349)），其他所有读写 `c.flags` 的地方都没有锁。
+
+**为什么当前安全**：`Config.SwitchContext` 只在 `APIClient.SwitchContext` 中调用，而后者在 `useContext → App.switchContext` 流程中被调用。因为 `Halt()` 先停止了所有后台 goroutine，所以此时没有其他线程在并发读取 `flags`。但这是**时序上的安全**，不是**锁的保护**。如果未来有任何 goroutine 在切换期间读取 `c.flags`（例如通过 `config.CurrentContextName()`），会有数据竞态。
+
+### 4.2 `APIClient.reset` — 逐字段锁边界分析
 
 文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L588-L599)
 
 ```go
 func (a *APIClient) reset() {
-    a.config.reset()                         // Config.reset() 是空操作
-    a.cache = cache.NewLRUExpireCache(cacheSize)  // 重建 LRU 缓存
-    a.nsClient = nil                         // 清空 Namespace 客户端
+    a.config.reset()                         // 空函数
+    a.cache = cache.NewLRUExpireCache(cacheSize)  // ❌ 直接替换指针，无 APIClient.mx
+    a.nsClient = nil                         // ❌ 直接赋值，无 APIClient.mx
 
-    a.setDClient(nil)                        // 清空 Dynamic 客户端
-    a.setMxsClient(nil)                      // 清空 Metrics 客户端
-    a.setCachedClient(nil)                   // 清空 Discovery 缓存客户端
-    a.setClient(nil)                         // 清空 Kubernetes 客户端
-    a.setLogClient(nil)                      // 清空 Log 客户端
-    a.setConnOK(true)                        // 重置连接状态
+    a.setDClient(nil)                        // ✅ setDClient 内有 APIClient.mx.Lock
+    a.setMxsClient(nil)                      // ✅ setMxsClient 内有 APIClient.mx.Lock
+    a.setCachedClient(nil)                   // ✅ setCachedClient 内有 APIClient.mx.Lock
+    a.setClient(nil)                         // ✅ setClient 内有 APIClient.mx.Lock
+    a.setLogClient(nil)                      // ✅ setLogClient 内有 APIClient.mx.Lock
+    a.setConnOK(true)                        // ✅ setConnOK 内有 APIClient.mx.Lock
 }
 ```
 
-**重建的对象一览**：
+**逐字段对比表（reset 中）**：
 
-| 字段 | 类型 | 作用 | reset 处理 |
-|------|------|------|------------|
-| `client` | `kubernetes.Interface` | 标准 K8s 客户端 | 置 nil |
-| `logClient` | `kubernetes.Interface` | 日志专用客户端（无超时） | 置 nil |
-| `dClient` | `dynamic.Interface` | 动态客户端（CRD等） | 置 nil |
-| `nsClient` | `dynamic.NamespaceableResourceInterface` | NS 资源客户端 | 置 nil |
-| `mxsClient` | `*versioned.Clientset` | Metrics 客户端 | 置 nil |
-| `cachedClient` | `*disk.CachedDiscoveryClient` | Discovery 缓存客户端 | 置 nil |
-| `cache` | `*cache.LRUExpireCache` | LRU 缓存（CanI、NS等） | 重建新实例 |
+| 字段 | 处理方式 | 经过 APIClient.mx？ | 说明 |
+|------|----------|---------------------|------|
+| `config` | `a.config.reset()` — 空 | — | 不在 reset 中替换，在 SwitchContext 第 577 行单独替换 |
+| `cache` | `a.cache = New...` | ❌ **直接替换，无锁** | 新指针替换旧指针 |
+| `nsClient` | `a.nsClient = nil` | ❌ **直接赋值，无锁** | 死代码：整个项目从未读取过此字段（[client.go:591](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L591) 是唯一引用） |
+| `dClient` | `setDClient(nil)` | ✅ `mx.Lock` → 赋值 → `Unlock` |  |
+| `mxsClient` | `setMxsClient(nil)` | ✅ `mx.Lock` → 赋值 → `Unlock` |  |
+| `cachedClient` | `setCachedClient(nil)` | ✅ `mx.Lock` → 赋值 → `Unlock` |  |
+| `client` | `setClient(nil)` | ✅ `mx.Lock` → 赋值 → `Unlock` |  |
+| `logClient` | `setLogClient(nil)` | ✅ `mx.Lock` → 赋值 → `Unlock` |  |
+| `connOK` | `setConnOK(true)` | ✅ `mx.Lock` → 赋值 → `Unlock` |  |
 
-所有客户端均采用**懒初始化**模式：reset 时只清空，首次 Dial 时才重建。`reset()` 后所有字段为 nil/空，下一次 `Dial()`/`DynDial()`/`CachedDiscovery()` 等调用会根据新的 `config.flags` 重新创建。
+### 4.3 `APIClient.SwitchContext` 逐行锁边界
 
-### 4.3 `CheckConnectivity` — 连通性检查与客户端预热
+文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L570-L586)
+
+```go
+func (a *APIClient) SwitchContext(name string) error {
+    slog.Debug("Switching context", slogs.Context, name)
+    if err := a.config.SwitchContext(name); err != nil {
+        return err                    // 内部 ❌ 无 Config.mx
+    }
+    a.reset()                         // 内部：cache/nsClient ❌ 无锁；其他 ✅ mx.Lock
+    ResetMetrics()                    // 全局变量 MetricsDial = nil ❌ 无任何锁
+    a.config = NewConfig(a.config.flags) // ❌ 直接替换 a.config 指针，无 APIClient.mx
+    if !a.CheckConnectivity() {       // 内部：setClient/setConnOK ✅ mx.Lock
+        slog.Warn("SwitchContext: connectivity check failed", slogs.Context, name)
+    }
+
+    if _, err := a.DynDial(); err != nil {  // DynDial: getDClient ✅ RLock；setDClient ✅ Lock
+        slog.Warn("SwitchContext: DynDial pre-warm failed", slogs.Error, err)
+    }
+    return a.invalidateCache()              // CachedDiscovery: getCachedClient ✅ RLock
+}
+```
+
+**SwitchContext 全流程逐字段锁追踪**：
+
+| 步骤 | 操作 | 涉及字段 | 锁保护 |
+|------|------|----------|--------|
+| 1 | `config.SwitchContext(name)` | `Config.flags` 指针 | ❌ 无 Config.mx |
+| 2.1 | `reset() → cache = New` | `APIClient.cache` 指针 | ❌ 无 APIClient.mx |
+| 2.2 | `reset() → nsClient = nil` | `APIClient.nsClient` | ❌ 无 APIClient.mx（死代码） |
+| 2.3 | `reset() → setDClient(nil)` | `APIClient.dClient` | ✅ `APIClient.mx.Lock` |
+| 2.4 | `reset() → setMxsClient(nil)` | `APIClient.mxsClient` | ✅ `APIClient.mx.Lock` |
+| 2.5 | `reset() → setCachedClient(nil)` | `APIClient.cachedClient` | ✅ `APIClient.mx.Lock` |
+| 2.6 | `reset() → setClient(nil)` | `APIClient.client` | ✅ `APIClient.mx.Lock` |
+| 2.7 | `reset() → setLogClient(nil)` | `APIClient.logClient` | ✅ `APIClient.mx.Lock` |
+| 2.8 | `reset() → setConnOK(true)` | `APIClient.connOK` | ✅ `APIClient.mx.Lock` |
+| 3 | `ResetMetrics()` | 全局 `MetricsDial` 指针 | ❌ 全局变量无锁 |
+| 4 | `a.config = NewConfig(...)` | `APIClient.config` 指针 | ❌ 无 APIClient.mx |
+| 5 | `CheckConnectivity()` | `APIClient.client`, `connOK`, `cache` | client/connOK ✅；cache ❌ |
+| 6 | `DynDial()` | `APIClient.dClient` | ✅ `getDClient(RLock)` → 创建 → `setDClient(Lock)` |
+| 7 | `invalidateCache()` | `APIClient.cachedClient` | ✅ `getCachedClient(RLock)` |
+
+### 4.4 `CheckConnectivity` 逐行锁边界
 
 文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L307-L342)
 
@@ -221,76 +268,153 @@ func (a *APIClient) reset() {
 func (a *APIClient) CheckConnectivity() bool {
     defer func() {
         if err := recover(); err != nil {
-            a.setConnOK(false)
+            a.setConnOK(false)          // ✅ mx.Lock
         }
         if !a.getConnOK() {
-            a.clearCache()
+            a.clearCache()              // ❌ clearCache 内无 mx（逐 Remove + cache 内部锁）
         }
     }()
 
-    // 用新 Config 创建 REST 配置和 Client
-    cfg, err := a.config.RESTConfig()
-    cfg.Timeout = a.config.CallTimeout()
+    cfg, err := a.config.RESTConfig()    // ❌ a.config 指针裸读；flags 裸读
+    if err != nil {
+        a.connOK = false                 // ❌ 直接赋值，无 mx！与 setConnOK 的锁策略不一致
+        return a.connOK
+    }
+    cfg.Timeout = a.config.CallTimeout() // ❌ a.config 裸读
     client, err := kubernetes.NewForConfig(cfg)
-
-    // 连通性验证：调用 ServerVersion
-    if _, err := client.ServerVersion(); err == nil {
-        a.setClient(client)    // 成功则缓存客户端，后续 Dial() 复用
-        if !a.getConnOK() {
-            a.reset()
-        }
-    } else {
-        a.setConnOK(false)
+    if err != nil {
+        a.setConnOK(false)               // ✅ mx.Lock
+        return a.getConnOK()
     }
 
-    return a.getConnOK()
+    if _, err := client.ServerVersion(); err == nil {
+        a.setClient(client)              // ✅ mx.Lock
+        if !a.getConnOK() {
+            a.reset()                    // cache/nsClient ❌；其他 ✅
+        }
+    } else {
+        a.setConnOK(false)               // ✅ mx.Lock
+    }
+
+    return a.getConnOK()                 // ✅ mx.RLock
 }
 ```
 
-**关键**：`CheckConnectivity` 不仅检查连通性，还会将成功创建的 client 缓存到 `a.client` 中，这样后续 `Dial()` 调用可以直接复用，无需再创建。
+**`CheckConnectivity` 的关键不一致**：
+- `a.connOK = false`（[client.go:320](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L320)）是**裸赋值**，无 `APIClient.mx.Lock`
+- 其他所有 connOK 写入（setConnOK(true/false)）都经 `mx.Lock`
+- 读取：`getConnOK()` 经 `mx.RLock`，但 `ConnectionOK()`（[client.go:87-89](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L87-L89)）是**裸读** `a.connOK`
 
-### 4.4 `invalidateCache` — Discovery 缓存失效
+### 4.5 `Config()` getter 的锁边界
+
+文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L344-L347)
+
+```go
+func (a *APIClient) Config() *Config {
+    return a.config   // ❌ 裸返回 Config 指针，无 APIClient.mx.RLock
+}
+```
+
+这是 `APIClient` 中**所有客户端/配置 getter 里唯一不加锁的一个**。对照：
+
+| getter 方法 | 是否加锁 |
+|-------------|----------|
+| `getClient()` | ✅ `mx.RLock` |
+| `getLogClient()` | ✅ `mx.RLock` |
+| `getDClient()` | ✅ `mx.RLock` |
+| `getMxsClient()` | ✅ `mx.RLock` |
+| `getCachedClient()` | ✅ `mx.RLock` |
+| `getConnOK()` | ✅ `mx.RLock` |
+| **`Config()`** | **❌ 无锁** |
+
+### 4.6 `ResetMetrics` — 全局单例无锁替换
+
+文件：[metrics.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/metrics.go#L26-L41)
+
+```go
+var MetricsDial *MetricsServer   // 全局变量
+
+func DialMetrics(c Connection) *MetricsServer {
+    if MetricsDial == nil {      // ❌ 全局变量裸读
+        MetricsDial = NewMetricsServer(c)  // ❌ 全局变量裸写
+    }
+    return MetricsDial           // ❌ 全局变量裸读
+}
+
+func ResetMetrics() {
+    MetricsDial = nil            // ❌ 全局变量裸写，无任何锁
+}
+```
+
+`MetricsDial` 是包级全局指针，**完全没有互斥保护**。`DialMetrics` 中的 if-check+赋值也不是原子操作。但 `ResetMetrics` 只在 `SwitchContext` 中调用（Halt 已生效），所以当前时序下安全。
+
+### 4.7 `invalidateCache` — Discovery 缓存失效
 
 文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L559-L567)
 
 ```go
 func (a *APIClient) invalidateCache() error {
-    dial, err := a.CachedDiscovery()
+    dial, err := a.CachedDiscovery()   // getCachedClient ✅ RLock
     if err != nil {
         return err
     }
-    dial.Invalidate()   // 清除磁盘上的 Discovery 缓存
+    dial.Invalidate()                  // disk cache 自带内部锁处理
     return nil
 }
 ```
 
-`CachedDiscovery` 客户端的缓存路径基于 API Server 地址：
+`Invalidate()` 由 `disk.CachedDiscoveryClient` 内部实现。
 
-文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L489-L518)
+---
 
-```go
-func (a *APIClient) CachedDiscovery() (*disk.CachedDiscoveryClient, error) {
-    // ...
-    baseCacheDir := filepath.Join(mustHomeDir(), ".kube", "cache")
-    httpCacheDir := filepath.Join(baseCacheDir, "http")
-    discCacheDir := filepath.Join(baseCacheDir, "discovery", toHostDir(cfg.Host))
-    // ...
-}
-```
+## 附录 A：字段级锁归属完整矩阵
 
-不同集群的 API Server 地址不同，所以 Discovery 缓存天然按集群隔离。`Invalidate()` 确保切换后不会使用旧集群的 API 资源信息。
+汇总 `APIClient` 和 `Config` 所有字段的**读路径锁**和**写路径锁**：
 
-### 4.5 `ResetMetrics` — 全局 Metrics 单例重置
+### A.1 `APIClient` 字段
 
-文件：[metrics.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/metrics.go#L39-L41)
+| 字段 | 初始化/写入位置 | 写锁 | 读取位置 | 读锁 | 风险评估 |
+|------|----------------|------|----------|------|----------|
+| `client` | `setClient()` 在 CheckConnectivity/Dial 中 | ✅ `mx.Lock` | `getClient()` 在 Dial/ConnectionOK 路径 | ✅ `mx.RLock` | 安全 |
+| `logClient` | `setLogClient()` 在 DialLogs 中 | ✅ `mx.Lock` | `getLogClient()` 在 DialLogs 中 | ✅ `mx.RLock` | 安全 |
+| `dClient` | `setDClient()` 在 DynDial/reset 中 | ✅ `mx.Lock` | `getDClient()` 在 DynDial 中 | ✅ `mx.RLock` | 安全 |
+| `mxsClient` | `setMxsClient()` 在 MXDial/reset 中 | ✅ `mx.Lock` | `getMxsClient()` 在 MXDial 中 | ✅ `mx.RLock` | 安全 |
+| `cachedClient` | `setCachedClient()` 在 CachedDiscovery/reset 中 | ✅ `mx.Lock` | `getCachedClient()` 在 CachedDiscovery/invalidateCache 中 | ✅ `mx.RLock` | 安全 |
+| `config` | 结构体初始化；`SwitchContext:L577` `a.config = NewConfig(...)` | ❌ 直接赋值 | `Config()` getter；`Dial/CallTimeout/RESTConfig` 等 | ❌ 裸读 | **潜在竞态**（Halt 时序保护） |
+| `cache` | 结构体初始化；`reset()` `a.cache = New...`；`CheckConnectivity` defer 中 `clearCache()`（逐 Remove，内部有锁） | ❌ 直接替换 / `clearCache` 无 mx | `CanI/ServerVersion/ValidNamespaceNames/checkCacheBool/supportsMetricsResources` 中的 `cache.Get/Add` | ❌ 裸访问（但 LRUExpireCache 内部自带 mutex） | 指针替换为原子操作；内部 map 操作有 cache 自有锁。**当前安全** |
+| `nsClient` | `reset()` 中 `= nil` | ❌ 直接赋值 | **整个代码库无读取者** | — | 死代码，无风险 |
+| `connOK` | `InitConnection` 初始化(true)；`setConnOK()`；`CheckConnectivity:L320` 裸赋值 | ✅ / ❌ 有不一致 | `getConnOK()`；`ConnectionOK()` 裸读 | ✅ / ❌ 有不一致 | `L320 裸写 + ConnectionOK() 裸读` 构成竞态窗口（极低概率） |
+| `log` | 结构体初始化，之后只读 | — | 各处 `slog.With` / `a.log.Debug/Warn` | — | 只读，安全 |
+| `mx` | sync.RWMutex 零值 | — | — | — | — |
 
-```go
-func ResetMetrics() {
-    MetricsDial = nil
-}
-```
+### A.2 `Config` 字段
 
-`MetricsServer` 是一个全局单例（`var MetricsDial *MetricsServer`），内部持有 `Connection` 和独立的 `cache.LRUExpireCache`。切换上下文时置 nil，下一次 `DialMetrics()` 调用会用新的 Connection 重建。
+| 字段 | 初始化/写入位置 | 写锁 | 读取位置 | 读锁 | 风险评估 |
+|------|----------------|------|----------|------|----------|
+| `flags` | `NewConfig()`；`SwitchContext:L108` `c.flags = flags` | ❌ 直接赋值 | 几乎所有 Config 方法（CurrentContext/Namespace/RESTConfig 等）；`ConfigAccess()` | ❌ 裸读 / ✅ `ConfigAccess` 有 RLock | **潜在竞态**（Halt 时序保护） |
+| `proxy` | `SetProxy()` 中直接赋值 | ❌ 直接赋值 | `RESTConfig()` 中裸读 | ❌ 裸读 | 只读一次写入，极低频，安全 |
+| `mx` | sync.RWMutex 零值 | — | — | — | 几乎不使用，仅 ConfigAccess 加 RLock |
+
+### A.3 全局变量
+
+| 变量 | 写入 | 写锁 | 读取 | 读锁 | 风险评估 |
+|------|------|------|------|------|----------|
+| `MetricsDial` | `DialMetrics`（懒创建）；`ResetMetrics()`（置 nil） | ❌ 无锁 | `DialMetrics`（每次调用） | ❌ 无锁 | 但 `ResetMetrics` 在 Halt 保护下，**当前安全** |
+| `customViewers` | `Command.Init` 中赋值 `loadCustomViewers()` | ❌ 无锁 | 各处 view 创建时查询 | ❌ 裸读 | 启动时一次写入，之后只读，安全 |
+
+---
+
+## 附录 B：锁边界总结（避免笼统归类）
+
+之前笼统地说"客户端和缓存重建都受 `APIClient.mx` 保护"是不准确的。事实是：
+
+1. **6 个客户端字段**（client/logClient/dClient/mxsClient/cachedClient/connOK）经 `APIClient.mx` 读写锁保护——**正确**
+2. **`cache` 字段指针替换**（`reset()` 中 `= New...`）**无** `APIClient.mx`，依赖指针原子性；内部 LRU map 操作由 cache 自带锁保护
+3. **`nsClient`** 是死代码，**无**任何锁保护，但无人读取
+4. **`config` 字段指针**（SwitchContext:L577）和 **`Config.flags` 指针**（SwitchContext:L108）**两层都无锁**，完全依赖 Halt 时序保障
+5. **`Config.mx`** 声明了 RWMutex，但只在 `ConfigAccess()` 一个方法中使用了读锁——其余所有 flags 读写都是裸操作
+6. **`connOK`**：`CheckConnectivity:320` 是裸写，与 `ConnectionOK()` 裸读形成**不一致的锁策略**
+7. **全局 `MetricsDial`**：无任何锁，依赖调用时序
 
 ---
 
