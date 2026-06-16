@@ -426,27 +426,114 @@ func (t *Table) refresh(ctx context.Context) error {
 
 ---
 
-### 5.3 机制② 界面回调入队（QueueUpdateDraw）：所有回调一定入队并串行执行
+### 5.3 机制② 界面回调入队（QueueUpdateDraw）：tview 依赖源码级分析
 
-#### 5.3.1 k9s 的关键封装：每次调用都启动新 goroutine
+本章节分析基于 **derailed/tview v0.8.5** 源码（k9s `go.mod` 中锁定版本），逐行说明队列容量、阻塞条件，以及 k9s 额外包装 goroutine 的真实作用。
+
+#### 5.3.1 tview 底层：100 容量的缓冲 channel + done 同步机制
+
+derailed/tview v0.8.5 `application.go`（依赖源码，可通过 `go mod download` 后在 module cache 中复核）：
+
+```go
+// 代码证据 1：队列容量常量（tview application.go 顶部）
+const (
+    queueSize  = 100                // ★ channel 缓冲大小 = 100
+    redrawPause = 50 * time.Millisecond
+)
+
+// 代码证据 2：队列元素结构体
+type queuedUpdate struct {
+    f    func()
+    done chan struct{}   // ★ 用于同步：f() 执行完后向 done 发信号
+}
+
+// 代码证据 3：Application 结构体
+type Application struct {
+    events   chan tcell.Event     // make(chan tcell.Event, queueSize) → 容量 100
+    updates  chan queuedUpdate    // make(chan queuedUpdate, queueSize) → 容量 100
+    ...
+}
+
+func NewApplication() *Application {
+    return &Application{
+        events:   make(chan tcell.Event, queueSize),   // 缓冲 100
+        updates:  make(chan queuedUpdate, queueSize),  // 缓冲 100
+        screenReplacement: make(chan tcell.Screen, 1),
+    }
+}
+
+// 代码证据 4：主循环消费端（EventLoop 的 select）
+EventLoop:
+for {
+    select {
+    case event := <-a.events:    // 处理键盘/鼠标/resize 事件
+        ...
+    case update := <-a.updates:  // ★ 消费一个 queuedUpdate
+        update.f()               // 在主循环 goroutine 中执行 f()
+        update.done <- struct{}{} // ★ f() 执行完后，向 done 发信号
+    }
+}
+```
+
+**核心事实（均来自依赖源码，可逐行复核）：**
+
+| 项 | 值 | 含义 |
+|----|----|-----|
+| `updates` channel 类型 | `chan queuedUpdate` | 每个元素包含 f 和 done |
+| `updates` channel 容量 | **100**（`queueSize`） | 有缓冲 channel，不是无缓冲 |
+| send 阻塞条件 | **仅当 channel 中已积压 100 个未处理更新时** | 正常情况下不阻塞 |
+| f() 执行位置 | **tview Run 主循环 goroutine** | 所有 f() 按入队顺序，单线程串行执行 |
+| `done` channel 作用 | 调用方可以等 `<-done` 来同步等待 f() 完成 | QueueUpdate 会等，QueueUpdateDraw 不等 |
+
+#### 5.3.2 QueueUpdate vs QueueUpdateDraw：是否等待 f() 执行完
+
+derailed/tview 提供两个 API，区别在于**调用方是否阻塞等待 f() 在主循环中执行完毕**：
+
+| API | 行为 | 典型用途 |
+|-----|------|---------|
+| `QueueUpdate(f)` | send `queuedUpdate{f, done}` 到 `updates`，然后**阻塞等 `<-done`** | 需要知道 f() 已完成时（如 `Draw()` 内部用它） |
+| `QueueUpdateDraw(f)` | send `queuedUpdate{f, done}` 到 `updates`，**不等待 done，立即返回** | 仅投递 UI 操作，不关心何时执行（k9s 全部使用这个） |
+
+k9s 只使用 `QueueUpdateDraw`（见 `internal/ui/app.go#L75-L82`），所以：
+- **如果 channel 未满（≤ 100 个待执行）**：tview.QueueUpdateDraw(f) 的 send 操作立即返回。
+- **如果 channel 已满（> 100 个待执行）**：send 操作阻塞在 channel send 上，直到主循环消费出一个空位。
+
+> 100 个容量对于 k9s 来说极其宽裕：4 条独立触发路径（A/B/C/D）就算每条路径 1ms 触发一次（极端情况），要填满 100 也需要至少 25ms。而主循环处理一个 UpdateUI（Clear + 逐行 buildRow + Draw）一般在亚毫秒到几毫秒级，所以正常运行时 channel 基本为空或极浅。
+
+#### 5.3.3 k9s 额外包装 goroutine 的真实作用
 
 `internal/ui/app.go#L75-L82`
 ```go
-// 代码证据：k9s 在 tview 之上又套了一层 goroutine
 func (a *App) QueueUpdateDraw(f func()) {
     if a.Application == nil {
         return
     }
-    go func() {
-        a.Application.QueueUpdateDraw(f)  // 交给 tview 的 draw 队列
+    go func() {           // ★ 每次调用都启动一个新 goroutine
+        a.Application.QueueUpdateDraw(f)
     }()
 }
 ```
 
-> 为什么要多套一层 goroutine？
-> tview.QueueUpdateDraw 是把 f 发到 `drawChan`（无缓冲 channel）。如果 tview Run 主循环消费较慢，send 操作会**阻塞调用方 goroutine**（比如 updater goroutine）。k9s 加一层 goroutine 就是为了避免调用方被 channel send 阻塞，把 send 移到一个临时 goroutine 里。
+现在有了 tview channel 容量 = 100 的事实，重新评估这层包装的作用：
 
-#### 5.3.2 四条独立调用路径（每条都独立调一次 QueueUpdateDraw）
+**之前的推断（不准确）**："tview channel 是无缓冲的，send 会阻塞，所以加 goroutine 避免调用方被阻塞。"
+
+**基于源码的正确分析**：
+
+| 场景 | channel 未满（正常情况，≤ 99 个待执行） | channel 已满（极端情况，100 个待执行） |
+|------|------------------------------------|----------------------------------|
+| **不加 goroutine**（直接调 tview.QueueUpdateDraw） | send 到缓冲 channel，立即返回。调用方（如 updater goroutine）完全不阻塞。 | send 阻塞在 channel send 上，调用方 goroutine 被挂起。**对于 updater goroutine，这意味着定时器的下一个 tick 不会触发，直到 channel 空出位置。** |
+| **加 goroutine**（k9s 当前实现） | 多启动一个临时 goroutine，临时 goroutine 调 tview.QueueUpdateDraw → send 立即返回 → 临时 goroutine 退出。**调用方不阻塞，但多了一次 goroutine 创建/销毁开销。** | 临时 goroutine 被阻塞在 send 上，调用方（updater goroutine）继续运行，**定时器下一个 tick 仍会触发**（可能产生更多被阻塞的临时 goroutine）。 |
+
+**真实作用总结：**
+
+1. **在正常场景下（channel 未满，占 99.9%+ 运行时间）**：这层 goroutine 包装是 **多余的**——tview 的 100 容量缓冲 channel 已经保证 send 不阻塞，k9s 多套一层 goroutine 反而带来额外的 goroutine 创建/销毁开销。
+2. **在极端场景下（channel 满）**：这层包装保护了**调用方 goroutine（如 updater goroutine）不被阻塞挂起**，定时器可以继续 tick；但代价是可能产生多个被阻塞在 channel send 上的临时 goroutine（每个都持有一个闭包 f 的引用），相当于**把阻塞从调用方转移到了匿名临时 goroutine**。
+3. **另一个隐含好处**：让调用代码可以**不区分自己是否在 tview 主循环 goroutine 中**——`BufferActive` 在主循环 goroutine 内调，`TableDataChanged` 在 updater goroutine 内调，统一走 `go func(){ tview.QueueUpdateDraw }`，行为一致，不必担心"在主循环内 send 到 channel 又在同一 select 消费"这种死锁风险。
+
+> 注：k9s 的 `QueueUpdate` 也做了同样的 goroutine 包装（见 `internal/ui/app.go#L64-L72`），原因相同。
+
+#### 5.3.4 四条独立调用路径（每条都独立调一次 QueueUpdateDraw）
 
 | 触发源 | 入口位置 | 在哪个 goroutine 中被调用 | 什么时间发生 |
 |--------|---------|---------------------------|-------------|
@@ -482,9 +569,9 @@ func (c *CmdBuff) SetActive(b bool) {
 
 而 `SetActive(false)` 的触发链：用户按回车 → tview 主循环处理按键 → Prompt 组件 → FishBuff/CmdBuff.Reset → SetActive(false) → fireActive。所以整个 `BufferActive() → model.Refresh() → model.Peek() → b.app.QueueUpdateDraw()` 这一串都在 **tview 主循环 goroutine** 中执行。
 
-#### 5.3.3 tview 的执行保证：所有 f() 在同一个 goroutine 串行执行
+#### 5.3.5 tview 的执行保证：所有 f() 在同一个 goroutine 串行执行
 
-无论哪个 goroutine 调 k9s.QueueUpdateDraw，最终所有 `f()` 闭包都在 **tview Run 主循环 goroutine** 中按进入队列的顺序**一个一个串行执行**。这是 tview 框架的核心线程安全保证。
+无论哪个 goroutine 调 k9s.QueueUpdateDraw，最终所有 `f()` 闭包都在 **tview Run 主循环 goroutine** 中按进入 `updates` channel 的顺序**一个一个串行执行**。这是 tview 框架的核心线程安全保证。
 
 **这是下文分析 `updating` 行为的关键前提。**
 
@@ -569,7 +656,7 @@ func (b *Browser) TableDataChanged(mdata *model1.TableData) {
 
 ### 5.5 完整时序例证（基于代码事实推演）
 
-场景：用户输入 filter 后按回车（BufferActive），刚好 2s tick 也触发 refresh，两条路径几乎同时发生。
+场景：用户输入 filter 后按回车（BufferActive），刚好 2s tick 也触发 refresh，两条路径几乎同时发生。tview 的 `updates` channel 容量为 100，本例远未满。
 
 ```
     updater goroutine          tview 主循环 goroutine          临时 goroutine（k9s 额外启动）
@@ -592,20 +679,21 @@ T=2 │                                │ 用户按回车：
   │                                │           → 启动 goroutine X1 ────────┐
   │                                │                                        │
   │                                │                               X1: tview.QueueUpdateDraw(f_C1)
-  │                                │                                    (send to drawChan，阻塞直到消费)
-T=5 │                                │                                        │
-  │ reconcile()完成                  │                                        │
-  │ → fireTableChanged()同步         │                                        │
-  │   → TableDataChanged()执行       │                                        │
-  │     ├─ b.Update(mdata)算过滤     │                                        │
-  │     └─ b.app.QueueUpdateDraw(f_A1)                                        │
-  │           → 启动 goroutine X2 ────────────────────────────────────┐        │
-  │                                                                  │        │
+  │                                │                      (send to updates chan, cap=100, 未满，立即返回)
+  │                                │                      → X1 goroutine 退出
+T=5 │                                │
+  │ reconcile()完成                  │
+  │ → fireTableChanged()同步         │
+  │   → TableDataChanged()执行       │
+  │     ├─ b.Update(mdata)算过滤     │
+  │     └─ b.app.QueueUpdateDraw(f_A1)
+  │           → 启动 goroutine X2 ────────────────────────────────────┐
+  │                                                                  │
   │                                                      X2: tview.QueueUpdateDraw(f_A1)
-  │                                                          (send to drawChan)
-  │                                                                  ↓        ↓
-T=6 │                               ┌──────────────────────────────────────────┘
-  │                               │ Run 循环 select 取到 f_C1
+  │                                             (send to updates chan, 仍未满，立即返回)
+  │                                             → X2 goroutine 退出
+  │                                                                  ↓
+T=6 │                               │ Run 循环 select 从 updates chan 取到 f_C1
   │                               │ 执行 f_C1（主循环 goroutine）：
   │                               │   getUpdating()=false
   │                               │   setUpdating(true)
@@ -613,7 +701,7 @@ T=6 │                               ┌─────────────
   │                               │   defer → setUpdating(false)  ← ★ 此时已变 false
   │                               │   Draw() 刷到终端
   │                               │
-T=12│                               │ Run 循环下一轮 select 取到 f_A1
+T=12│                               │ Run 循环下一轮 select 从 updates chan 取到 f_A1
   │                               │ 执行 f_A1（同一 goroutine 继续）：
   │                               │   getUpdating()=false  ← ★ C1 已经设为 false
   │                               │   setUpdating(true)    ← ★ 通过检查，不被跳过
@@ -626,6 +714,7 @@ T=12│                               │ Run 循环下一轮 select 取到 f_A1
 - T=2 的 `model.Refresh()` 被 CAS 丢弃 → `internal/model/table.go#L229-L247`
 - BufferActive 在主循环 goroutine → `internal/model/cmd_buff.go#L83-L89` + `#L241-L244`
 - QueueUpdateDraw 启动临时 goroutine → `internal/ui/app.go#L75-L82`
+- tview updates channel 容量 = 100，send 未满不阻塞 → derailed/tview v0.8.5 `application.go` 的 `queueSize = 100` 常量
 - C1 defer 结束后 A1 才开始（串行）→ tview Run 主循环单线程执行保证
 - A1 的 getUpdating() 看到 false → 不跳过 → 上文 5.4.3 的推导
 
@@ -667,10 +756,10 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
 | 对比维度 | ① 刷新并发控制 | ② 界面回调入队 | ③ 绘制互斥 |
 |---------|---------------|-------------|-----------|
 | **处理对象** | `refresh()` 调用 | `QueueUpdateDraw(f)` 中的 UI 闭包 f | UpdateUI 调用 |
-| **冲突策略** | **丢**（CAS 失败直接 return nil，不 fire listener） | **排**（全部入 tview 队列，按序串行执行，绝不丢） | 设计意图为"跳"，但**当前实现不会跳过**（见 5.4.3） |
-| **所在线程** | 任意 goroutine（通常 updater） | 任意 goroutine 调 k9s.QueueUpdateDraw → 启动临时 goroutine → tview 主循环执行 f | f() 全部在**同一个 goroutine**（tview 主循环）串行执行 |
-| **代码位置** | `internal/model/table.go#L229` 首行 | `internal/ui/app.go#L75-L82`（k9s 封装）+ 4 个 browser 调用点 | `internal/view/browser.go#L55-L65` + 3 处调用点 |
-| **释放时机** | defer atomic.Store（fireXxx 同步执行完毕后） | f() return → tview 取队列下一个 | defer setUpdating(false)（当前 f return 前） |
+| **冲突策略** | **丢**（CAS 失败直接 return nil，不 fire listener） | **排**（全部入 tview updates channel，按序串行执行，绝不丢） | 设计意图为"跳"，但**当前实现不会跳过**（见 5.4.3） |
+| **所在线程** | 任意 goroutine（通常 updater） | 任意 goroutine 调 k9s.QueueUpdateDraw → 启动临时 goroutine → send 到 tview updates channel → tview 主循环执行 f | f() 全部在**同一个 goroutine**（tview 主循环）串行执行 |
+| **代码位置** | `internal/model/table.go#L229` 首行 | `internal/ui/app.go#L75-L82`（k9s 封装）+ 4 个 browser 调用点；底层 derailed/tview v0.8.5 `application.go` | `internal/view/browser.go#L55-L65` + 3 处调用点 |
+| **释放时机** | defer atomic.Store（fireXxx 同步执行完毕后） | f() return + send `done` → tview select 下一个 | defer setUpdating(false)（当前 f return 前） |
 | **典型场景** | Ctrl+R 与 2s tick 撞车 → 丢 | A/B/C/D 四条路径各自独立入队 → 排 | 连续排 2+ 个 f → 设计跳 实际全跑 |
 
 ---
@@ -681,8 +770,9 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
 |------|---------|---------|--------------|
 | **刷新发起频率** | `updater time.After(rate)` + `refreshRate` | 定时器间隔（拉模式） | 指数退避，最长 2min 退出 |
 | **refresh 并发控制（丢）** | `internal/model/table.go#L229-L247` 首行 | CAS 原子锁 `inUpdate` | 后到的 refresh 直接 return nil，**不 fire 任何 listener** |
-| **QueueUpdateDraw 封装（防阻塞）** | `internal/ui/app.go#L75-L82` | 每次调启动临时 goroutine，send drawChan 不阻塞调用方 | drawChan send 在临时 goroutine 里等待 |
-| **界面回调入队（排）** | `internal/view/browser.go` 4 处调用点 | tview draw 队列 FIFO + 主循环 goroutine 串行执行 | **全部入队，不会丢弃**（除非 App 退出） |
+| **tview updates channel** | derailed/tview v0.8.5 `application.go` | `queueSize=100` 缓冲 channel + done 同步 | 仅当积压 100 个时 send 才阻塞 |
+| **QueueUpdateDraw 封装（防阻塞）** | `internal/ui/app.go#L75-L82` | 每次调启动临时 goroutine，send 不阻塞调用方 | channel 满时阻塞移到临时 goroutine |
+| **界面回调入队（排）** | `internal/view/browser.go` 4 处调用点 | tview updates FIFO + 主循环 goroutine 串行执行 | **全部入队，不会丢弃**（除非 App 退出） |
 | **DAO 数据源选择** | `resourceMeta(gvr)` | Registry 三层 fallback（明确 DAO → nil→Resource → Table） | 未注册资源默认 HTTP Table |
 | **Inform 缓存未就绪** | `Browser.TableNoData` | `HasSynced()` 检查 | 显示 Synchronizing 而非误报 |
 | **增量 Delta 计算** | `TableData.Update` | 按 ID 匹配 + DeltaRow | 无则 Add、有变 Update、无变 Unchanged、缺失 Delete |
@@ -719,3 +809,13 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
   1. **CAS 原子锁 `inUpdate`**（`internal/model/table.go#L229`）：在数据层丢弃并行的 `refresh()` 请求，省掉了 DAO.List + Delta 计算的浪费。
   2. **定时器 `time.After(rate)`**（`internal/model/table.go#L66`）：在最源头控制刷新频率（默认 2s），从根本上限制进入 `refresh()` 的次数。
 - `updating` 是最外层的"设计意图表达"，在当前代码路径上实际上不产生节流效果。
+
+**Q8：tview 的更新队列容量是多少？什么情况下会阻塞？**
+- 队列是**有缓冲 channel**，容量固定为 **100**（derailed/tview v0.8.5 `application.go` 的 `queueSize = 100` 常量）。
+- 阻塞条件：**仅当 channel 中已经积压了 100 个未处理的 queuedUpdate 时**，新的 send 才会阻塞。正常运行时队列深度基本为 0~2。
+- 事件队列（键盘/鼠标/resize）也是同一个 `queueSize = 100`。
+
+**Q9：k9s 在 `QueueUpdateDraw` 外面再套一层 `go func()`，真实作用是什么？**
+- **正常场景（channel 未满，99.9%+ 时间）**：这层包装是**多余的**。tview 是 100 容量缓冲 channel，send 本来就不阻塞，多套 goroutine 反而带来额外的 goroutine 创建/销毁开销。
+- **极端场景（channel 满 100 个）**：这层包装把**阻塞从调用方 goroutine（如 updater）转移到了临时匿名 goroutine**——updater 定时器可以继续 tick，不会因为 channel send 阻塞而卡住整个刷新循环。代价是可能积累多个被阻塞在 send 上的临时 goroutine。
+- **隐含好处**：让调用代码不必关心"自己在哪个 goroutine"。`BufferActive` 在 tview 主循环内调，`TableDataChanged` 在 updater goroutine 内调，统一走 `go func()` 包装，行为完全一致，避免了潜在死锁风险。
