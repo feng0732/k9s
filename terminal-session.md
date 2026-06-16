@@ -2,22 +2,486 @@
 
 ## 概述
 
-K9s 的 exec/attach 终端会话采用「外挂 kubectl 二进制 + TUI 挂起移交」的设计模式。整个流程包括：会话创建、TUI 挂起、终端移交、尺寸同步、异常清理五个阶段。
+K9s 的 exec/attach 终端会话采用「外挂 kubectl 二进制 + TUI 挂起移交」的设计模式。整个流程包括：多视图入口、会话创建、TUI 挂起、标准 IO 接管、尺寸同步、异常清理六个阶段。
 
 ---
 
-## 1. 会话创建流程
+## 1. 资源详情视图入口全景
 
-### 1.1 入口点（键盘事件）
+exec/attach 并非只能从 Pod/Container 列表视图触发，K9s 在多个视图中都暴露了相关入口。
 
-| 视图 | 按键 | 处理函数 |
-|------|------|----------|
-| Pod 视图 | `s` (Shell) | [pod.go:shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L222-L238) |
-| Pod 视图 | `a` (Attach) | [pod.go:attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L240-L256) |
-| Container 视图 | `s` (Shell) | [container.go:shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L158-L181) |
-| Container 视图 | `a` (Attach) | [container.go:attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L183-L194) |
+### 1.1 完整入口矩阵
 
-### 1.2 前置检查
+| 视图类型 | 视图文件 | 按键 | GVR 类型 | 处理函数 | Feature Gate 依赖 |
+|----------|----------|------|----------|----------|------------------|
+| **Pod 列表** | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L126-L135) | `s` | Pod | [shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L222-L238) | 非只读 |
+| **Pod 列表** | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L126-L135) | `a` | Pod | [attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L240-L256) | 非只读 |
+| **Container 列表** | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L83-L94) | `s` | Container | [shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L158-L181) | 非只读 |
+| **Container 列表** | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L83-L94) | `a` | Container | [attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go#L183-L194) | 非只读 |
+| **Xray 拓扑图** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L207-L232) | `s` | Pod/Container | [xray.shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362) | 非只读 |
+| **Xray 拓扑图** | [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L207-L232) | `a` | Pod | [xray.attachCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L364-L385) | 非只读 |
+| **Node 列表** | [node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L75-L77) | `s` | Node | [sshCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L179-L191) | NodeShell + ShellPod 配置 |
+| **热键/插件** | [actions.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go#L60-L106) | 用户自定义 | 任意 | `gotoCmd` 跳转或直接调用 runK | 插件 Scopes 配置匹配 |
+
+### 1.2 Xray 拓扑图入口（资源详情视图）
+
+在 Xray 视图中，当选中 Pod 或 Container 节点时按 `s` 或 `a` 可直接触发终端会话。
+
+**快捷键绑定** [xray.go:207-L232](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L207-L232)：
+```go
+case client.CoGVR:  // Container GVR
+    if !x.app.Config.IsReadOnly() {
+        aa.Add(ui.KeyS, ui.NewKeyActionWithOpts("Shell", x.shellCmd,
+            ui.ActionOpts{Visible: true, Dangerous: true}))
+    }
+case client.PodGVR:  // Pod GVR
+    if !x.app.Config.IsReadOnly() {
+        aa.Bulk(ui.KeyMap{
+            ui.KeyS: ui.NewKeyActionWithOpts("Shell", x.shellCmd, ...),
+            ui.KeyA: ui.NewKeyActionWithOpts("Attach", x.attachCmd, ...),
+        })
+    }
+```
+
+**Xray shellCmd 处理流程** [xray.go:340-L362](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go#L340-L362)：
+```go
+func (x *Xray) shellCmd(*tcell.EventKey) *tcell.EventKey {
+    spec := x.selectedSpec()
+    if spec.Status() != "ok" {  // 检查节点状态是否运行中
+        x.app.Flash().Errf("%s is not in a running state", spec.Path())
+        return nil
+    }
+    path, co := spec.Path(), ""
+    if spec.GVR() == client.CoGVR {
+        // 若选中的是 Container 节点，需提取父路径作为 Pod 路径
+        _, co = client.Namespaced(spec.Path())
+        path = *spec.ParentPath()
+    }
+    if err := containerShellIn(x.app, x, path, co); err != nil {
+        x.app.Flash().Err(err)
+    }
+    return nil
+}
+```
+
+### 1.3 Node Shell 入口（特殊场景）
+
+Node 列表的 `s` 键不会直接 exec 到 Node（Node 不是 Pod），而是启动一个**特权 Pod** 来访问节点宿主机。
+
+**入口检查** [node.go:75-L77](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L75-L77)：
+```go
+if ct.FeatureGates.NodeShell && n.App().Config.K9s.ShellPod != nil {
+    aa.Add(ui.KeyS, ui.NewKeyAction("Shell", n.sshCmd, true))
+}
+```
+
+**执行流程** [node.go:179-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go#L179-L191)：
+```go
+func (n *Node) sshCmd(evt *tcell.EventKey) *tcell.EventKey {
+    n.Stop()
+    defer n.Start()
+    _, node := client.Namespaced(path)
+    launchNodeShell(n, n.App(), node)  // 进入 Node Shell 启动流程
+    return nil
+}
+```
+
+---
+
+## 2. 标准输入输出接管位置与机制
+
+K9s 不使用 client-go 的 `remotecommand.Stream()` API，而是通过 `exec.Command` 启动 kubectl 子进程，并**直接将其标准 IO 映射到操作系统终端**。
+
+### 2.1 接管链路全景
+
+```
+用户键盘输入 → 终端设备驱动 (/dev/tty)
+    ↓
+os.Stdin (k9s 进程继承的文件描述符 0)
+    ↓  tview Application.Suspend() 挂起 tcell 原始模式后
+cmd.Stdin = os.Stdin  ← [exec.go:pipe 574行]
+cmd.Stdout = os.Stdout ← [exec.go:pipe 574行]
+cmd.Stderr = os.Stderr ← [exec.go:pipe 574行]
+    ↓  cmd.Run() 启动 kubectl 子进程
+kubectl exec -it ...
+    ↓  kubectl 内部使用 client-go remotecommand
+remotecommand.SPDYExecutor.Stream()
+    ↓  SPDY 多路复用 5 个子通道
+├─ stdin 通道 (channel 0)
+├─ stdout 通道 (channel 1)
+├─ stderr 通道 (channel 2)
+├─ error 通道 (channel 3)
+└─ resize 通道 (channel 4) ← 终端尺寸同步专用
+```
+
+### 2.2 关键接管代码位置
+
+**核心函数** [exec.go:pipe 549-L615行](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L549-L615)
+
+**单命令模式（exec/attach 使用）** [exec.go:554-L594](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L554-L594)：
+```go
+if len(cmds) == 1 {
+    cmd := cmds[0]
+    if opts.background {
+        // 后台模式：输出写入 buffer，不直接交互
+        go func() {
+            cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, w, e
+            if err := cmd.Run(); err != nil { ... }
+        }()
+        return nil
+    }
+    // ═══════════ 前台交互式模式（exec/attach 实际走这里）═══════════
+    // 关键行：直接将 os 层面的标准 IO 赋值给子进程
+    cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+    // 打印 banner 信息（如 Pod 名称提示）
+    _, _ = cmd.Stdout.Write([]byte(opts.banner))
+    // 同步执行：阻塞在此，直到 kubectl 退出
+    err := cmd.Run()
+    // 处理信号导致的异常退出（如 Ctrl+C）
+    var ex *exec.ExitError
+    if errors.As(err, &ex) && !ex.Exited() {
+        return nil  // 信号终止不算错误
+    }
+    if err == nil {
+        statusChan <- fmt.Sprintf("Command completed successfully: %q", cmd.String())
+    }
+    close(statusChan)
+    return err
+}
+```
+
+**管道命令模式（多命令组合，如 kubectl | grep）** [exec.go:597-L614](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L597-L614)：
+```go
+last := len(cmds) - 1
+for i := range cmds {
+    cmds[i].Stderr = os.Stderr  // 所有命令的 stderr 直接输出
+    if i+1 < len(cmds) {
+        // 相邻命令之间通过 io.Pipe 连接
+        r, w := io.Pipe()
+        cmds[i].Stdout, cmds[i+1].Stdin = w, r
+    }
+}
+cmds[last].Stdout = os.Stdout  // 最后一条命令输出到终端
+```
+
+### 2.3 execute 函数包装层
+
+[exec.go:execute 172-L239行](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L172-L239) 负责在 pipe 之前做信号和清理准备：
+
+```go
+func execute(opts *shellOpts, statusChan chan<- string) error {
+    if opts.clear {
+        clearScreen()  // 清屏：打印 ANSI 转义序列 \033[H\033[2J
+    }
+    ctx, cancel := context.WithCancel(context.Background())
+    defer func() {
+        if !opts.background {
+            cancel()      // 取消命令上下文，可能终止 kubectl
+            clearScreen() // 恢复 TUI 前再次清屏
+        }
+    }()
+
+    // 信号监听：捕获 Ctrl+C (SIGINT) 和终止信号
+    var interrupted bool
+    sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+    go func(cancel context.CancelFunc) {
+        defer slog.Debug("Got signal canceled")
+        select {
+        case sig := <-sigChan:
+            slog.Debug("Command canceled with signal", slogs.Sig, sig)
+            cancel()  // 用户按 Ctrl+C 时取消 context
+        case <-ctx.Done():
+            slog.Debug("Signal context canceled!")
+        }
+        interrupted = true
+    }(cancel)
+
+    // 构建命令
+    cmds := make([]*exec.Cmd, 0, 1)
+    cmd := exec.CommandContext(ctx, opts.binary, opts.args...)
+    // KUBE_EDITOR 环境变量注入（用于 kubectl edit 等场景）
+    if env := os.Getenv("K9S_EDITOR"); env != "" {
+        cmd.Env = append(os.Environ(), fmt.Sprintf("KUBE_EDITOR=%s", ...))
+    }
+    cmds = append(cmds, cmd)
+    // 支持 opts.pipes 管道命令追加
+    for _, p := range opts.pipes {
+        tokens := strings.Split(p, " ")
+        cmds = append(cmds, exec.CommandContext(ctx, tokens[0], tokens[1:]...))
+    }
+
+    // 调用 pipe 完成真正的 IO 接管
+    var o, e bytes.Buffer
+    err := pipe(ctx, opts, statusChan, &o, &e, cmds...)
+    if err != nil && !interrupted {
+        return errors.Join(err, fmt.Errorf("%s", e.String()))
+    }
+    return nil
+}
+```
+
+### 2.4 TUI 挂起：移交终端控制权的前提
+
+在 `execute` 被调用前，必须先通过 `tview.Application.Suspend()` 挂起 TUI，释放对终端的控制。
+
+**调用顺序** [exec.go:run 99-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L99-L122)：
+```go
+func run(a *App, opts *shellOpts) (bool, <-chan error, error) {
+    a.Halt()         // 停止集群更新、文件监听等后台 goroutine
+    defer a.Resume() // 退出时恢复
+
+    statusChan := make(chan string)
+    var status error
+    // 核心：Suspend 将终端从 tcell 原始模式切回标准模式
+    suspended := a.Suspend(func() {
+        status = execute(opts, statusChan)  // 在此函数内 kubectl 接管 stdio
+    })
+    return suspended, errChan, status
+}
+```
+
+**tview Suspend 底层实现**（来自 derailed/tview v0.8.5）：
+```go
+func (a *Application) Suspend(f func()) bool {
+    screen := a.screen
+    // 1. 挂起 tcell：tcsetattr 恢复终端标准模式（canonical + echo）
+    if err := screen.Suspend(); err != nil { return false }
+    // 2. 执行用户函数（此时 stdin/stdout/stderr 可以被子进程直接使用）
+    f()
+    // 3. 恢复 tcell：tcsetattr 重新设置原始模式（raw + noecho），清屏重绘 TUI
+    screen.Resume()
+    return true
+}
+```
+
+---
+
+## 3. 终端尺寸同步功能深度分析
+
+尺寸同步是 exec/attach 最复杂的部分。K9s 采取「完全移交」策略：TUI 挂起后，终端尺寸同步**完全由 kubectl 子进程自行处理**，K9s 不参与。
+
+### 3.1 完整尺寸同步链路
+
+```
+用户调整终端窗口大小（拖拽、字体变化等）
+    ↓
+操作系统内核（TTY 层）检测到窗口变化
+    ↓
+内核向前台进程组发送 SIGWINCH 信号
+    ↓  （此时前台进程组是 kubectl，因为 k9s 的 Suspend 没有切换进程组）
+kubectl 进程的信号处理 goroutine 捕获 SIGWINCH
+    ↓  [kubectl util/term/resizeevents.go]
+signal.Notify(winch, unix.SIGWINCH) → winch channel 收到信号
+    ↓
+ioctl(STDOUT_FILENO, TIOCGWINSZ, &winsize) 读取新终端尺寸
+    ↓  [kubectl util/term/resize.go monitorSize]
+resizeEvents chan 接收新尺寸 → 发送到 sizeQueue.resizeChan
+    ↓  [kubectl util/term/resize.go sizeQueue.Next]
+client-go remotecommand.TerminalSizeQueue.Next() 阻塞读取新尺寸
+    ↓  [client-go tools/remotecommand/v3.go handleResizes]
+streamProtocolV3.handleResizes() goroutine 获取到 TerminalSize
+    ↓
+JSON 编码后写入 SPDY resize 子通道（channel 4）
+    ↓  → API Server → kubelet → CRI Runtime
+kubelet 收到 resize 请求 → 调用容器运行时 ResizeTTY 接口
+    ↓
+runtime (containerd/CRI-O) 调用 ioctl(TIOCSWINSZ) 设置容器 PTY 尺寸
+    ↓
+内核向容器内前台进程组发送 SIGWINCH 信号
+    ↓
+容器内 bash/vim 等程序收到信号 → 重新布局终端界面
+```
+
+### 3.2 kubectl 端尺寸同步源码实现
+
+#### 3.2.1 SIGWINCH 信号监听
+
+文件：`k8s.io/kubectl/pkg/util/term/resizeevents.go`（非 Windows 平台）
+```go
+// monitorResizeEvents 监听 SIGWINCH 信号并读取终端尺寸
+func monitorResizeEvents(fd uintptr, resizeEvents chan<- TerminalSize, stop chan struct{}) {
+    go func() {
+        defer runtime.HandleCrash()
+        winch := make(chan os.Signal, 1)
+        signal.Notify(winch, unix.SIGWINCH)   // 注册 SIGWINCH 监听
+        defer signal.Stop(winch)
+
+        for {
+            select {
+            case <-winch:                      // 收到窗口变化信号
+                size := GetSize(fd)            // ioctl 读新尺寸
+                if size == nil { return }
+                select {
+                case resizeEvents <- *size:    // 非阻塞发送
+                default:                       // 消费者慢则丢弃
+                }
+            case <-stop:
+                return
+            }
+        }
+    }()
+}
+```
+
+#### 3.2.2 TerminalSizeQueue 实现
+
+文件：`k8s.io/kubectl/pkg/util/term/resize.go`
+```go
+type sizeQueue struct {
+    t            TTY
+    resizeChan   chan TerminalSize    // client-go 从此读取
+    stopResizing chan struct{}        // 停止信号
+}
+
+// 被 client-go 的 handleResizes goroutine 循环调用，阻塞等待新尺寸
+func (s *sizeQueue) Next() *TerminalSize {
+    size, ok := <-s.resizeChan
+    if !ok { return nil }
+    return &size
+}
+
+// TTY.MonitorSize() 启动整个尺寸监控流程
+func (t *TTY) MonitorSize(initialSizes ...*TerminalSize) TerminalSizeQueue {
+    outFd, isTerminal := term.GetFdInfo(t.Out)
+    if !isTerminal { return nil }
+    t.sizeQueue = &sizeQueue{
+        t: *t,
+        resizeChan:   make(chan TerminalSize, len(initialSizes)),
+        stopResizing: make(chan struct{}),
+    }
+    t.sizeQueue.monitorSize(outFd, initialSizes...)
+    return t.sizeQueue
+}
+
+// monitorSize 后台 goroutine 转发信号事件
+func (s *sizeQueue) monitorSize(outFd uintptr, initialSizes ...*TerminalSize) {
+    for i := range initialSizes {
+        if initialSizes[i] != nil {
+            s.resizeChan <- *initialSizes[i]  // 先发送初始尺寸
+        }
+    }
+    resizeEvents := make(chan TerminalSize, 1)
+    monitorResizeEvents(outFd, resizeEvents, s.stopResizing)  // 启动 SIGWINCH 监听
+
+    go func() {
+        defer runtime.HandleCrash()
+        for {
+            select {
+            case size, ok := <-resizeEvents:
+                if !ok { return }
+                select {
+                case s.resizeChan <- size:  // 转发给 client-go
+                default:                     // 消费不及时则丢弃
+                }
+            case <-s.stopResizing:
+                return
+            }
+        }
+    }()
+}
+```
+
+#### 3.2.3 TIOCGWINSZ 读取尺寸
+
+文件：`k8s.io/kubectl/pkg/util/term/resize.go`
+```go
+func (t TTY) GetSize() *TerminalSize {
+    outFd, isTerminal := term.GetFdInfo(t.Out)
+    if !isTerminal { return nil }
+    return GetSize(outFd)
+}
+
+// GetSize 通过 ioctl 系统调用读取终端窗口大小
+func GetSize(fd uintptr) *TerminalSize {
+    // 底层调用 term.GetWinsize(fd)
+    // → syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&winsize)))
+    winsize, err := term.GetWinsize(fd)
+    if err != nil {
+        runtime.HandleError(fmt.Errorf("unable to get terminal size: %v", err))
+        return nil
+    }
+    return &TerminalSize{Width: winsize.Width, Height: winsize.Height}
+}
+```
+
+#### 3.2.4 client-go handleResizes 发送尺寸
+
+文件：`k8s.io/client-go/tools/remotecommand/v3.go`
+```go
+// 由 SPDYExecutor 在建立流连接后启动的后台 goroutine
+func (p *streamProtocolV3) handleResizes() {
+    if p.resizeStream == nil || p.TerminalSizeQueue == nil {
+        return
+    }
+    go func() {
+        defer runtime.HandleCrash()
+        encoder := json.NewEncoder(p.resizeStream)  // SPDY resize 子通道
+        for {
+            // 阻塞调用 Next()，等待 kubectl 的 SIGWINCH 处理器推送新尺寸
+            size := p.TerminalSizeQueue.Next()
+            if size == nil {
+                return  // sizeQueue.stop() 被调用时返回 nil，退出循环
+            }
+            // JSON 编码后写入 resizeStream → API Server
+            if err := encoder.Encode(&size); err != nil {
+                runtime.HandleError(err)
+            }
+        }
+    }()
+}
+```
+
+### 3.3 TTY Safe 包装：确保终端状态恢复
+
+kubectl 在整个 exec/attach 过程中使用 `TTY.Safe()` 包装，确保即使 panic 也能恢复终端状态：
+
+文件：`k8s.io/kubectl/pkg/util/term/term.go`
+```go
+func (t TTY) Safe(fn SafeFunc) error {
+    inFd, isTerminal := term.GetFdInfo(t.In)
+    if !isTerminal && t.TryDev {
+        if f, err := os.Open("/dev/tty"); err == nil {
+            defer f.Close()
+            inFd = f.Fd()
+            isTerminal = term.IsTerminal(inFd)
+        }
+    }
+    if !isTerminal { return fn() }
+
+    // 保存终端当前状态（tcgetattr）
+    var state *term.State
+    var err error
+    if t.Raw {
+        state, err = term.MakeRaw(inFd)  // 设置原始模式（关行缓冲、关回显、关信号处理字符）
+    } else {
+        state, err = term.SaveState(inFd)
+    }
+    if err != nil { return err }
+
+    // interrupt.Chain 确保：信号 → 先停止 resize 监控 → 再恢复终端状态
+    return interrupt.Chain(t.Parent, func() {
+        if t.sizeQueue != nil {
+            t.sizeQueue.stop()         // 关闭 SIGWINCH 监听 goroutine
+        }
+        term.RestoreTerminal(inFd, state)  // tcsetattr 恢复终端设置
+    }).Run(fn)
+}
+```
+
+### 3.4 K9s 为何不处理 resize？
+
+| 原因 | 说明 |
+|------|------|
+| **TUI 已挂起** | `screen.Suspend()` 后，tcell 不再读取 `tcell.EventResize` 事件，主 event loop 停止 |
+| **进程组不变** | k9s 启动 kubectl 时未调用 `syscall.Setsid()`，kubectl 与 k9s 同属一个前台进程组，SIGWINCH 同时发送给两者，但 k9s 的 signal handler 在 TUI 挂起时已不处理 resize |
+| **移交原则** | kubectl 有成熟的 SIGWINCH + TIOCGWINSZ 方案，重复实现易出错 |
+
+---
+
+## 4. 会话创建流程（补充）
+
+### 4.1 前置检查（Pod Running 验证）
 
 在 [pod.go:shellCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L222-L238) 中：
 ```go
@@ -27,15 +491,15 @@ if !podIsRunning(p.App().factory, path) {
 }
 ```
 
-### 1.3 容器选择逻辑
+### 4.2 容器选择逻辑
 
 [pod.go:containerShellIn](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L358-L386)：
 1. 若指定了容器名，直接使用
 2. 检查 `kubectl.kubernetes.io/default-container` annotation
 3. 若只有一个容器，直接使用
-4. 多容器时弹出选择器
+4. 多容器时弹出 Picker 选择器
 
-### 1.4 命令参数构建
+### 4.3 命令参数构建
 
 [pod.go:buildShellArgs](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L478-L503) 构建 kubectl 命令参数：
 ```go
@@ -48,315 +512,140 @@ args = append(args, "-c", containerName)
 
 [pod.go:computeShellArgs](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L461-L468) 会根据 pod OS（Linux/Windows）选择不同的 shell 命令。
 
----
+### 4.4 kubectl 命令增强参数
 
-## 2. TUI 挂起与终端移交
-
-### 2.1 核心调用链
-
-```
-resumeShellIn
-    ↓
-[pod.go] shellIn → runK
-    ↓
-[exec.go:runK](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L57-L97)
-    ↓
-[exec.go:run](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L99-L122)
-    ├─ a.Halt()        // 停止后台任务
-    ├─ defer a.Resume() // 恢复后台任务
-    └─ a.Suspend(func() {
-           execute(...) // 执行 kubectl 命令
-       })
-```
-
-### 2.2 Halt/Resume 机制
-
-[app.go:Halt](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go#L334-L339) 停止后台任务：
+[exec.go:runK](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L57-L97) 会在执行前追加 K9s 配置参数：
 ```go
-func (a *App) Halt() {
-    if a.cancelFn != nil {
-        a.cancelFn()      // 取消集群更新、文件监听等后台 goroutine
-        a.cancelFn = nil
-    }
+// 追加用户仿冒身份
+if u, err := a.Conn().Config().ImpersonateUser(); err == nil {
+    args = append(args, "--as", u)
+}
+if g, err := a.Conn().Config().ImpersonateGroups(); err == nil {
+    args = append(args, "--as-group", g)
+}
+// 追加当前 context 名
+args = append(args, "--context", a.Config.K9s.ActiveContextName())
+// 追加 kubeconfig 路径
+if cfg := a.Conn().Config().Flags().KubeConfig; cfg != nil && *cfg != "" {
+    args = append(args, "--kubeconfig", *cfg)
 }
 ```
 
-[app.go:Resume](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go#L342-L362) 恢复后台任务：
-```go
-func (a *App) Resume() {
-    ctx, a.cancelFn = context.WithCancel(context.Background())
-    go a.clusterUpdater(ctx)           // 集群信息更新
-    go a.ConfigWatcher(ctx, a)         // 配置文件监听
-    // ... 其他监听器
-}
-```
-
-### 2.3 tview.Application.Suspend 实现
-
-来自 [derailed/tview v0.8.5](https://raw.githubusercontent.com/derailed/tview/v0.8.5/application.go)：
-
-```go
-func (a *Application) Suspend(f func()) bool {
-    a.RLock()
-    screen := a.screen
-    a.RUnlock()
-    if screen == nil {
-        return false
-    }
-    // 1. 挂起屏幕：退出终端原始模式
-    if err := screen.Suspend(); err != nil {
-        return false
-    }
-    // 2. 执行用户函数（此时终端控制权已移交）
-    f()
-    // 3. 恢复屏幕：重新进入终端原始模式
-    a.RLock()
-    defer a.RUnlock()
-    if a.screen != screen {
-        screen.Fini()
-        if a.screen == nil {
-            return true
-        }
-    } else {
-        screen.Resume() // 重新初始化终端原始模式
-    }
-    return true
-}
-```
-
-**tcell Screen 挂起原理：**
-- `Screen.Suspend()` → 调用 `tcsetattr` 恢复终端标准模式（canonical mode + echo）
-- `Screen.Resume()` → 调用 `tcsetattr` 设置终端原始模式（raw mode + no echo），并重新初始化屏幕缓冲区
-
-### 2.4 kubectl 执行上下文
-
-[exec.go:execute](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L172-L239) 中的关键设置：
-```go
-cmd := exec.CommandContext(ctx, opts.binary, opts.args...)
-cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-_, _ = cmd.Stdout.Write([]byte(opts.banner)) // 打印 banner
-err := cmd.Run()
-```
-
-此时 kubectl 进程完全接管标准输入输出，直接与用户交互。
-
 ---
 
-## 3. 终端尺寸同步机制
-
-K9s 采用「完全移交」策略：TUI 挂起后，终端尺寸同步完全由 kubectl 负责。
-
-### 3.1 kubectl 内部尺寸同步流程
-
-```
-用户调整终端窗口大小
-    ↓
-内核发送 SIGWINCH 信号给前台进程组（kubectl）
-    ↓
-kubectl 的信号处理器被触发
-    ↓
-ioctl(STDIN_FILENO, TIOCGWINSZ, &winsize) 获取新尺寸
-    ↓
-通过 SPDY/WebSocket 的 resize 子通道发送尺寸到 API Server
-    ↓
-API Server 转发给 kubelet
-    ↓
-kubelet 调用容器运行时 ResizeTTY 接口
-    ↓
-容器运行时更新 PTY 窗口大小
-    ↓
-内核发送 SIGWINCH 给容器内前台进程（如 bash）
-    ↓
-shell 重新计算并调整布局
-```
-
-### 3.2 关键技术点
-
-| 技术 | 说明 |
-|------|------|
-| `SIGWINCH` | 窗口尺寸变化信号，发送给终端前台进程组 |
-| `TIOCGWINSZ` | ioctl 命令，从内核读取终端窗口大小（rows/cols） |
-| `TIOCSWINSZ` | ioctl 命令，设置终端窗口大小 |
-| `struct winsize` | 定义终端尺寸的内核结构体 |
-
-**winsize 结构体：**
-```c
-struct winsize {
-    unsigned short ws_row;     // 行数
-    unsigned short ws_col;     // 列数
-    unsigned short ws_xpixel;  // 水平像素（未使用）
-    unsigned short ws_ypixel;  // 垂直像素（未使用）
-};
-```
-
-### 3.3 K9s 为何不处理 resize？
-
-因为 K9s 挂起 TUI 后：
-1. tcell 不再监听终端事件（包括 `EventResize`）
-2. 终端的标准输入输出完全由 kubectl 进程接管
-3. kubectl 有自己成熟的 SIGWINCH 处理逻辑
-
----
-
-## 4. 异常清理与会话收尾
+## 5. 异常清理与会话收尾
 
 采用**多层 defer 防御式编程**，确保各种异常路径下资源都能正确释放。
 
-### 4.1 清理层级（从内到外）
+### 5.1 清理层级（从内到外）
 
-**第一层：execute 函数内部清理** [exec.go:execute](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L176-L197)
+| 层级 | 清理内容 | 代码位置 |
+|------|----------|----------|
+| L1 | `cancel()` 终止 kubectl + `clearScreen()` 清屏 | [exec.go:execute L177-L182](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L177-L182) defer |
+| L2 | SIGINT/SIGTERM 信号监听 → 取消 context | [exec.go:execute L184-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L184-L197) goroutine |
+| L3 | `a.Resume()` 恢复后台任务（集群更新、文件监听） | [exec.go:run L113](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L113) defer |
+| L4 | `c.Start()` 恢复视图刷新 | [pod.go:resumeShellIn L388-L401](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L388-L401) defer |
+| L5 | `nukeK9sShell()` 删除 Node Shell 特权 Pod | [exec.go:launchPodShell L332-L337](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L332-L337) defer |
+| L6 | tview Run 函数 panic recover → `screen.Fini()` 恢复终端 | tview Application.Run defer |
+| L7 | `App.BailOut()` → `nukeK9sShell()` 退出清理 | [app.go:BailOut L540-L542](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go#L540-L542) |
+
+### 5.2 Node Shell 清理机制
+
+Node Shell 会启动名为 `k9s-shell-{k9s_pid}` 的特权 Pod，通过命名带 pid 实现多实例隔离。
+
+**三重清理保障**：
+1. **启动前清理** [exec.go:launchNodeShell L301-L304](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L301-L304)：防止上次崩溃残留
+2. **使用后清理** [exec.go:launchPodShell L332-L337](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L332-L337) defer：正常退出路径
+3. **应用退出清理** [app.go:BailOut L540-L542](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go#L540-L542)：整个应用退出时
+
+**nukeK9sShell 实现** [exec.go:381-L405](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L381-L405)：
 ```go
-ctx, cancel := context.WithCancel(context.Background())
-defer func() {
-    if !opts.background {
-        cancel()      // 取消命令上下文，终止子进程
-        clearScreen() // 清屏，准备恢复 TUI
-    }
-}()
-
-// 信号监听 goroutine
-sigChan := make(chan os.Signal, 1)
-signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
-go func(cancel context.CancelFunc) {
-    select {
-    case sig := <-sigChan:
-        slog.Debug("Command canceled with signal", slogs.Sig, sig)
-        cancel() // 用户按 Ctrl+C 时取消命令
-    case <-ctx.Done():
-        slog.Debug("Signal context canceled!")
-    }
-    interrupted = true
-}(cancel)
-```
-
-**第二层：run 函数恢复后台任务** [exec.go:run](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L112-L113)
-```go
-a.Halt()       // 停止后台集群更新、文件监听等
-defer a.Resume() // 恢复后台任务
-```
-
-**第三层：视图刷新控制** [pod.go:resumeShellIn](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L388-L401)
-```go
-c.Stop()       // 停止当前视图的数据刷新
-defer c.Start() // 恢复视图刷新
-```
-
-### 4.2 Node Shell 特殊清理
-
-Node Shell 会启动一个特权 pod 访问节点，需要额外的清理机制防止残留。
-
-**清理触发点：**
-
-1. **启动前清理** [exec.go:launchNodeShell](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L301-L304)
-   - 防止之前的 k9s-shell pod 残留
-
-2. **使用后清理** [exec.go:launchPodShell](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L332-L337)
-   ```go
-   defer func() {
-       if err := nukeK9sShell(a); err != nil { ... }
-   }()
-   ```
-
-3. **应用退出清理** [app.go:BailOut](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go#L540-L542)
-   ```go
-   if err := nukeK9sShell(a); err != nil {
-       slog.Error("Unable to nuke k9s shell pod", ...)
-   }
-   ```
-
-**nukeK9sShell 实现** [exec.go:nukeK9sShell](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L381-L405)：
-- 检查 `NodeShell` feature gate 是否启用
-- 删除名为 `k9s-shell-{pid}` 的 pod（pid 是 k9s 进程 ID）
-- 500ms 超时避免阻塞
-
-### 4.3 tview 内置 Panic 恢复
-
-[tview Run 函数](https://raw.githubusercontent.com/derailed/tview/v0.8.5/application.go) 中的防御性编程：
-```go
-defer func() {
-    if p := recover(); p != nil {
-        if a.screen != nil {
-            a.screen.Fini() // panic 时确保终端状态恢复，避免终端乱码
-        }
-        panic(p)
-    }
-}()
+func nukeK9sShell(a *App) error {
+    // 检查 Feature Gate
+    ct, err := a.Config.K9s.ActiveContext()
+    if err != nil || !ct.FeatureGates.NodeShell { return nil }
+    // 使用 k9s 进程 pid 构造 pod 名
+    podName := fmt.Sprintf("k9s-shell-%d", os.Getpid())
+    // 删除 pod，500ms 超时避免阻塞
+    ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+    defer cancel()
+    err = a.factory.Client().CoreV1().Pods(ns).Delete(ctx, podName, metav1.DeleteOptions{})
+    // 404 不算错误（pod 可能已不存在）
+    if errors.IsNotFound(err) { return nil }
+    return err
+}
 ```
 
 ---
 
-## 5. 完整调用链图
+## 6. 完整调用链图
 
 ```
 用户按键 (s/a)
     ↓
-[pod.go] shellCmd/attachCmd
-    ├─ podIsRunning() 检查 Pod 状态
-    └─ containerShellIn/containerAttachIn
-        ├─ 多容器时显示 Picker 选择器
-        └─ resumeShellIn/resumeAttachIn
-            ├─ c.Stop()               // 停止视图刷新
-            ├─ [pod.go] shellIn/attachIn
-            │   └─ [exec.go] runK
-            │       ├─ exec.LookPath("kubectl")  查找 kubectl
-            │       ├─ 追加 --as/--as-group/--context 等参数
-            │       └─ [exec.go] run
-            │           ├─ a.Halt()             // 停止后台任务
-            │           ├─ defer a.Resume()      // 恢复后台任务
-            │           └─ a.Suspend(f)          // 挂起 TUI
-            │               ├─ screen.Suspend()   // 终端恢复标准模式
-            │               ├─ f() → [exec.go] execute
-            │               │   ├─ clearScreen()
-            │               │   ├─ ctx, cancel := context.WithCancel()
-            │               │   ├─ 启动 SIGINT/SIGTERM 监听 goroutine
-            │               │   ├─ exec.CommandContext(ctx, "kubectl", ...)
-            │               │   ├─ cmd.Stdin/Stdout/Stderr = os.Stdin/os.Stdout/os.Stderr
-            │               │   ├─ cmd.Run()          // kubectl 完全接管终端
-            │               │   │   └─ kubectl 内部处理:
-            │               │   │       ├─ SPDY/WebSocket 连接 API Server
-            │               │   │       ├─ 分配 PTY
-            │               │   │       ├─ 监听 SIGWINCH 信号
-            │               │   │       ├─ ioctl(TIOCGWINSZ) 读尺寸
-            │               │   │       └─ SPDY resize 子通道同步
-            │               │   └─ defer: cancel() + clearScreen()
-            │               └─ screen.Resume()    // 终端恢复原始模式
-            └─ defer c.Start()                  // 恢复视图刷新
+┌───────────────────────────────────────────────────────┐
+│  多视图入口层（统一调用 containerShellIn/containerAttachIn） │
+│  Pod 列表 → shellCmd                                   │
+│  Container 列表 → shellCmd                             │
+│  Xray 拓扑 → xray.shellCmd (提取 parent path)          │
+│  Node 列表 → sshCmd → launchNodeShell (启动特权 Pod)   │
+└───────────────────────────────────────────────────────┘
+    ↓
+containerShellIn
+    ├─ podIsRunning() 检查
+    ├─ 多容器时弹出 Picker
+    └─ resumeShellIn
+        ├─ c.Stop()                 // L4: 停止视图刷新
+        ├─ shellIn
+        │   └─ runK
+        │       ├─ exec.LookPath("kubectl")
+        │       ├─ 追加 --as/--as-group/--context/--kubeconfig
+        │       └─ run
+        │           ├─ a.Halt()    // L3: 停止后台任务
+        │           ├─ defer a.Resume()   // L3 defer
+        │           └─ a.Suspend(f)       // tview 挂起 TUI
+        │               ├─ screen.Suspend()   // tcsetattr 恢复标准模式
+        │               ├─ f() → execute      // L1 & L2: execute 函数
+        │               │   ├─ clearScreen()
+        │               │   ├─ ctx, cancel := WithCancel()
+        │               │   ├─ defer: cancel() + clearScreen()  // L1 defer
+        │               │   ├─ goroutine: SIGINT/SIGTERM → cancel  // L2
+        │               │   ├─ exec.CommandContext(ctx, "kubectl", ...)
+        │               │   └─ pipe(ctx, opts, ..., cmds)
+        │               │       └── 单命令模式:
+        │               │           cmd.Stdin = os.Stdin   ★ IO 接管点
+        │               │           cmd.Stdout = os.Stdout ★ IO 接管点
+        │               │           cmd.Stderr = os.Stderr ★ IO 接管点
+        │               │           cmd.Run() ───────────────┐
+        │               │           ┌────────────────────────┘
+        │               │           │ kubectl 子进程内部:
+        │               │           │ ├─ SetupTTY: MakeRaw + SaveState
+        │               │           │ ├─ TTY.MonitorSize():
+        │               │           │ │   ├─ signal.Notify(SIGWINCH) ★ 尺寸监听点
+        │               │           │ │   ├─ monitorResizeEvents goroutine
+        │               │           │ │   └─ sizeQueue.Next() ← TerminalSizeQueue
+        │               │           │ ├─ SPDYExecutor.Stream():
+        │               │           │ │   └─ handleResizes goroutine:
+        │               │           │ │       Next() → JSON → resizeStream ★ 尺寸发送点
+        │               │           │ └─ TTY.Safe defer: stopResize + RestoreTerminal
+        │               └─ screen.Resume()   // tcsetattr 重新设置原始模式 + 重绘
+        └─ defer c.Start()   // L4 defer: 恢复视图刷新
 ```
-
----
-
-## 6. 关键设计决策分析
-
-### 6.1 为什么调用 kubectl 而不是直接用 client-go API？
-
-| 优点 | 缺点 |
-|------|------|
-| 复用 kubectl 成熟的 exec/attach 实现（TTY 分配、信号处理、resize 同步） | 需要用户 PATH 中有 kubectl 二进制 |
-| 自动兼容不同 k8s 版本和容器运行时 | 多了一层进程开销 |
-| 命令会经过 k8s API Server 的审计日志 | 无法细粒度控制终端行为 |
-| 代码量大幅减少，维护成本低 | |
-
-### 6.2 为什么需要多层 Halt/Resume？
-
-- **`a.Halt()`/`a.Resume()`**：停止集群信息更新、配置文件监听等后台任务，避免在终端会话期间产生干扰输出或竞争条件
-- **`c.Stop()`/`c.Start()`**：停止当前视图的数据刷新，避免在终端会话期间更新 UI 导致屏幕混乱
-
-### 6.3 异常恢复保障层级
-
-1. **kubectl 进程崩溃** → `execute` defer 清理 + `run` defer 恢复 TUI
-2. **用户 Ctrl+C 中断** → 信号 goroutine 取消 context → defer 链正常执行
-3. **k9s 内部 panic** → tview Run 函数的 defer 恢复终端状态
-4. **k9s 进程被强制杀死** → Node Shell pod 可能残留，但命名带 pid 可识别
-5. **应用正常退出** → `BailOut()` 主动清理 k9s-shell pod
 
 ---
 
 ## 7. 核心代码文件速查表
 
-| 文件 | 核心函数 | 职责 |
-|------|----------|------|
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go) | `runK`, `run`, `execute`, `pipe`, `nukeK9sShell` | kubectl 命令执行、TUI 挂起恢复、Node Shell 清理 |
-| [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go) | `shellCmd`, `attachCmd`, `containerShellIn`, `shellIn`, `buildShellArgs` | Pod 视图的 exec/attach 入口、命令参数构建 |
-| [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go) | `shellCmd`, `attachCmd` | Container 视图的 exec/attach 入口 |
-| [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go) | `Halt`, `Resume`, `BailOut` | 后台任务启停、应用退出清理 |
-| [ui/app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/ui/app.go) | `Suspend` (继承自 tview) | TUI 挂起（tview 提供） |
+| 文件 | 核心函数/代码行 | 职责 |
+|------|----------------|------|
+| [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go) | `shellCmd`(222-238), `attachCmd`(240-256), `containerShellIn`(358-386), `buildShellArgs`(478-503) | Pod 视图入口、容器选择、命令参数构建 |
+| [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go) | `shellCmd`(158-181), `attachCmd`(183-194) | Container 视图入口 |
+| [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go) | `shellCmd`(340-362), `attachCmd`(364-385), key binding(207-232) | Xray 拓扑图视图入口 |
+| [node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go) | `bindDangerousKeys`(75-77), `sshCmd`(179-191) | Node Shell 入口，Feature Gate 检查 |
+| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go) | `runK`(57-97), `run`(99-122), `execute`(172-239), **`pipe`(549-615)**, `nukeK9sShell`(381-405) | **★ IO 接管核心**、TUI 挂起恢复、清理 |
+| [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go) | `Halt`(334-339), `Resume`(342-362), `BailOut`(540-542) | 后台任务启停、应用退出清理 |
+| [actions.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go) | `hotKeyActions`(60-106), `pluginActions`(115+) | 热键、插件入口 |
+| *kubectl* util/term/term.go | `TTY.Safe()`, `MakeRaw`, `RestoreTerminal` | 终端原始模式设置、状态恢复 |
+| *kubectl* util/term/resize.go | `TTY.MonitorSize()`, `sizeQueue.Next()`, `GetSize()` | **★ 尺寸同步核心**、SIGWINCH 到 TerminalSizeQueue 的桥接 |
+| *kubectl* util/term/resizeevents.go | `monitorResizeEvents()` | **★ SIGWINCH 信号监听**、TIOCGWINSZ 读尺寸 |
+| *client-go* remotecommand/v3.go | `handleResizes()` | SPDY resize 子通道尺寸发送 |
