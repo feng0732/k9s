@@ -300,15 +300,29 @@ func (t PortTunnels) CheckAvailable(ctx context.Context) error {
 }
 ```
 
-**注意**：`startFwdCB` 中先调用 `CheckAvailable` 全部通过后才继续，避免部分成功部分失败的状态。
+**⚠️ CheckAvailable 的真实作用（按源码）**：
+- 它**只检查端口占用**这一个条件，提前拦掉端口被占用的情况
+- 它**不能避免所有部分成功的场景**，因为后续还有两个检查在循环内：`ForwarderFor`（重复转发检测）和 `pf.Start()`（启动连接）
+- 这两步任何一个失败，前面已经 `go runForward()` 启动的转发**不会被回滚**，会留在转发表中形成部分成功状态
 
 ### 3.3 重复转发检测
 
-在启动前检查是否已有相同的转发存在，定义于 [pf_extender.go:155-L157](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/pf_extender.go#L155-L157)：
+**⚠️ 重要：这步检查在循环内逐个进行**，代码位于 [pf_extender.go:154-L157](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/pf_extender.go#L154-L157)：
 
 ```go
-if _, ok := v.App().factory.ForwarderFor(dao.PortForwardID(path, pt.Container, pt.PortMap())); ok {
-    return fmt.Errorf("port-forward is already active on pod %s", path)
+tt := make([]string, 0, len(pts))
+for _, pt := range pts {
+    if _, ok := v.App().factory.ForwarderFor(dao.PortForwardID(path, pt.Container, pt.PortMap())); ok {
+        return fmt.Errorf("port-forward is already active on pod %s", path)
+    }
+    // ⭐ 注意：检测通过后立即启动，没有第二重预检查
+    pf := dao.NewPortForwarder(v.App().factory)
+    fwd, err := pf.Start(path, pt)
+    if err != nil {
+        return err   // ⚠️ 这里失败不会回滚前面已启动的项
+    }
+    go runForward(v, pf, fwd)
+    tt = append(tt, pt.LocalPort)
 }
 ```
 
@@ -336,6 +350,74 @@ func (p *PortForwarder) Start(path string, tt port.PortTunnel) (*portforward.Por
     return p.forwardPorts("POST", req.URL(), tt.Address, tt.PortMap())
 }
 ```
+
+### 4.1.1 批量启动的原子性：CheckAvailable 不能避免部分成功
+
+**⚠️ 这是之前文档理解不准确的核心点**。按源码 [startFwdCB](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/pf_extender.go#L148-L177) 的真实执行顺序：
+
+```go
+func startFwdCB(v ResourceViewer, path string, pts port.PortTunnels) error {
+    // ── 阶段1：预检查（只拦端口占用） ──
+    if err := pts.CheckAvailable(context.Background()); err != nil {
+        return err   // 端口占用直接失败，此时还没启动任何转发，无副作用
+    }
+
+    tt := make([]string, 0, len(pts))
+    for _, pt := range pts {
+        // ── 阶段2：循环内检查（无事务，失败不回滚） ──
+        // 检查2a: 重复转发检测
+        if _, ok := v.App().factory.ForwarderFor(...); ok {
+            return fmt.Errorf("port-forward is already active ...")
+        }
+        pf := dao.NewPortForwarder(v.App().factory)
+        // 检查2b: 启动连接（RBAC 权限、APIServer 连接等）
+        fwd, err := pf.Start(path, pt)
+        if err != nil {
+            return err   // ⚠️ 关键：这里 return 时，前面已启动的 goroutine 不会被 Stop
+        }
+        go runForward(v, pf, fwd)   // ⭐ 已启动的转发进入转发表
+        tt = append(tt, pt.LocalPort)
+    }
+    // ... 全部成功的提示 ...
+}
+```
+
+**三阶段检查的失败影响对比**：
+
+| 检查阶段 | 位置 | 检查内容 | 失败时已启动的转发 | 是否回滚 |
+|---------|------|---------|------------------|---------|
+| 1. `CheckAvailable` | 循环前 | 本地端口占用 | 0 个（还没启动任何转发） | ✅ 无副作用 |
+| 2. `ForwarderFor` | 循环内 | 转发表中是否已存在 | 前面 N-1 个已 `go runForward` | ❌ 不会回滚 |
+| 3. `pf.Start` | 循环内 | RBAC 权限、APIServer 连接、协议握手 | 前面 N-1 个已 `go runForward` | ❌ 不会回滚 |
+
+**典型的部分成功场景**：
+```
+配置 3 个自动转发：c1::8080, c2::8081, c3::8082
+  │
+  ├─ CheckAvailable 全部通过
+  │
+  ├─ 循环第 1 项 c1::8080：
+  │    ├─ ForwarderFor 不存在 ✅
+  │    ├─ pf.Start 成功 ✅
+  │    └─ go runForward → 已加入转发表 ✓
+  │
+  ├─ 循环第 2 项 c2::8081：
+  │    ├─ ForwarderFor 不存在 ✅
+  │    ├─ pf.Start 成功 ✅
+  │    └─ go runForward → 已加入转发表 ✓
+  │
+  └─ 循环第 3 项 c3::8082：
+       ├─ ForwarderFor 不存在 ✅
+       ├─ pf.Start 失败 ❌（如 APIServer 突然拒绝）
+       └─ return err
+           │
+           └─ 结果：c1、c2 已成功启动并留在转发表中，c3 未启动
+              （c1、c2 不会被自动停止）
+```
+
+**竞态窗口**：
+- `CheckAvailable` 到 `pf.Start` 之间有时间窗口，期间端口可能被其他进程占用、或其他线程添加了相同的转发
+- 这两个情况都会被循环内的检查拦住，但前面已启动的项不会回滚
 
 ### 4.2 协议降级机制
 
@@ -733,15 +815,17 @@ func (f *Factory) Terminate() {
     │            └─ 用户点击 OK → ToTunnels() → startFwdCB()
     ↓
 [pf_extender.go:148] startFwdCB()
-    ├─ PortTunnels.CheckAvailable() 全部端口可用性检查
-    ├─ 检查转发是否已存在 (ForwarderFor ID)
-    ├─ 每个 PortTunnel:
+    ├─ PortTunnels.CheckAvailable()  // ⚠️ 循环前预检查，只拦端口占用
+    │   └─ ❌ 不能防止后续循环内的失败导致部分成功
+    ├─ 循环处理每个 PortTunnel:
+    │   ├─ 检查转发是否已存在 (ForwarderFor ID)  // ⚠️ 循环内检查，失败不回滚
     │   ├─ NewPortForwarder()
-    │   └─ pf.Start(path, pt)
-    │       ├─ age = time.Now() [用于后续失效检测]
-    │       ├─ RBAC: GET pods + CREATE pods/portforward
-    │       └─ forwardPorts(): WebSocket优先 → SPDY降级
-    └─ go runForward(v, pf, fwd)  // 启动独立goroutine
+    │   ├─ pf.Start(path, pt)                  // ⚠️ 循环内启动，失败不回滚
+    │   │   ├─ age = time.Now() [用于后续失效检测]
+    │   │   ├─ RBAC: GET pods + CREATE pods/portforward
+    │   │   └─ forwardPorts(): WebSocket优先 → SPDY降级
+    │   └─ go runForward(v, pf, fwd)  // 已启动，后续失败不会 Stop
+    └─ 全部成功才显示成功提示（部分成功时用户只看到错误，看不到已启动的转发）
         ↓
     [goroutine] runForward()
         ├─ factory.AddForwarder(pf)  // 注册到转发表
@@ -780,7 +864,7 @@ func (f *Factory) Terminate() {
 ### 8.1 端口分配
 - 没有自动分配随机端口的机制，端口由用户指定或注解配置
 - 通过实际绑定测试来检查端口可用性，确保准确性
-- 启动前双重检查（可用性+重复转发检测）
+- 预检查 `CheckAvailable` 只拦端口占用，重复转发检测和 `pf.Start` 在**循环内逐个进行**，失败不回滚已启动项
 - `PreferredPorts` 支持注解中用端口名匹配，内部回填实际端口号
 
 ### 8.2 连接保持
@@ -836,6 +920,10 @@ func (f *Factory) Terminate() {
 6. **失效检测检测周期**：连接失败进入退避期间（最长 2 分钟），`ValidatePortForwards` 不会执行，可能存在僵尸转发窗口
 
 7. **Forwarders() 返回 map 引用**：虽然读取时有 `RLock()`，但返回的是 map 引用，外部调用方如果并发修改仍有并发风险
+
+8. **⚠️ 批量启动无回滚**：`startFwdCB` 循环内任何一步失败（重复转发检测、`pf.Start`），前面已 `go runForward` 启动的转发**不会被自动停止**，留在转发表中形成部分成功状态
+   - 只有 `CheckAvailable` 失败是干净的（此时还没启动任何转发）
+   - 用户看到错误提示，但可能不知道部分转发已经启动
 
 ### 9.2 代码优化建议
 
@@ -901,6 +989,46 @@ func (f *Factory) Forwarders() Forwarders {
     ff := make(Forwarders, len(f.forwarders))
     for k, v := range f.forwarders { ff[k] = v }   // ⭐ 返回副本
     return ff
+}
+```
+
+**优化5：startFwdCB 批量启动失败时回滚已启动的转发**
+
+```go
+func startFwdCB(v ResourceViewer, path string, pts port.PortTunnels) error {
+    if err := pts.CheckAvailable(context.Background()); err != nil {
+        return err
+    }
+
+    // ⭐ 记录已成功启动的转发，失败时回滚
+    started := make([]watch.Forwarder, 0, len(pts))
+    tt := make([]string, 0, len(pts))
+    defer func() {
+        // 函数返回前检查是否有部分成功需要回滚
+        if err != nil && len(started) > 0 {
+            slog.Warn("Rolling back partially started port-forwards", slogs.Count, len(started))
+            for _, pf := range started {
+                pf.Stop()
+                v.App().factory.DeleteForwarder(pf.ID())
+            }
+        }
+    }()
+
+    for _, pt := range pts {
+        if _, ok := v.App().factory.ForwarderFor(dao.PortForwardID(path, pt.Container, pt.PortMap())); ok {
+            return fmt.Errorf("port-forward is already active on pod %s", path)
+        }
+        pf := dao.NewPortForwarder(v.App().factory)
+        fwd, err := pf.Start(path, pt)
+        if err != nil {
+            return err
+        }
+        started = append(started, pf)   // ⭐ 记录已启动的
+        go runForward(v, pf, fwd)
+        tt = append(tt, pt.LocalPort)
+    }
+    // ... 成功提示 ...
+    return nil
 }
 ```
 
