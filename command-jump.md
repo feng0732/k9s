@@ -104,23 +104,35 @@ case tcell.KeyEnter, tcell.KeyCtrlE:
 
 **触发源**：`FishBuff.Add` / `FishBuff.Delete` → `Notify` → `suggestionFn`
 
-**作用范围**：仅修改 `suggestions` 列表和 `suggestion` 字段，通过 `SuggestionChanged` 通知 Prompt 重绘灰色建议文本。**不修改 `buff`（用户实际输入），不触发任何命令执行。**
+**作用范围**：修改 `suggestions` 列表，通过 `SetText` 触发 `BufferCompleted` 事件通知 Prompt 重绘灰色建议文本。**不触发任何命令执行。**
 
-**时序**：每次字符增删后立即触发（同步调用 `suggestionFn`），与 `BufferCompleted` 的 100ms 延时无关。
+> **关键纠正**：建议更新后，并不是通过 `SuggestionChanged` 事件单独刷新界面。`fireSuggestionChanged` 内部调用 `SetText` 设置建议文本，由 `SetText` 触发 `BufferCompleted` 事件驱动 UI 刷新。`BufferCompleted` 是补全刷新的实际事件通道。详见「完整刷新链」。
 
-**数据流向**：
+**时序**：每次字符增删后立即触发（同步调用 `suggestionFn`），`SetText` 触发的 `BufferCompleted` 是同步的，与 `Add`/`Delete` 中 100ms 延时的 `BufferCompleted` 是两个独立的触发源。
+
+**完整刷新链（对照代码）**：
 
 ```
 FishBuff.Add(r)
-  ├── CmdBuff.Add(r)          → buff 追加字符
-  │   ├── fireBufferChanged   → Prompt.BufferChanged → 重绘（显示新字符）
-  │   └── 100ms 后 fireBufferCompleted → Prompt.BufferCompleted → 重绘（无视觉差异）
   │
-  └── Notify(false)           → suggestionFn(buff text)
-      └── fireSuggestionChanged → Prompt.SuggestionChanged → 重绘（显示灰色建议）
+  ├── CmdBuff.Add(r)                     [cmd_buff.go#L147-L163]
+  │   ├── buff 追加字符
+  │   ├── fireBufferChanged(...)         → Prompt.BufferChanged → 重绘（显示新字符）
+  │   └── 100ms 后 fireBufferCompleted(...) → Prompt.BufferCompleted → 重绘（延时优化）
+  │
+  └── Notify(false)                       [fish_buff.go#L108-L113]
+      └── fireSuggestionChanged(ss)       [fish_buff.go#L127-L137]
+          ├── 更新 f.suggestions 和 f.suggestionIndex
+          ├── 计算 suggest = ss[0]（首项）
+          └── SetText(text, suggest, true)  [cmd_buff.go#L135-L144]
+              ├── 设置 buff 和 suggestion
+              └── fireBufferCompleted(text, suggest)  ← 同步触发！
+                  └── Prompt.BufferCompleted → update → 重绘（显示灰色建议）
 ```
 
-> `BufferCompleted` 在此边界中仅触发 `Prompt.update`（重绘），语义上等价于 `BufferChanged`，两者在 Prompt 中的实现完全相同。`BufferCompleted` 的"完成"含义仅对 **FilterBuffer** 有语义差异（见下文对比）。
+**为什么 BufferCompleted 而不是 SuggestionChanged？**
+
+虽然 `SuggestionListener` 接口定义了 `SuggestionChanged(text, sugg string)` 方法，Prompt 也实现了它，但**在补全刷新路径中从未被调用**。`fireSuggestionChanged` 的方法名有误导性——它实际上是更新内部状态后调用 `SetText`，由 `SetText` 触发 `BufferCompleted` 事件。这是一个设计上的简化：用 `BufferCompleted` 统一处理文本和建议的更新，不需要单独的建议变更事件。
 
 **建议的接受**：用户按 Tab/→/CtrlF 时，Prompt 将 `currentSuggestion` 追加到 `buff`：
 
@@ -132,7 +144,7 @@ case tcell.KeyTab, tcell.KeyRight, tcell.KeyCtrlF:
     }
 ```
 
-接受建议是**修改输入内容的操作**，属于补全边界与输入边界的交叉点。
+接受建议也是通过 `SetText` 触发 `BufferCompleted` 重绘 UI，与建议更新使用相同的事件通道。
 
 ### 边界二：执行（Execution）
 
@@ -301,8 +313,12 @@ func (a *App) lastCommand(evt *tcell.EventKey) *tcell.EventKey {
 │                    补全刷新边界（Suggestion）                  │
 │  触发：每次字符增删                                           │
 │  输入：FishBuff.buff 当前文本                                 │
-│  输出：suggestions 列表 → Prompt 灰色建议                      │
+│  输出：suggestions 列表 → SetText → fireBufferCompleted       │
+│        → Prompt.BufferCompleted → 灰色建议显示                │
 │  副作用：无（仅 UI 重绘）                                      │
+│  ─────────────────────────────────────────────────────────── │
+│  关键：不通过 SuggestionChanged 事件，而是通过 SetText 触发     │
+│        BufferCompleted 统一刷新界面                           │
 │  ─────────────────────────────────────────────────────────── │
 │  特殊：空输入时读取 cmdHistory.List() 作为建议源               │
 │        ← 历史回填边界为补全刷新边界提供数据（入口 A）             │
@@ -349,7 +365,7 @@ func (a *App) lastCommand(evt *tcell.EventKey) *tcell.EventKey {
 |------|--------|------|
 | `BufferCompleted` | `Prompt.BufferCompleted` | 重绘 UI（`p.update`） |
 | `BufferCompleted` | `App.BufferCompleted` | **空操作**（方法体为空） |
-| `SuggestionChanged` | `Prompt.SuggestionChanged` | 重绘 UI（含灰色建议） |
+| `SuggestionChanged` | `Prompt.SuggestionChanged` | 接口实现存在，但**在补全刷新路径中从未被调用**（实际通过 `SetText` → `BufferCompleted` 刷新 UI） |
 
 `BufferCompleted` 在命令面板上下文中是**纯 UI 信号**，不驱动任何业务逻辑。
 
@@ -883,16 +899,21 @@ App.activateCmd → ResetPrompt(FishBuff) → FishBuff.SetActive(true)
 FishBuff.Add(r)
   │
   ├── CmdBuff.Add(r)
-  │   ├── fireBufferChanged → Prompt.BufferChanged → 重绘
-  │   └── 100ms 后 fireBufferCompleted → Prompt.BufferCompleted → 重绘（无业务效果）
+  │   ├── fireBufferChanged → Prompt.BufferChanged → 重绘（显示新字符）
+  │   └── 100ms 后 fireBufferCompleted → Prompt.BufferCompleted → 重绘（延时优化）
   │
   └── Notify → suggestionFn(buff)
       ├── 空 → cmdHistory.List()（历史回填入口 A）
       └── 非空 → alias 前缀匹配 + SuggestSubCommand
-      └── fireSuggestionChanged → Prompt.SuggestionChanged → 灰色建议显示
+      └── fireSuggestionChanged
+          ├── 更新 suggestions 列表
+          ├── 计算 suggest = ss[0]（首项）
+          └── SetText(text, suggest, true)
+              └── fireBufferCompleted → Prompt.BufferCompleted → 重绘（显示灰色建议）
   │
   ▼ 用户按 Tab
-Prompt.keyboard → SetText(buff+suggestion) → 建议追加到 buff → 重绘
+Prompt.keyboard → SetText(buff+suggestion, "", true)
+  └── fireBufferCompleted → Prompt.BufferCompleted → 重绘
   │
   ▼ 用户按 Enter
   │
