@@ -374,73 +374,134 @@ func (t *Table) buildRow(r int, re, ore model1.RowEvent, h model1.Header, pads M
 
 ---
 
-## 五、界面重绘：三层机制的本质差异
+## 五、界面重绘：三层机制的代码证据与真实边界
 
-界面重绘涉及 **三种完全不同层级的机制**，之前容易混淆的是"丢弃"和"排队"语义，本节逐一对齐源码讲清各自的边界。
+本节的所有结论都基于可复核的代码路径，不做推断。先讲清楚两个容易混淆的核心事实：
 
-### 5.1 三者定位总览
+1. **哪些请求会被丢弃？** — 只有 Model 层 `refresh()` 的并发请求会被 CAS 原子锁丢弃，其余一律排队执行。
+2. **`updating` 标志真的能跳过 UpdateUI 吗？** — 在当前代码实现中**不能**。所有进入 draw 队列的回调都会完整执行 UpdateUI，下文会给出逐行证据。
 
-先从代码位置和目的两个维度区分：
+### 5.1 三层机制定位（代码可复核）
 
-| 机制 | 所在文件 | 作用层 | 目的 | 语义 |
-|------|---------|-------|------|------|
-| ① **刷新并发控制**（CAS `inUpdate`） | `internal/model/table.go#L229-L247` | Model 层 | 防止同一份数据同时被拉取 + 计算 Delta | 尝试并行 → **直接丢弃** |
-| ② **界面回调入队**（`QueueUpdateDraw`） | tview.Application 方法 | 框架层 | 跨线程安全地把 UI 操作送到主循环 | 无论多少，**都进队列串行执行** |
-| ③ **绘制期间互斥**（Browser `updating`） | `internal/view/browser.go#L36-L65` | View 层 | 防止多条独立触发路径重复执行 `UpdateUI` | 有回调在跑 → **本轮跳过** |
+| 机制 | 所在文件 | 冲突语义 | 代码证据 |
+|------|---------|---------|---------|
+| ① **刷新并发控制（丢）** | `internal/model/table.go#L229-L247` | **直接丢弃** refresh() 并行调用 | `CompareAndSwapInt32(&t.inUpdate, 0, 1)`失败就 `return nil` |
+| ② **界面回调入队（排）** | `internal/ui/app.go#L75-L82` 封装 + tview 队列 | **绝不丢弃，一定入队串行执行** | 每次调用启动新 goroutine，调 `tview.Application.QueueUpdateDraw(f)` |
+| ③ **绘制期间互斥（跳）** | `internal/view/browser.go#L36-L65` | 设计意图为跳过，但**当前实现下实际不发生跳过** | 下文 5.4 节逐行证明 |
 
-三者是**逐层传递**关系：① 通过后才会触发 listener；listener 里调用 ② 入队；队列回调里用 ③ 判断是否跳过。
+三者的传递路径：`① 通过 → fire listener → listener 调 ② 入队 → tview 取出 f 执行 → 在 f() 首行执行 ③ 的检查`
 
-### 5.2 机制① 刷新并发控制（CAS inUpdate）：数据层防重入
+---
+
+### 5.2 机制① 刷新并发控制（CAS inUpdate）：唯一会丢弃请求的位置
 
 `internal/model/table.go#L229-L247`
 ```go
 func (t *Table) refresh(ctx context.Context) error {
-    // 在数据拉取 + Delta 计算的入口处，用原子锁防并发
+    // 代码证据：唯一会"丢"的位置
     if !atomic.CompareAndSwapInt32(&t.inUpdate, 0, 1) {
-        slog.Debug("Dropping update...")   // ★ 直接丢弃，什么都不做
-        return nil
+        slog.Debug("Dropping update...")
+        return nil   // 直接 return，不会 fire 任何 listener
     }
     defer atomic.StoreInt32(&t.inUpdate, 0)
 
-    if err := t.reconcile(ctx); err != nil {  // DAO.List + Render + Update(Delta)
+    if err := t.reconcile(ctx); err != nil {
         return err
     }
+    // 以下只有 CAS 成功才会执行
     data := t.Peek()
     if data.RowCount() == 0 {
-        t.fireNoData(data)   // 通知 listener（可能不止一个 Browser）
+        t.fireNoData(data)
     } else {
-        t.fireTableChanged(data)
+        t.fireTableChanged(data)  // 同步遍历 listeners 调 TableDataChanged
     }
     return nil
 }
 ```
 
-**边界和语义：**
-- 位置：**在 goroutine 中、数据拉取之前**
-- 语义：尝试并行调用 `refresh()` → **静默丢弃后到的请求**（不等，不落队列，直接返回 nil）
-- 场景：用户在定时刷新 tick 之前按 Ctrl+R 重跑 Start，刚好 2s 的 tick 也到了，就会出现两次 refresh 同时竞争 CAS
+**代码定位事实：**
+- CAS 成功才能进入 `reconcile`（DAO.List + Delta 计算）和 `fireXxx`
+- CAS 失败时直接 `return nil`，**完全不触发任何 View 层回调**
+- 释放时机：`defer`，`fireTableChanged` / `fireNoData` **同步执行完毕** 之后才释放锁（因为 `fire` 是同步遍历 listeners）
 
-### 5.3 机制② 界面回调入队（QueueUpdateDraw）：线程安全 + 严格串行
+---
 
-`QueueUpdateDraw` 是 **tview.Application** 的标准方法（k9s 不自己实现），语义是：
+### 5.3 机制② 界面回调入队（QueueUpdateDraw）：所有回调一定入队并串行执行
 
-> 把传入的闭包**压入 UI 主循环的事件队列尾部**，tview 下一次处理事件时会从队头依次取出**一个一个执行**。
+#### 5.3.1 k9s 的关键封装：每次调用都启动新 goroutine
 
-调用点有三类独立路径（都在 `internal/view/browser.go`）：
-
-| 触发源 | 位置 | 何时发生 |
-|--------|------|---------|
-| A. `TableDataChanged` | `#L338-L365` | 定时 refresh 成功，CAS 通过后 fire → listener |
-| B. `TableNoData` | `#L298-L335` | refresh 结果为空，同上路径 |
-| C. `BufferActive` | `#L228-L251` | 用户输入过滤器后回车，退出搜索模式时 |
-| D. `TableLoadFailed` | `#L368-L373` | refresh 失败超过退避阈值 |
-
-**关键：每一路径独立调用 QueueUpdateDraw，每次调用都产生一个新的闭包入队。入队本身永不丢弃，一定执行（除非 App 退出）。**
-
-### 5.4 机制③ 绘制期间互斥（Browser.updating）：串行回调的逻辑去重
-
-`internal/view/browser.go#L55-L65` — 读写锁保护的标志：
+`internal/ui/app.go#L75-L82`
 ```go
+// 代码证据：k9s 在 tview 之上又套了一层 goroutine
+func (a *App) QueueUpdateDraw(f func()) {
+    if a.Application == nil {
+        return
+    }
+    go func() {
+        a.Application.QueueUpdateDraw(f)  // 交给 tview 的 draw 队列
+    }()
+}
+```
+
+> 为什么要多套一层 goroutine？
+> tview.QueueUpdateDraw 是把 f 发到 `drawChan`（无缓冲 channel）。如果 tview Run 主循环消费较慢，send 操作会**阻塞调用方 goroutine**（比如 updater goroutine）。k9s 加一层 goroutine 就是为了避免调用方被 channel send 阻塞，把 send 移到一个临时 goroutine 里。
+
+#### 5.3.2 四条独立调用路径（每条都独立调一次 QueueUpdateDraw）
+
+| 触发源 | 入口位置 | 在哪个 goroutine 中被调用 | 什么时间发生 |
+|--------|---------|---------------------------|-------------|
+| A. `TableDataChanged` | `internal/view/browser.go#L338-L365` | **updater goroutine**（`fireTableChanged` 同步调用 listener） | 定时 refresh 成功 + CAS 通过 → reconcile 完成 → fire |
+| B. `TableNoData` | `internal/view/browser.go#L298-L335` | **updater goroutine**（同上） | refresh 后数据为空 + CAS 通过 |
+| C. `BufferActive` | `internal/view/browser.go#L228-L251` | **tview 主循环 goroutine**（用户按键事件 → CmdBuff.SetActive → fireActive 同步调用 listener） | 用户按回车退出 filter 模式时 |
+| D. `TableLoadFailed` | `internal/view/browser.go#L368-L373` | **updater goroutine**（`fireTableLoadFailed` 同步调用） | backoff 超过 2 分钟，持续失败 |
+
+**代码证据 A：TableDataChanged 在 updater goroutine（fire 是同步遍历）**
+
+`internal/model/table.go#L293-L299`
+```go
+func (t *Table) fireTableChanged(data *model1.TableData) {
+    t.listeners.Range(func(key, value any) bool {
+        value.(TableListener).TableDataChanged(data)  // 同步调，不是 go func
+        return true
+    })
+}
+```
+所以整个 `TableDataChanged() → b.Update() → b.app.QueueUpdateDraw()` 这一串都在 **updater goroutine** 中执行。
+
+**代码证据 C：BufferActive 在 tview 主循环 goroutine**
+
+`internal/model/cmd_buff.go#L83-L89`（SetActive）→ `#L241-L244`（fireActive）都是同步调 listener：
+```go
+func (c *CmdBuff) SetActive(b bool) {
+    c.mx.Lock()
+    c.active = b
+    c.mx.Unlock()
+    c.fireActive(c.active)  // 同步遍历 listeners 调 BufferActive
+}
+```
+
+而 `SetActive(false)` 的触发链：用户按回车 → tview 主循环处理按键 → Prompt 组件 → FishBuff/CmdBuff.Reset → SetActive(false) → fireActive。所以整个 `BufferActive() → model.Refresh() → model.Peek() → b.app.QueueUpdateDraw()` 这一串都在 **tview 主循环 goroutine** 中执行。
+
+#### 5.3.3 tview 的执行保证：所有 f() 在同一个 goroutine 串行执行
+
+无论哪个 goroutine 调 k9s.QueueUpdateDraw，最终所有 `f()` 闭包都在 **tview Run 主循环 goroutine** 中按进入队列的顺序**一个一个串行执行**。这是 tview 框架的核心线程安全保证。
+
+**这是下文分析 `updating` 行为的关键前提。**
+
+---
+
+### 5.4 机制③ 绘制期间互斥（Browser.updating）：当前实现下实际不跳过任何 UpdateUI
+
+#### 5.4.1 updating 标志和访问器的代码
+
+`internal/view/browser.go#L36-L65`
+```go
+type Browser struct {
+    ...
+    mx        sync.RWMutex  // 保护 updating
+    updating  bool          // 标志：是否"正在绘制"
+}
+
 func (b *Browser) setUpdating(f bool) {
     b.mx.Lock()
     defer b.mx.Unlock()
@@ -454,84 +515,121 @@ func (b *Browser) getUpdating() bool {
 }
 ```
 
-三条独立路径的回调内部结构都相同（以 TableDataChanged 为例）：
+#### 5.4.2 updating 在回调中的使用（以 TableDataChanged 为例）
 
 `internal/view/browser.go#L338-L365`
 ```go
 func (b *Browser) TableDataChanged(mdata *model1.TableData) {
-    // 前置计算（在 fire 的 goroutine 里执行，不占主线程）
+    // 前置计算在当前调用方 goroutine 中执行（通常是 updater goroutine）
     cdata := b.Update(mdata, b.app.Conn().HasMetrics())
 
     b.app.QueueUpdateDraw(func() {
-        // ★ 在主线程真正开始执行回调的第一时间检查
-        if b.getUpdating() {
-            return   // 已有另一条路径的绘制正在进行 → 本轮跳过
+        // ★ 关键：这部分闭包在 tview 主循环 goroutine 中串行执行
+        if b.getUpdating() {   // 第 1 步：读 updating
+            return
         }
-        b.setUpdating(true)
-        defer b.setUpdating(false)
+        b.setUpdating(true)    // 第 2 步：写 updating=true
+        defer b.setUpdating(false)  // 第 N 步：闭包 return 前重置
 
         b.refreshActions()
-        b.UpdateUI(cdata, mdata)   // Clear + 逐行 buildRow
+        b.UpdateUI(cdata, mdata)
     })
 }
 ```
 
-`BufferActive`（路径 C）的回调同样做了这件事（`#L240-L250`）：
-```go
-b.app.QueueUpdateDraw(func() {
-    if b.getUpdating() { return }
-    b.setUpdating(true)
-    defer b.setUpdating(false)
-    b.UpdateUI(cdata, mdata)
-})
-```
+所有三条路径（TableDataChanged / TableNoData / BufferActive）的 QueueUpdateDraw 闭包结构完全相同。
 
-### 5.5 时序例证：三条路径在 1ms 内先后触发的场景
+#### 5.4.3 逐行证明"当前实现下不会发生跳过"
 
-用一个最容易混淆的场景（用户刚输完 filter 回车，同时定时 tick 也到了）说明三者协作：
+下面基于代码事实逐步推导：
 
-```
-时间轴（T 为毫秒）：
-  T=0   updater goroutine 到达 2s tick，调 refresh() → CAS 通过（inUpdate=1）
-  T=0~5 refresh() 内部：DAO.List → Render → Delta 计算（假设耗时 5ms，此时 inUpdate=1）
-  T=2   用户按回车退出 filter，BufferActive() 被调用：
-          ├─ 先调 model.Refresh(ctx) → refresh() 检查 CAS → inUpdate 已经是 1
-          │     → 直接 return nil（被机制① 丢弃） ← 此时没任何 UI 变动
-          ├─ 再调 model.Peek() 拿当前数据（仍是 T=0 开始前的旧快照）
-          └─ b.Update(mdata) 算过滤
-          └─ QueueUpdateDraw(闭包 C1) 入队 ← 机制② 已接收，稍后会执行
-  T=5   refresh() 完成，Peek() 拿新快照，fireTableChanged：
-          └─ listener TableDataChanged 被调：
-              ├─ b.Update(mdata) 算过滤（基于新数据）
-              └─ QueueUpdateDraw(闭包 A1) 入队 ← 机制② 又接收一个
-  T=6   tview 主循环取出队头 → 执行 闭包 C1：
-          ├─ getUpdating() → false
-          ├─ setUpdating(true)
-          ├─ UpdateUI(旧快照)  →  用旧数据画出界面（filter 已生效，基于旧 snapshot）
-          └─ defer setUpdating(false)  ← 退出时重置
-  T=12  tview 主循环取下一个 → 执行 闭包 A1：
-          ├─ getUpdating() → false（C1 已经跑完，释放了）
-          ├─ setUpdating(true)
-          └─ UpdateUI(新快照)  →  画出最终正确界面，filter + 新数据同时生效
-```
+**前提事实（已由代码证明）：**
+- P1：所有闭包 f() 在**同一个 goroutine**（tview 主循环 goroutine）中**按队列顺序串行执行**。
+- P2：每个闭包内部的 `getUpdating() → setUpdating(true) → ... → defer setUpdating(false)` 这一整段代码在 goroutine 中**原子地顺序执行**，中间不会被其他闭包插入（因为是串行执行）。
+- P3：`defer setUpdating(false)` 在**当前闭包 return 之前**一定已执行完毕。
 
-**如果没有 `updating` 标志**，在更快的时序下：C1 正在执行 `UpdateUI`（主线程里跑 Clear + buildRow），此时 tview 同一个主线程不可能同时执行 A1，所以其实不会"并发操作 tview 控件"。那 `updating` 到底防什么？
+**逐行推导：**
+1. tview 取出队列第一个闭包 `f(C1)`，在主循环 goroutine 中执行。
+2. `f(C1)` 第 1 步：`getUpdating()` → `updating=false`（初始状态 / 上一个闭包已 defer 重置）。
+3. `f(C1)` 第 2 步：`setUpdating(true)` → `updating=true`。
+4. `f(C1)` 执行 `UpdateUI(...)`。
+5. `f(C1)` return，触发 defer：`setUpdating(false)` → `updating=false`。**此时 C1 已经完全退出。**
+6. tview 取出队列下一个闭包 `f(A1)`，**在同一个 goroutine 中继续串行执行。**
+7. `f(A1)` 第 1 步：`getUpdating()` → **此时 updating 一定是 false**（由 P2、P3：C1 的 defer setUpdating(false) 在**第 5 步就已经完成了**，在 A1 开始执行之前）。
+8. 所以 `f(A1)` 通过检查，执行 `setUpdating(true)` → UpdateUI → defer → false。
 
-它防的是下面这种 **逻辑上的重复绘制浪费**（注意 tview 回调虽然串行，但可以连续排多个）：
+**结论：** 在当前实现中，**所有进入 tview 队列的闭包都会通过 updating 检查并完整执行 UpdateUI**。`updating` 标志不会跳过任何一次 UpdateUI 调用。
+
+> 那 `updating` + RWMutex 有什么意义？
+> 这是**防御性编程**：
+> - RWMutex 保证即使未来有**其他 goroutine**（非 tview 主循环）直接读写 `updating` 也是线程安全的。
+> - updating 标志代表了"设计意图"——期望"同一时刻只允许一个绘制流程进行"。当前代码因为所有 f() 在同一个 goroutine 串行，这个意图天然被 tview 满足；但如果未来重构（比如把 QueueUpdateDraw 的 goroutine 嵌套去掉、或者引入并行渲染路径），这层保护就会真正生效。
+
+---
+
+### 5.5 完整时序例证（基于代码事实推演）
+
+场景：用户输入 filter 后按回车（BufferActive），刚好 2s tick 也触发 refresh，两条路径几乎同时发生。
 
 ```
-T=0   BufferActive 入队 C1（基于旧 snapshot）
-T=1   TableDataChanged 入队 A1（基于新 snapshot）
-T=2   TableNoData 又入队 B1（另一个命名空间切换触发）
+    updater goroutine          tview 主循环 goroutine          临时 goroutine（k9s 额外启动）
+   ──────────────────        ────────────────────────        ──────────────────────────────────
+T=0
+  │ time.After(2s)到
+  │ refresh()调用
+  │ → CAS 通过(inUpdate=1)
+  │ → reconcile()开始（耗时 T0-T5）
+  │                                │
+T=2 │                                │ 用户按回车：
+  │                                │   CmdBuff.SetActive(false)
+  │                                │   → fireActive 同步调
+  │                                │   → BufferActive() 在主循环中执行
+  │                                │     ├─ 调 model.Refresh() → refresh() CAS 失败
+  │                                │     │     → return nil（被机制①丢弃）
+  │                                │     ├─ model.Peek() 拿旧快照
+  │                                │     ├─ b.Update(mdata) 算过滤
+  │                                │     └─ b.app.QueueUpdateDraw(f_C1)
+  │                                │           → 启动 goroutine X1 ────────┐
+  │                                │                                        │
+  │                                │                               X1: tview.QueueUpdateDraw(f_C1)
+  │                                │                                    (send to drawChan，阻塞直到消费)
+T=5 │                                │                                        │
+  │ reconcile()完成                  │                                        │
+  │ → fireTableChanged()同步         │                                        │
+  │   → TableDataChanged()执行       │                                        │
+  │     ├─ b.Update(mdata)算过滤     │                                        │
+  │     └─ b.app.QueueUpdateDraw(f_A1)                                        │
+  │           → 启动 goroutine X2 ────────────────────────────────────┐        │
+  │                                                                  │        │
+  │                                                      X2: tview.QueueUpdateDraw(f_A1)
+  │                                                          (send to drawChan)
+  │                                                                  ↓        ↓
+T=6 │                               ┌──────────────────────────────────────────┘
+  │                               │ Run 循环 select 取到 f_C1
+  │                               │ 执行 f_C1（主循环 goroutine）：
+  │                               │   getUpdating()=false
+  │                               │   setUpdating(true)
+  │                               │   UpdateUI(旧快照+新filter)
+  │                               │   defer → setUpdating(false)  ← ★ 此时已变 false
+  │                               │   Draw() 刷到终端
+  │                               │
+T=12│                               │ Run 循环下一轮 select 取到 f_A1
+  │                               │ 执行 f_A1（同一 goroutine 继续）：
+  │                               │   getUpdating()=false  ← ★ C1 已经设为 false
+  │                               │   setUpdating(true)    ← ★ 通过检查，不被跳过
+  │                               │   UpdateUI(新快照+新filter)
+  │                               │   defer → setUpdating(false)
+  │                               │   Draw() 刷到终端
 ```
 
-三个闭包会被 tview **一个接一个地连续执行**。如果没有 updating，就是 3 次 Clear + 重建。有了 updating：
-- C1 执行时 `updating=true`
-- 紧跟着执行 A1 时，检查发现 `updating=true` → **return，跳过这次重绘**
-- B1 同理也会被跳过
-- 最终用户只看到一次绘制（C1 的结果），但 C1 之后 A1 的数据其实是更新的——等等，这里被跳过不是会丢数据吗？
+**本时序可复核的代码点：**
+- T=2 的 `model.Refresh()` 被 CAS 丢弃 → `internal/model/table.go#L229-L247`
+- BufferActive 在主循环 goroutine → `internal/model/cmd_buff.go#L83-L89` + `#L241-L244`
+- QueueUpdateDraw 启动临时 goroutine → `internal/ui/app.go#L75-L82`
+- C1 defer 结束后 A1 才开始（串行）→ tview Run 主循环单线程执行保证
+- A1 的 getUpdating() 看到 false → 不跳过 → 上文 5.4.3 的推导
 
-这就是为什么 **`updating` 的语义不是"保留最新"，而是"避免短时间内连续重绘"**。它要求业务上接受"第一次绘制的结果在一段时间内就是最终展示"。对于 2 秒刷新周期来说，这个牺牲是可接受的（下一个周期会补回最新数据）。
+---
 
 ### 5.6 UpdateUI：全量重建单元格（Clear + 逐行构建）
 
@@ -546,9 +644,9 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
         col++
     }
     cdata.Sort(t.getSortCol())             // 就地排序
-    ComputeMaxColumns(pads, ..., cdata)    // 算列宽
+    ComputeMaxColumns(pads, ..., cdata)    // 算对齐列宽
     cdata.RowsRange(func(row int, re model1.RowEvent) bool {
-        ore, _ := data.FindRow(re.Row.ID)  // 从原表找 Delta 信息
+        ore, _ := data.FindRow(re.Row.ID)  // 从原表查 Delta 信息
         t.buildRow(row+1, re, ore, cdata.Header(), pads)
         return true
     })
@@ -557,22 +655,23 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
 }
 ```
 
-> **关键点**：
-> - `cdata` = 过滤后展示用的 TableData（经过 Browser.filtered），`data` = 原始数据（用于查 Delta）
-> - 每次都是 **Clear 后全量重建**，没有 DOM diff；但由于是 tcell 内存单元格操作 + tview 双缓冲 Draw，用户不会感知"清空→重建"的过程
+> **代码事实：**
+> - `cdata` = Browser 过滤后的 TableData（行可能少），`data` = 原始 TableData（查 Delta 用）
+> - 每次 `UpdateUI` 都是 `Clear` 后**全量重建所有单元格**，没有增量 diff；但由于是 tcell 内存操作 + tview 双缓冲 Draw，用户不会看到"清空→重绘"过程
 > - `cdata.Sort()` 是就地排序，`RowsRange` 按排序后顺序遍历
 
-### 5.7 三者语义差异对比表
+---
 
-| 对比维度 | ① 刷新并发控制 | ② 回调入队 | ③ 绘制互斥 |
-|---------|---------------|-----------|-----------|
-| **处理对象** | `refresh()` 函数调用 | 任意 UI 操作闭包 | `UpdateUI()` 调用 |
-| **所在线程** | 任意 goroutine（通常是 updater） | 任意 goroutine 入队 → 主线程出队执行 | 主线程 |
-| **冲突策略** | **丢**（后到者直接 return nil） | **排队**（都进队列，一个一个跑） | **跳**（当前正在跑就 return，本轮不跑） |
-| **是否保存最新** | 不保存，靠下一轮 tick 补 | 全部保存，严格按入队顺序 | 不保存，被跳过的 UpdateUI 不会再执行 |
-| **代码位置** | model.Table.refresh 首行 | app.QueueUpdateDraw 调用点 | Browser 各 QueueUpdateDraw 闭包首行 |
-| **可重入释放时机** | defer atomic.Store（reconcile 全跑完） | 闭包 return（队列 FIFO 下一个） | defer setUpdating(false)（当前 UpdateUI 跑完） |
-| **典型冲突场景** | 用户 Ctrl+R 与 2s tick 撞车 | 三条独立路径各自调用 | 回调连续串行执行时的逻辑重复绘制 |
+### 5.7 三者语义差异对比（基于代码证据）
+
+| 对比维度 | ① 刷新并发控制 | ② 界面回调入队 | ③ 绘制互斥 |
+|---------|---------------|-------------|-----------|
+| **处理对象** | `refresh()` 调用 | `QueueUpdateDraw(f)` 中的 UI 闭包 f | UpdateUI 调用 |
+| **冲突策略** | **丢**（CAS 失败直接 return nil，不 fire listener） | **排**（全部入 tview 队列，按序串行执行，绝不丢） | 设计意图为"跳"，但**当前实现不会跳过**（见 5.4.3） |
+| **所在线程** | 任意 goroutine（通常 updater） | 任意 goroutine 调 k9s.QueueUpdateDraw → 启动临时 goroutine → tview 主循环执行 f | f() 全部在**同一个 goroutine**（tview 主循环）串行执行 |
+| **代码位置** | `internal/model/table.go#L229` 首行 | `internal/ui/app.go#L75-L82`（k9s 封装）+ 4 个 browser 调用点 | `internal/view/browser.go#L55-L65` + 3 处调用点 |
+| **释放时机** | defer atomic.Store（fireXxx 同步执行完毕后） | f() return → tview 取队列下一个 | defer setUpdating(false)（当前 f return 前） |
+| **典型场景** | Ctrl+R 与 2s tick 撞车 → 丢 | A/B/C/D 四条路径各自独立入队 → 排 | 连续排 2+ 个 f → 设计跳 实际全跑 |
 
 ---
 
@@ -581,14 +680,15 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
 | 阶段 | 边界位置 | 保障手段 | 失败/异常处理 |
 |------|---------|---------|--------------|
 | **刷新发起频率** | `updater time.After(rate)` + `refreshRate` | 定时器间隔（拉模式） | 指数退避，最长 2min 退出 |
-| **刷新并发控制（丢）** | `refresh()` 首行 | CAS 原子锁 `inUpdate` | 后到的 refresh 直接 return nil 丢弃 |
+| **refresh 并发控制（丢）** | `internal/model/table.go#L229-L247` 首行 | CAS 原子锁 `inUpdate` | 后到的 refresh 直接 return nil，**不 fire 任何 listener** |
+| **QueueUpdateDraw 封装（防阻塞）** | `internal/ui/app.go#L75-L82` | 每次调启动临时 goroutine，send drawChan 不阻塞调用方 | drawChan send 在临时 goroutine 里等待 |
+| **界面回调入队（排）** | `internal/view/browser.go` 4 处调用点 | tview draw 队列 FIFO + 主循环 goroutine 串行执行 | **全部入队，不会丢弃**（除非 App 退出） |
 | **DAO 数据源选择** | `resourceMeta(gvr)` | Registry 三层 fallback（明确 DAO → nil→Resource → Table） | 未注册资源默认 HTTP Table |
 | **Inform 缓存未就绪** | `Browser.TableNoData` | `HasSynced()` 检查 | 显示 Synchronizing 而非误报 |
 | **增量 Delta 计算** | `TableData.Update` | 按 ID 匹配 + DeltaRow | 无则 Add、有变 Update、无变 Unchanged、缺失 Delete |
 | **时间列防抖动** | `NewDeltaRow` | `h.IsTimeCol(i)` 跳过 | AGE 等变化不计入 Delta |
-| **界面回调入队（排）** | Browser 三处独立调用点 | `app.QueueUpdateDraw` 入 FIFO 队列 | 永远入队，tview 主线程按序出队 |
-| **绘制期间互斥（跳）** | 各 QueueUpdateDraw 回调首行 | `b.updating` 读写锁标志 | 已有绘制在执行时本轮 return 跳过 |
-| **UI 渲染串行** | `UpdateUI` 整体 | 仅在 QueueUpdateDraw 回调主线程中执行 | tview 双缓冲，操作控件线程安全 |
+| **绘制期间互斥（updating）** | Browser 3 个 QueueUpdateDraw 回调首行 | RWMutex + bool | 当前实现下**实际不跳过**（见 5.4.3），为防御性代码 |
+| **UpdateUI 全量重建** | `ui/table.go#L472-L505` | Clear + AddHeader + buildRow + 双缓冲 Draw | tview 主线程安全，用户看不到中间态 |
 
 ---
 
@@ -607,11 +707,15 @@ func (t *Table) UpdateUI(cdata, data *model1.TableData) {
 - 手动走 `refreshCmd → b.refresh() → b.Start()`，是重走整个 Watch 流程（会重建 context/cancel），定时只在 updater goroutine 内循环调 `t.refresh(ctx)`。
 
 **Q5：UpdateUI 全量重建会不会导致闪烁？**
-- tview 的 Draw 是双缓冲，更新完统一 `Sync()` 到终端；外层还有 `updating` 标志 + 2s 刷新间隔确保不会每秒重建。
+- tview 的 Draw 是双缓冲，更新完统一 `Sync()` 到终端；实际只有 C1 和 A1 两次独立绘制，不是每秒 1 次，用户感知不到"清空→重建"过程。
 
-**Q6：三层 UI 机制（CAS/入队/互斥）合并成一层不够吗？为什么要分层？**
-- 不够，因为三者解决的问题域不同：
-  - **CAS 不能替代 QueueUpdateDraw**：前者在数据层，不知道 UI 线程的存在；tview 控件不能在任意 goroutine 操作，所以必须有 QueueUpdateDraw 切到主线程。
-  - **QueueUpdateDraw 不能替代 updating**：入队是"全部保留按顺序跑"，如果 1ms 内三条路径各入队一次，就是 3 次连续重绘，浪费 CPU。updating 相当于在回调里再叠加一层"节流"——保留第一次，后两次跳过。
-  - **仅用 updating 又不能替代 CAS**：refresh() 的瓶颈在 DAO.List + Delta 计算（可能跨网络），不等这一步结束就直接丢弃，比"算完了进了队列再跳过"省得多。
-- 三者合起来是一个 **丢弃→排队→跳过** 的多级漏斗，越在前面丢弃，越节省后面的算力。
+**Q6：`updating` 标志当前实现不跳过任何 UpdateUI，那它是不是多余代码？**
+- 不是多余代码，而是**防御性编程**：
+  - RWMutex 保证即使未来有**其他 goroutine**（非 tview 主循环）直接读写 `updating` 也是线程安全的。
+  - 标志本身代表了"设计意图"——期望同一时刻只进行一次绘制流程。当前代码因为所有 f() 在同一个 goroutine 串行，意图天然被满足；但如果未来重构（比如去掉 k9s 的 `go func()` 嵌套、或者引入并行渲染路径），这层保护就会真正生效。
+
+**Q7：真正防重/节流的机制是哪个？**
+- 主要靠两层：
+  1. **CAS 原子锁 `inUpdate`**（`internal/model/table.go#L229`）：在数据层丢弃并行的 `refresh()` 请求，省掉了 DAO.List + Delta 计算的浪费。
+  2. **定时器 `time.After(rate)`**（`internal/model/table.go#L66`）：在最源头控制刷新频率（默认 2s），从根本上限制进入 `refresh()` 的次数。
+- `updating` 是最外层的"设计意图表达"，在当前代码路径上实际上不产生节流效果。
