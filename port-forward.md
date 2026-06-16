@@ -395,21 +395,23 @@ func runForward(v ResourceViewer, pf watch.Forwarder, f *portforward.PortForward
 }
 ```
 
-**失败退出后从转发表移除的调用链详解**：
+**失败退出后从转发表移除的调用链详解（带锁保护状态标注）**：
 
 ```
 ForwardPorts() 返回（无论正常/异常）
     ↓
-QueueUpdateDraw(...)          // 将清理操作序列化到 UI 主线程执行
-    ↓
+QueueUpdateDraw(...)          // 将清理回调排队到 UI 事件循环
+    ↓                         // ⚠️ 注意：这只是 UI 层的序列化，不影响 map 并发安全
 factory.DeleteForwarder(pf.ID())   // [factory.go:304-L311]
+    ❌ 无任何 f.mx 锁保护
     ↓
 forwarders.Kill(path)              // [forwarders.go:95-L113]
+    ❌ 遍历 map + delete 均裸操作
     ↓
 遍历 forwarders map：
   匹配 prefix = path + "|" 或完全相等
-    ├─ f.Stop()                   // 关闭 stopChan（但这里 ForwardPorts 已经返回了）
-    └─ delete(ff, k)              // 从 map 中删除
+    ├─ f.Stop()                   // 关闭 stopChan（ForwardPorts 已返回后属于重复调用）
+    └─ delete(ff, k)              // 从 map 删除
 ```
 
 **DeleteForwarder → Kill 具体代码**，定义于 [factory.go:304-L311](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/watch/factory.go#L304-L311) 和 [forwarders.go:95-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/watch/forwarders.go#L95-L113)：
@@ -417,7 +419,7 @@ forwarders.Kill(path)              // [forwarders.go:95-L113]
 ```go
 // factory.go
 func (f *Factory) DeleteForwarder(path string) {
-    count := f.forwarders.Kill(path)    // 调用 Forwarders.Kill
+    count := f.forwarders.Kill(path)    // ⚠️ 调用前后没有任何 f.mx 锁
     slog.Warn("Deleted portforward", slogs.Count, count, slogs.GVR, path)
 }
 
@@ -425,12 +427,12 @@ func (f *Factory) DeleteForwarder(path string) {
 func (ff Forwarders) Kill(path string) int {
     var stats int
     prefix := path + "|"                 // ⭐ 加 '|' 防止前缀误匹配
-    for k, f := range ff {
-        if k == path || strings.HasPrefix(k, prefix) {  // 完全相等或前缀匹配
+    for k, f := range ff {               // ⚠️ 无锁遍历 map
+        if k == path || strings.HasPrefix(k, prefix) {
             stats++
             slog.Debug("Stop and delete port-forward", slogs.Name, k)
             f.Stop()                     // 调用 Forwarder.Stop()
-            delete(ff, k)                // 从 map 删除
+            delete(ff, k)                // ⚠️ 无锁 delete map
         }
     }
     return stats
@@ -441,7 +443,7 @@ func (ff Forwarders) Kill(path string) int {
 1. `runForward` 中的清理逻辑**位于 goroutine 尾部**，是 Go 的结构化编程保证——只要函数返回就一定执行
 2. `ForwardPorts()` 返回的情况包括：端口绑定失败、连接断开、APIServer 拒绝、`stopChan` 被关闭等
 3. 即使 `ForwardPorts()` 启动时就失败（如端口已占用），流程仍会走到清理逻辑，确保不会留下僵尸条目
-4. `QueueUpdateDraw` 将操作提交到 UI 主线程，避免 map 并发读写冲突
+4. `QueueUpdateDraw` 的作用是**将回调函数排队到 UI 事件循环的主线程执行**——这只是为了保证 UI 操作（如关闭对话框）在主线程发生，**与 forwarders map 的并发安全完全无关**。后台 `clusterUpdater` 的 `ValidatePortForwards()` 是独立 goroutine，仍会与这条路径并发读写 map
 
 ### 4.4 Kubernetes 端口转发底层原理
 
@@ -581,14 +583,19 @@ func (f *Factory) ValidatePortForwards() {
 }
 ```
 
-**与 runForward 清理路径的区别**：
+**各清理路径的执行上下文与锁保护（逐项对照源码）**：
 
-| 清理路径 | 触发者 | 删除方式 | 是否调 Stop | 并发安全（真实锁情况） |
-|----------|--------|----------|-------------|----------------------|
-| `runForward` 尾部 | goroutine 结束时 | `DeleteForwarder` → `Kill`（前缀匹配） | 是 | ⚠️ **DeleteForwarder 无锁** |
-| `ValidatePortForwards` | 15s 定时循环 | 直接 `delete(map, key)` | 是 | ⚠️ **完全无锁** |
-| 用户 Ctrl-D 删除 | UI 事件 | `Delete` → `DeleteForwarder` → `Kill` | 是 | ⚠️ **DeleteForwarder 无锁** |
-| 程序退出 Terminate | `cancelFn()` 触发 | `DeleteAll()` 遍历 Stop+delete | 是 | ✅ `f.mx.Lock()` 保护 |
+| 清理路径 | 触发 goroutine | 执行入口 | 实际删除操作 | f.mx 锁保护 | Stop 调用 |
+|----------|---------------|---------|------------|------------|-----------|
+| **路径1**：`runForward` 尾部（`ForwardPorts()` 返回后） | runForward 独立 goroutine → `QueueUpdateDraw` 排队到 **UI 事件循环线程** | `DeleteForwarder(pf.ID)` | `Kill(ID)` → 前缀/完全匹配 → `delete` | ❌ 完全无锁 | `Kill` 内调用 `f.Stop()`（此时 `ForwardPorts()` 已返回，属于重复关闭风险点） |
+| **路径2**：`ValidatePortForwards` | 后台 `clusterUpdater` goroutine（独立于 UI） | `ValidatePortForwards()` 内部 | 直接 `delete(f.forwarders, k)` | ❌ 完全无锁 | 直接调用 `fwd.Stop()` |
+| **路径3**：用户 Ctrl-D 删除 | UI 事件循环线程（按键事件处理） | `PortForward.Delete()` → `DeleteForwarder(path)` | `Kill(path)` → 前缀匹配 → `delete` | ❌ 完全无锁 | `Kill` 内调用 `f.Stop()` |
+| **路径4**：程序退出 `Terminate` | 主 goroutine（`cancelFn()` → App 关闭流程） | `forwarders.DeleteAll()` | 遍历全部 → `delete` | ✅ `f.mx.Lock()` 写锁 | 遍历逐个 `f.Stop()` |
+
+**⚠️ 关键一致性结论（按源码）**：
+1. **QueueUpdateDraw ≠ 锁保护**：路径 1 虽然通过 `QueueUpdateDraw` 序列化到 UI 线程执行，但路径 2（`clusterUpdater`）是完全独立的后台 goroutine，两者仍会**同时读写同一张 map**——UI 主线程的串行化对后台 goroutine 没有任何互斥作用。
+2. **三条高频清理路径（1、2、3）全部无锁**，只有退出场景的路径 4 有锁。
+3. **路径 1 + 路径 2 的并发是最常见的崩溃点**：runForward 刚因连接断开走到 `Kill()`（遍历 map），15 秒定时的 `ValidatePortForwards()` 也在遍历，Go runtime 直接 fatal。
 
 ### 5.3.1 真实锁保护情况逐方法核对（按源码逐一对照）
 
@@ -795,13 +802,13 @@ func (f *Factory) Terminate() {
 - 只有 K8s 连通性 OK 时才执行转发校验，避免误判
 
 ### 8.5 并发安全
-- `Factory` 使用 `sync.RWMutex` 保护 `forwarders` map，但**锁保护不完整**：
-  - ✅ `AddForwarder`：有写锁 `mx.Lock()`
-  - ❌ **`DeleteForwarder`：完全无锁**（直接调用 `Kill()`，无任何 `mx` 操作）
-  - ✅ `Forwarders()` / `ForwarderFor()`：有读锁 `mx.RLock()`
-  - ❌ **`ValidatePortForwards`：完全无锁**（遍历 + `delete` 全裸操作）
-  - ✅ `Terminate()`：有写锁 `mx.Lock()`
-- UI 更新通过 `QueueUpdateDraw()` 序列化到主线程（减少并发场景）
+- `Factory` 使用 `sync.RWMutex` 保护 `forwarders` map，但**锁保护不完整**（3 条高频写路径无锁）：
+  - ✅ `AddForwarder`：有写锁 `mx.Lock()` —— 唯一在写保护下的增操作
+  - ❌ **`DeleteForwarder`：完全无锁**（直接调用 `Kill()` 遍历并 delete map，无任何 `mx` 操作）—— 被路径 1、3 共享
+  - ✅ `Forwarders()` / `ForwarderFor()`：有读锁 `mx.RLock()`（但返回的是 map 引用，出锁作用域后外部仍可写）
+  - ❌ **`ValidatePortForwards`：完全无锁**（遍历 + `delete` 全裸操作）—— 路径 2 专属，后台 goroutine 每 15s 执行
+  - ✅ `Terminate()`：有写锁 `mx.Lock()` —— 仅程序退出场景用
+- `QueueUpdateDraw()` 只是 UI 层的回调排队，将关闭对话框等操作序列化到 UI 事件循环线程，**与 forwarders map 的并发安全无任何关系**，后台 `clusterUpdater` goroutine 仍然与 UI 线程无互斥地读写 map
 - `Kill(path)` 中使用 `path + "|"` 前缀匹配防止误删同名 Pod（如 web-0 vs web-0-bla）
 
 ---
