@@ -345,19 +345,40 @@ func execute(opts *shellOpts, statusChan chan<- string) error {
 
 **调用顺序** [exec.go:run 99-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L99-L122)：
 ```go
-func run(a *App, opts *shellOpts) (bool, <-chan error, error) {
-    a.Halt()         // 停止集群更新、文件监听等后台 goroutine
-    defer a.Resume() // 退出时恢复
+func run(a *App, opts *shellOpts) (ok bool, errC chan error, outC chan string) {
+    errChan := make(chan error, 1)
+    statusChan := make(chan string, 1)
 
-    statusChan := make(chan string)
-    var status error
-    // 核心：Suspend 将终端从 tcell 原始模式切回标准模式
-    suspended := a.Suspend(func() {
-        status = execute(opts, statusChan)  // 在此函数内 kubectl 接管 stdio
-    })
-    return suspended, errChan, status
+    if opts.background {
+        // 后台模式：不挂起 TUI，直接执行
+        if err := execute(opts, statusChan); err != nil {
+            errChan <- err
+            a.Flash().Errf("Exec failed %q: %s", opts, err)
+        }
+        close(errChan)
+        return true, errChan, statusChan
+    }
+
+    // ═══════════ 前台模式（exec/attach 走这里）═══════════
+    a.Halt()         // 停止集群更新、文件监听等后台 goroutine
+    defer a.Resume() // Suspend 返回后恢复（Suspend 是同步阻塞的）
+
+    // a.Suspend() 同步阻塞，直到闭包执行完毕
+    // 返回值顺序: suspend成功与否, errChan, statusChan
+    return a.Suspend(func() {
+        if err := execute(opts, statusChan); err != nil {
+            errChan <- err                              // 错误写入 channel
+            a.Flash().Errf("Exec failed %q: %s", opts, err)  // Flash 排队显示
+        }
+        close(errChan)
+    }), errChan, statusChan
 }
 ```
+
+**关键注意事项：**
+- `a.Suspend()` 是**同步阻塞**的，闭包执行完才返回
+- `defer a.Resume()` 在 `Suspend` 返回后才执行（因为 Suspend 是最后一条 return 语句，defer 在函数返回前执行）
+- `a.Flash().Errf()` 在 Suspend 闭包**内部**调用，但此时 TUI 已挂起，消息通过 `QueueUpdateDraw` 排队，TUI 恢复后才显示
 
 **tview Suspend 底层实现**（来自 derailed/tview v0.8.5）：
 ```go
@@ -365,13 +386,126 @@ func (a *Application) Suspend(f func()) bool {
     screen := a.screen
     // 1. 挂起 tcell：tcsetattr 恢复终端标准模式（canonical + echo）
     if err := screen.Suspend(); err != nil { return false }
-    // 2. 执行用户函数（此时 stdin/stdout/stderr 可以被子进程直接使用）
+    // 2. 执行用户函数（同步阻塞，直到 f 返回）
     f()
-    // 3. 恢复 tcell：tcsetattr 重新设置原始模式（raw + noecho），清屏重绘 TUI
+    // 3. 恢复 tcell：tcsetattr 重新设置原始模式（raw + noecho）
     screen.Resume()
     return true
 }
 ```
+
+---
+
+### 2.5 TUI 挂起状态下的执行状态回传机制
+
+这是最容易误解的部分：**TUI 挂起期间没有实时状态回传到 UI，所有状态消息都在 TUI 恢复后才显示。**
+
+#### 2.5.1 三条回传通道
+
+| 通道 | 类型 | 传递内容 | 前台模式行为 | 后台模式行为 |
+|------|------|----------|-------------|-------------|
+| **errChan** | `chan error` (buffer=1) | 执行错误 | 闭包内写入，闭包返回后 `runK` 读取 | 同步写入，调用方读取 |
+| **statusChan** | `chan string` (buffer=1) | 状态消息 | 命令执行完毕后写入 1 条成功消息 | 逐行写入命令输出 |
+| **Flash** | UI 组件 | 用户可见的提示消息 | `QueueUpdateDraw` 排队，TUI 恢复后显示 | 直接显示 |
+
+#### 2.5.2 前台模式（exec/attach）时序图
+
+```
+用户按 s 键
+    ↓
+runK() 调用 run()
+    ↓
+a.Halt() → 停止后台 goroutine
+    ↓
+a.Suspend(func() { ... }) 开始
+    ├─ screen.Suspend() → 终端切到标准模式
+    ├─ execute(opts, statusChan)
+    │   ├─ clearScreen() → 清屏（ANSI 转义序列）
+    │   ├─ 启动 SIGINT/SIGTERM 监听 goroutine
+    │   ├─ cmd.Stdin/Stdout/Stderr = os.Stdin/os.Stdout/os.Stderr
+    │   ├─ cmd.Run() ───────────────────────┐
+    │   │                                    │ kubectl 接管终端
+    │   │                                    │ （用户直接与 kubectl 交互）
+    │   │  ← 用户退出 kubectl，cmd.Run() 返回
+    │   ├─ 成功: statusChan <- "Command completed successfully: ..."
+    │   ├─ 失败: 返回 error → errChan <- err
+    │   │          + a.Flash().Errf(...) → QueueUpdateDraw 排队 ⚠️
+    │   ├─ close(statusChan)
+    │   └─ defer: cancel() + clearScreen()
+    ├─ close(errChan)
+    └─ [闭包结束，Suspend 继续执行]
+    ↓
+screen.Resume() → 终端切回原始模式，重绘 TUI
+    ↓ （此时 Flash 队列中的消息才被绘制出来）
+defer a.Resume() → 恢复后台 goroutine
+    ↓
+run() 返回 (suspended, errChan, statusChan)
+    ↓
+runK() 读取 errChan 和 statusChan
+    ├─ statusChan 内容 → slog.Debug("stdout", ...) （仅日志，不显示）
+    └─ errChan 内容 → 收集错误并 return errs
+    ↓
+回到视图按键处理函数
+```
+
+#### 2.5.3 statusChan 的真实作用
+
+**前台模式（exec/attach）** [exec.go:pipe 574-L594](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L574-L594)：
+```go
+cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+_, _ = cmd.Stdout.Write([]byte(opts.banner))  // 打印 banner
+err := cmd.Run()                               // 阻塞等待 kubectl 退出
+if err == nil {
+    // ⚠️ 只有执行成功时才写 1 条成功消息到 statusChan
+    statusChan <- fmt.Sprintf("Command completed successfully: %q", cmd.String())
+}
+close(statusChan)  // 关闭 channel
+```
+
+**runK 中对 statusChan 的处理** [exec.go:runK 88-L90](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L88-L90)：
+```go
+for v := range stChan {
+    slog.Debug("stdout", slogs.Line, v)  // ⚠️ 仅输出到 debug 日志！不显示在 UI！
+}
+```
+
+> **重要修正**：statusChan 的成功消息**不会显示给用户**，只用于 debug 日志。用户看到的成功/失败提示完全来自 Flash 组件。
+
+#### 2.5.4 Flash 消息的排队机制
+
+**Flash.SetMessage 实现** [flash.go:70-L85](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/ui/flash.go#L70-L85)：
+```go
+func (f *Flash) SetMessage(m model.LevelMessage) {
+    fn := func() {
+        if m.Text == "" { f.Clear(); return }
+        f.SetTextColor(flashColor(m.Level))
+        f.SetText(f.flashEmoji(m.Level) + " " + m.Text)
+    }
+    if f.testMode {
+        fn()
+    } else {
+        f.app.QueueUpdateDraw(fn)  // ⚠️ 放入更新队列，不立即执行
+    }
+}
+```
+
+**关键机制：`QueueUpdateDraw`**
+- 将 UI 更新函数放入 tview 的事件队列
+- 在 Suspend 期间，screen 被挂起，主 event loop 暂停，队列中的操作不会执行
+- Suspend 结束、screen.Resume() 后，event loop 恢复，队列中的 Flash 更新被一次性执行
+- 用户看到的效果：TUI 恢复后，Flash 区域显示错误消息
+
+#### 2.5.5 错误回传的双重机制
+
+| 机制 | 作用对象 | 显示时机 | 用途 |
+|------|----------|----------|------|
+| **Flash 消息** | 用户（UI 可见） | TUI 恢复后立即显示 | 用户感知操作结果 |
+| **errChan** | 调用方代码（UI 不可见） | Suspend 返回后读取 | 上层函数判断执行是否成功 |
+
+**为什么需要双重机制？**
+- `errChan` 供代码逻辑判断（如 `runK` 返回错误给 `shellIn`）
+- `Flash` 供用户感知，且必须在 Suspend 闭包内触发才能保证消息在 TUI 恢复后第一时间显示
+- 如果在 Suspend 返回后再调用 Flash，用户可能会看到短暂的空白再显示消息，体验不好
 
 ---
 
@@ -706,6 +840,8 @@ func nukeK9sShell(a *App) error {
 │  Pod 列表 → shellCmd                                   │
 │  Container 列表 → shellCmd                             │
 │  Xray 拓扑 → xray.shellCmd (提取 parent path)          │
+│    ⚠️ Xray Container 节点: 只有 s 键，无 a 键         │
+│    ⚠️ xray.attachCmd 中 CoGVR 分支为死代码              │
 │  Node 列表 → sshCmd → launchNodeShell (启动特权 Pod)   │
 └───────────────────────────────────────────────────────┘
     ↓
@@ -721,7 +857,7 @@ containerShellIn
         │       └─ run
         │           ├─ a.Halt()    // L3: 停止后台任务
         │           ├─ defer a.Resume()   // L3 defer
-        │           └─ a.Suspend(f)       // tview 挂起 TUI
+        │           └─ a.Suspend(f)       // ★ 同步阻塞！
         │               ├─ screen.Suspend()   // tcsetattr 恢复标准模式
         │               ├─ f() → execute      // L1 & L2: execute 函数
         │               │   ├─ clearScreen()
@@ -729,7 +865,7 @@ containerShellIn
         │               │   ├─ defer: cancel() + clearScreen()  // L1 defer
         │               │   ├─ goroutine: SIGINT/SIGTERM → cancel  // L2
         │               │   ├─ exec.CommandContext(ctx, "kubectl", ...)
-        │               │   └─ pipe(ctx, opts, ..., cmds)
+        │               │   └─ pipe(ctx, opts, statusChan, ..., cmds)
         │               │       └── 单命令模式:
         │               │           cmd.Stdin = os.Stdin   ★ IO 接管点
         │               │           cmd.Stdout = os.Stdout ★ IO 接管点
@@ -746,8 +882,26 @@ containerShellIn
         │               │           │ │   └─ handleResizes goroutine:
         │               │           │ │       Next() → JSON → resizeStream ★ 尺寸发送点
         │               │           │ └─ TTY.Safe defer: stopResize + RestoreTerminal
-        │               └─ screen.Resume()   // tcsetattr 重新设置原始模式 + 重绘
-        └─ defer c.Start()   // L4 defer: 恢复视图刷新
+        │               │           │
+        │               │           ↓  命令退出，回到 pipe 函数
+        │               │   成功: statusChan <- "Command completed successfully..."
+        │               │   失败: return error → errChan <- err
+        │               │           + a.Flash().Errf() → QueueUpdateDraw 排队 ⚠️
+        │               │   close(statusChan)
+        │               ├─ close(errChan)
+        │               └─ [闭包结束，Suspend 继续]
+        │               ↓
+        │       screen.Resume()   // tcsetattr 原始模式 + 重绘（Flash 消息此时显示）
+        │       ↓
+        │   defer a.Resume()   // L3 defer: 恢复后台任务
+        │   ↓
+        └─ run() 返回 (suspended, errChan, statusChan)
+            │
+            ├─ runK 读取:
+            │   ├─ statusChan → slog.Debug (仅日志，不显示！)
+            │   └─ errChan → 收集错误 return errs
+            │
+        defer c.Start()   // L4 defer: 恢复视图刷新
 ```
 
 ---
@@ -758,12 +912,13 @@ containerShellIn
 |------|----------------|------|
 | [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go) | `shellCmd`(222-238), `attachCmd`(240-256), `containerShellIn`(358-386), `buildShellArgs`(478-503) | Pod 视图入口、容器选择、命令参数构建 |
 | [container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/container.go) | `shellCmd`(158-181), `attachCmd`(183-194) | Container 视图入口 |
-| [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go) | `shellCmd`(340-362), `attachCmd`(364-385), key binding(207-232) | Xray 拓扑图视图入口 |
+| [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/xray.go) | `shellCmd`(340-362), `attachCmd`(364-385), **key binding**(198-233) | Xray 拓扑图视图入口（CoGVR 无 a 键） |
 | [node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/node.go) | `bindDangerousKeys`(75-77), `sshCmd`(179-191) | Node Shell 入口，Feature Gate 检查 |
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go) | `runK`(57-97), `run`(99-122), `execute`(172-239), **`pipe`(549-615)**, `nukeK9sShell`(381-405) | **★ IO 接管核心**、TUI 挂起恢复、清理 |
+| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go) | **`runK`**(57-97), **`run`**(99-122), `execute`(172-239), **`pipe`**(549-615), `nukeK9sShell`(381-405) | ★ 执行核心：TUI 挂起、IO 接管、状态回传、清理 |
+| [flash.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/ui/flash.go) | `SetMessage`(70-85), `Watch`(57-67) | ★ 状态显示：`QueueUpdateDraw` 排队机制 |
 | [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/app.go) | `Halt`(334-339), `Resume`(342-362), `BailOut`(540-542) | 后台任务启停、应用退出清理 |
-| [actions.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go) | `hotKeyActions`(60-106), `pluginActions`(115+) | 热键、插件入口 |
+| [actions.go](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/actions.go) | `hotKeyActions`(60-106), `pluginActions`(115-174), `executePlugin`(206-265) | 热键（纯导航）、插件（通用命令执行） |
 | *kubectl* util/term/term.go | `TTY.Safe()`, `MakeRaw`, `RestoreTerminal` | 终端原始模式设置、状态恢复 |
-| *kubectl* util/term/resize.go | `TTY.MonitorSize()`, `sizeQueue.Next()`, `GetSize()` | **★ 尺寸同步核心**、SIGWINCH 到 TerminalSizeQueue 的桥接 |
-| *kubectl* util/term/resizeevents.go | `monitorResizeEvents()` | **★ SIGWINCH 信号监听**、TIOCGWINSZ 读尺寸 |
+| *kubectl* util/term/resize.go | `TTY.MonitorSize()`, `sizeQueue.Next()`, `GetSize()` | ★ 尺寸同步核心、SIGWINCH 到 TerminalSizeQueue 的桥接 |
+| *kubectl* util/term/resizeevents.go | `monitorResizeEvents()` | ★ SIGWINCH 信号监听、TIOCGWINSZ 读尺寸 |
 | *client-go* remotecommand/v3.go | `handleResizes()` | SPDY resize 子通道尺寸发送 |
