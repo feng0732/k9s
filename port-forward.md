@@ -457,16 +457,33 @@ func (ff Forwarders) Kill(path string) int {
 
 ### 5.1 触发时机与调用链
 
-**定时器启动入口**，定义于 [app.go:367-L394](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/app.go#L367-L394)：
+**定时器启动入口**。真实函数名是 `clusterUpdater`（**注意**：之前写错为 `startClusterInfoUpdater`，该函数不存在）。
+
+**启动位置**：[app.go:346](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/app.go#L346-L346)，App 初始化 context 后直接以 goroutine 启动：
+```go
+ctx, a.cancelFn = context.WithCancel(context.Background())
+go a.clusterUpdater(ctx)   // ⭐ 真实启动语句
+```
+
+**函数定义**：[app.go:364-L395](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/app.go#L364-L395)：
 
 ```go
 // 常量定义 [app.go:39]
 const clusterRefresh = 15 * time.Second      // 正常检查间隔：15秒
 
-func (a *App) startClusterInfoUpdater(ctx context.Context) {
-    if a == nil || a.factory == nil || ctx.Err() != nil {
+func (a *App) clusterUpdater(ctx context.Context) {   // ⭐ 真实函数名
+    // 前置检查：连接或工厂未就绪时直接返回
+    if a.Conn() == nil || !a.Conn().ConnectionOK() || a.factory == nil || a.clusterModel == nil {
+        slog.Debug("Skipping cluster updater - no valid connection")
         return
     }
+
+    // ⭐ 立即先执行一次 refreshCluster，不等 15s
+    if err := a.refreshCluster(ctx); err != nil {
+        slog.Error("Cluster updater failed!", slogs.Error, err)
+        return
+    }
+
     // 指数退避：初始 15s，失败后倍增，最大 2min
     bf := model.NewExpBackOff(ctx, clusterRefresh, 2*time.Minute)
     delay := clusterRefresh
@@ -513,6 +530,7 @@ func (a *App) refreshCluster(context.Context) error {
 
 | 场景 | 校验间隔 |
 |------|----------|
+| 启动时立即执行 | 0 秒（`clusterUpdater` 启动后**先执行一次** refreshCluster，不等待） |
 | 连接正常 | **15 秒** 固定间隔 |
 | 连接失败后首次重试 | 15 秒 |
 | 连接失败后第 N 次重试 | 15s × 2^(N-1)，最多 2 分钟 |
@@ -520,9 +538,10 @@ func (a *App) refreshCluster(context.Context) error {
 | 程序退出（ctx.Done） | 停止校验 |
 
 **额外说明**：
-- 校验**不是**单独的定时器，而是依附于 `clusterInfoUpdater` 的集群健康检查循环
+- 校验**不是**单独的定时器，而是依附于 `clusterUpdater` 的集群健康检查循环
 - 只有当 `CheckConnectivity()` 成功时才会执行 `ValidatePortForwards()`——网络不通时不做无用功
-- `startClusterInfoUpdater` 在 App 初始化连接成功后启动（`go a.startClusterInfoUpdater(ctx)`）
+- **启动时机**：App 初始化创建 context 后直接 `go a.clusterUpdater(ctx)` 启动（不等待连接就绪，函数内部有 ConnectionOK 检查，未就绪时会直接 return）
+- 前置检查失败时（`!ConnectionOK()` 等），`clusterUpdater` 会直接 `return`，**不会启动循环**，需要等待下次 App 重新初始化
 
 ### 5.3 ValidatePortForwards 内部逻辑（与转发表交互）
 
@@ -564,13 +583,50 @@ func (f *Factory) ValidatePortForwards() {
 
 **与 runForward 清理路径的区别**：
 
-| 清理路径 | 触发者 | 删除方式 | 是否调 Stop | 并发安全 |
-|----------|--------|----------|-------------|----------|
-| `runForward` 尾部 | goroutine 结束时 | `DeleteForwarder` → `Kill`（前缀匹配） | 是 | QueueUpdateDraw 主线程 |
-| `ValidatePortForwards` | 15s 定时循环 | 直接 `delete(map, key)` | 是 | Factory mx.RLock/RUnlock? ⚠️ **注意无锁** |
-| 用户 Ctrl-D 删除 | UI 事件 | `Delete` → `DeleteForwarder` → `Kill` | 是 | UI 主线程 |
+| 清理路径 | 触发者 | 删除方式 | 是否调 Stop | 并发安全（真实锁情况） |
+|----------|--------|----------|-------------|----------------------|
+| `runForward` 尾部 | goroutine 结束时 | `DeleteForwarder` → `Kill`（前缀匹配） | 是 | ⚠️ **DeleteForwarder 无锁** |
+| `ValidatePortForwards` | 15s 定时循环 | 直接 `delete(map, key)` | 是 | ⚠️ **完全无锁** |
+| 用户 Ctrl-D 删除 | UI 事件 | `Delete` → `DeleteForwarder` → `Kill` | 是 | ⚠️ **DeleteForwarder 无锁** |
+| 程序退出 Terminate | `cancelFn()` 触发 | `DeleteAll()` 遍历 Stop+delete | 是 | ✅ `f.mx.Lock()` 保护 |
 
-**⚠️ 代码缺陷提示**：`ValidatePortForwards` 遍历和修改 `f.forwarders` map 时，**没有**使用 `f.mx` 锁保护，与 `AddForwarder/DeleteForwarder` 中的加锁操作不一致，存在潜在的数据竞争风险。
+### 5.3.1 真实锁保护情况逐方法核对（按源码逐一对照）
+
+**⚠️ 重要修正**：之前文档中 `DeleteForwarder` 加锁的描述是**错误的**。以下是 Factory 中所有与转发表相关方法的真实锁情况，代码位置均在 [factory.go:296-L359](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/watch/factory.go#L296-L359)：
+
+| 方法 | 代码行 | 是否有 f.mx 锁 | 锁类型 | 说明 |
+|------|--------|--------------|--------|------|
+| `AddForwarder(pf)` | 297-302 | ✅ 是 | `Lock()` 写锁 | `f.mx.Lock() + defer f.mx.Unlock()` |
+| **`DeleteForwarder(path)`** | 304-311 | ❌ **完全无锁** | —— | 直接调用 `f.forwarders.Kill(path)`，**没有任何锁操作** |
+| `Forwarders()` | 313-319 | ✅ 是 | `RLock()` 读锁 | 返回 `f.forwarders`（⚠️ 返回的是 map 引用，外部仍可并发修改） |
+| `ForwarderFor(path)` | 321-329 | ✅ 是 | `RLock()` 读锁 | 在锁保护下查询单个 key |
+| **`ValidatePortForwards()`** | 331-359 | ❌ **完全无锁** | —— | 遍历 + `delete(map, k)` 全部裸操作，**无任何锁** |
+| `Terminate()` | 60-72 | ✅ 是 | `Lock()` 写锁 | 退出场景的清理在锁保护下 |
+
+**锁保护不一致导致的并发风险场景**：
+
+```
+T1: runForward 调用 DeleteForwarder(path)
+        └─ f.forwarders.Kill(path)     // 遍历 map + delete，无锁
+同时
+T2: ValidatePortForwards()             // 15s 定时触发
+        └─ for k, fwd := range f.forwarders { delete() }  // 无锁
+同时
+T3: 新转发启动 AddForwarder(pf)        // f.mx.Lock() 保护
+```
+
+**风险**：T1 和 T2 同时对 map 进行写操作（遍历 + delete），在 Go 中会直接触发 `fatal error: concurrent map iteration and map write`，导致 K9s 进程崩溃。
+
+### 5.3.2 代码自带的 BOZO 注释
+
+源码中 `ValidatePortForwards` 上方有作者留下的注释：
+```go
+// ValidatePortForwards check if pods are still around for portforwards.
+// BOZO!! Review!!!        // ⭐ 作者自己也标记了这段代码需要复查
+func (f *Factory) ValidatePortForwards() { ... }
+```
+
+"BOZO" 是俚语"蠢货/笨蛋"的意思，在代码中通常表示：「这里写得很糙，后面的人注意一下」。侧面印证这段代码的并发安全问题是已知隐患。
 
 ### 5.4 主动停止
 
@@ -693,7 +749,8 @@ func (f *Factory) Terminate() {
             └─ pf.SetActive(false)
 
 ─────────────────────────────────────────────────────────
-后台线程 (15秒周期, app.startClusterInfoUpdater)
+后台线程 (15秒周期, app.clusterUpdater)
+    ├─ 启动时立即先执行 1 次 refreshCluster（不等待）
     ├─ time.After(15s)
     ├─ CheckConnectivity() OK?
     │   └─ YES → factory.ValidatePortForwards()
@@ -738,9 +795,13 @@ func (f *Factory) Terminate() {
 - 只有 K8s 连通性 OK 时才执行转发校验，避免误判
 
 ### 8.5 并发安全
-- `Factory` 使用 `sync.RWMutex` 保护 `forwarders` map（Add/Delete 加锁，ValidatePortForwards 未加锁⚠️）
-- 转发器注册和删除都在锁保护下进行（除 ValidatePortForwards）
-- UI 更新通过 `QueueUpdateDraw()` 序列化到主线程
+- `Factory` 使用 `sync.RWMutex` 保护 `forwarders` map，但**锁保护不完整**：
+  - ✅ `AddForwarder`：有写锁 `mx.Lock()`
+  - ❌ **`DeleteForwarder`：完全无锁**（直接调用 `Kill()`，无任何 `mx` 操作）
+  - ✅ `Forwarders()` / `ForwarderFor()`：有读锁 `mx.RLock()`
+  - ❌ **`ValidatePortForwards`：完全无锁**（遍历 + `delete` 全裸操作）
+  - ✅ `Terminate()`：有写锁 `mx.Lock()`
+- UI 更新通过 `QueueUpdateDraw()` 序列化到主线程（减少并发场景）
 - `Kill(path)` 中使用 `path + "|"` 前缀匹配防止误删同名 Pod（如 web-0 vs web-0-bla）
 
 ---
@@ -752,15 +813,22 @@ func (f *Factory) Terminate() {
 1. **端口竞态条件**：`IsPortFree()` 检查通过后，在实际绑定前端口可能被其他程序占用
    - 但 `portforward.PortForwarder` 内部会再次绑定，失败会报错，属于"最终失败"而非"静默失败"
 
-2. **ValidatePortForwards 未加锁**：遍历和删除 `f.forwarders` 时未持有 `f.mx` 锁，与 AddForwarder/DeleteForwarder 的加锁操作不一致，存在 data race 风险
+2. **⚠️ DeleteForwarder 完全无锁（最严重并发问题）**：
+   - 调用 `f.forwarders.Kill(path)` 时遍历并 delete map，无任何 `mx` 锁保护
+   - 与 `AddForwarder`（有锁）和 `ValidatePortForwards`（无锁）并发执行时，会触发 Go runtime 的 `concurrent map iteration and map write` fatal error，直接导致 K9s 进程崩溃
 
-3. **ValidatePortForwards 提前 return**：当遇到格式错误的 key 时使用 `return` 而非 `continue`，导致后续合法的转发也不被校验
+3. **⚠️ ValidatePortForwards 完全无锁**：遍历和删除 `f.forwarders` 时未持有 `f.mx` 锁，与 `DeleteForwarder` 同时执行时直接崩溃
+   - 代码上方有作者标记：`// BOZO!! Review!!!`，说明是已知的粗糙实现
+
+4. **ValidatePortForwards 提前 return**：当遇到格式错误的 key 时使用 `return` 而非 `continue`，导致后续合法的转发也不被校验
    - 代码位置：[factory.go:336](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/watch/factory.go#L336-L339)
 
-4. **`stopChan` 重复关闭风险**：`Stop()` 方法中只检查 `stopChan != nil`，但并发调用仍可能导致 panic
+5. **`stopChan` 重复关闭风险**：`Stop()` 方法中只检查 `stopChan != nil`，但并发调用仍可能导致 panic
    - 路径：`ValidatePortForwards.Stop()` + `runForward` 退出时 `Kill().Stop()` 可能同时执行
 
-5. **失效检测检测周期**：连接失败进入退避期间（最长 2 分钟），`ValidatePortForwards` 不会执行，可能存在僵尸转发窗口
+6. **失效检测检测周期**：连接失败进入退避期间（最长 2 分钟），`ValidatePortForwards` 不会执行，可能存在僵尸转发窗口
+
+7. **Forwarders() 返回 map 引用**：虽然读取时有 `RLock()`，但返回的是 map 引用，外部调用方如果并发修改仍有并发风险
 
 ### 9.2 代码优化建议
 
@@ -801,6 +869,34 @@ func (f *Factory) ValidatePortForwards() {
 }
 ```
 
+**优化3：DeleteForwarder 也需要加锁（当前完全无锁，是主要并发风险）**
+
+```go
+func (f *Factory) DeleteForwarder(path string) {
+    f.mx.Lock()                     // ⭐ 补上写锁
+    defer f.mx.Unlock()
+
+    count := f.forwarders.Kill(path)
+    slog.Warn("Deleted portforward",
+        slogs.Count, count,
+        slogs.GVR, path,
+    )
+}
+```
+
+**优化4：Forwarders() 返回副本而不是引用，防止外部并发修改**
+
+```go
+func (f *Factory) Forwarders() Forwarders {
+    f.mx.RLock()
+    defer f.mx.RUnlock()
+
+    ff := make(Forwarders, len(f.forwarders))
+    for k, v := range f.forwarders { ff[k] = v }   // ⭐ 返回副本
+    return ff
+}
+```
+
 ---
 
 ## 十、核心文件速查表
@@ -817,4 +913,4 @@ func (f *Factory) ValidatePortForwards() {
 | [ann.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/port/ann.go) | 预设端口选择 | `Annotations.PreferredPorts()` |
 | [co_portspec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/port/co_portspec.go) | 容器端口规格与匹配 | `ContainerPortSpec`, `MatchAnnotations()`, `Match()` |
 | [pfs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/port/pfs.go) | 注解集合转隧道 | `PFAnns.ToTunnels()`, `PFAnns.ToPortSpec()` |
-| [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/app.go) | 定时校验触发器（15s） | `startClusterInfoUpdater()`, `refreshCluster()` |
+| [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/5-k9s/internal/view/app.go) | 定时校验触发器（15s） | `clusterUpdater()`, `refreshCluster()` |
