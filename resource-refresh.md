@@ -1,284 +1,481 @@
-# K9s 资源表格刷新与节流机制分析
+# K9s 资源表格刷新机制代码分析
 
-## 整体架构概览
+本文档基于仓库源码逐行梳理资源表格的**刷新节奏控制、Informer 缓存读取、差异标记、界面重绘**四个环节的边界关系。
 
-K9s 的资源表格刷新机制采用 **Model-View** 分层架构，由三个核心层协作完成：
+---
+
+## 一、模块分层与文件映射
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│  View 层 (Browser → view.Table → ui.Table)              │
-│  负责接收数据变更通知，在主线程安全地更新 UI               │
-├─────────────────────────────────────────────────────────┤
-│  Model 层 (model.Table → model1.TableData)              │
-│  负责定时拉取数据、计算行级增量差异、分发变更事件          │
-├─────────────────────────────────────────────────────────┤
-│  Data 层 (watch.Factory → Informer → Kubernetes API)    │
-│  负责通过 Informer 缓存提供数据源                        │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│  View 层：UI 展示与事件分发                                        │
+│  ├─ internal/view/browser.go     — 浏览器，实现 TableListener    │
+│  ├─ internal/view/table.go       — 视图表格封装                  │
+│  └─ internal/ui/table.go         — tview 表格渲染，含 UpdateUI() │
+├──────────────────────────────────────────────────────────────────┤
+│  Model 层：数据刷新调度与增量计算                                   │
+│  ├─ internal/model/table.go      — Table：updater goroutine      │
+│  ├─ internal/model/helpers.go    — resourceMeta() 选择 DAO      │
+│  ├─ internal/model1/table_data.go — TableData.Update() 算 Delta │
+│  ├─ internal/model1/delta.go     — DeltaRow 计算                │
+│  └─ internal/model1/row_event.go — RowEvent 标记 Add/Update 等  │
+├──────────────────────────────────────────────────────────────────┤
+│  DAO 层：数据来源策略（三种获取方式并存）                            │
+│  ├─ internal/dao/resource.go     — Resource.List → 读 Informer  │
+│  ├─ internal/dao/generic.go      — Generic.List → 直连 APIServer│
+│  ├─ internal/dao/table.go        — Table.List → HTTP Table 格式 │
+│  ├─ internal/dao/pod.go          — Pod.List → Informer + 指标  │
+│  └─ internal/dao/accessor.go     — AccessorFor() DAO 注册       │
+├──────────────────────────────────────────────────────────────────┤
+│  Informer 层：Kubernetes 缓存                                      │
+│  └─ internal/watch/factory.go    — Factory.List/Get → Lister    │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 一、刷新时机：什么时候刷新？
+## 二、刷新节奏：什么时候刷新？刷新频率如何控制？
 
-### 1.1 定时轮询（核心刷新路径）
+### 2.1 定时刷新循环（核心路径）
 
-表格的核心刷新由 [model.Table.updater](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/model/table.go#L203-L227) 中的 goroutine 驱动：
+启动入口：`Browser.Start()` → `GetModel().Watch(ctx)`
 
+`internal/model/table.go#L120-L128`
+```go
+func (t *Table) Watch(ctx context.Context) error {
+    if err := t.refresh(ctx); err != nil {
+        return err
+    }
+    go t.updater(ctx)     // 启动后台定时刷新 goroutine
+    return nil
+}
+```
+
+`internal/model/table.go#L203-L227` — `updater()` 定时循环
 ```go
 func (t *Table) updater(ctx context.Context) {
     bf := backoff.NewExponentialBackOff()
-    bf.InitialInterval, bf.MaxElapsedTime = initRefreshRate, maxReaderRetryInterval
+    bf.InitialInterval = initRefreshRate  // 300ms
+    bf.MaxElapsedTime    = maxReaderRetryInterval  // 2 分钟
     rate := initRefreshRate  // 首次 300ms 快速刷新
+
     for {
         select {
         case <-ctx.Done():
             return
         case <-time.After(rate):
-            rate = t.refreshRate  // 之后切换为用户配置的刷新间隔
+            rate = t.refreshRate  // 之后切换为配置的刷新间隔
             err := backoff.Retry(func() error {
                 if err := t.refresh(ctx); err != nil {
-                    return err
+                    return err  // 失败时按指数退避重试
                 }
                 return nil
             }, backoff.WithContext(bf, ctx))
-            // ...
+            if err != nil {
+                t.fireTableLoadFailed(err)  // 超过 2 分钟持续失败就退出
+                return
+            }
         }
     }
 }
 ```
 
-**关键点：**
-- **首次刷新间隔**：`initRefreshRate = 300ms`（[table.go:26](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/model/table.go#L26)），让用户尽快看到数据
-- **后续刷新间隔**：`t.refreshRate`，由配置决定，默认 **2 秒**（[types.go:7](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/config/types.go#L7)）
-- **刷新失败退避**：使用指数退避（Exponential Backoff），`MaxElapsedTime = 2 分钟`（[model/types.go:21](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/model/types.go#L21)）
+**刷新节奏要点：**
 
-### 1.2 刷新速率的配置来源
+| 阶段 | 间隔值 | 定义位置 |
+|------|--------|---------|
+| 首次刷新后首循环 | 300ms | `initRefreshRate` in `internal/model/table.go#L26` |
+| 稳定期循环 | 默认 2s，可配置 | `defaultRefreshRate=2` in `internal/config/types.go#L7` |
+| 失败退避 | 指数递增，最长 2min 总时长 | `internal/model/types.go#L21` |
 
-刷新速率 `refreshRate` 由以下路径注入：
+### 2.2 刷新频率配置链路
 
-1. **配置文件**：`k9s.yaml` 中的 `refreshRate` 字段，默认 `2`（秒）
-2. **命令行参数**：`--refresh-rate` 覆盖配置文件
-3. **最低限制**：不允许低于 `DefaultRefreshRate = 2.0` 秒（[flags.go:8](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/config/flags.go#L8)）
+配置值最终注入到 `Table.refreshRate`：
 
-配置链路：
 ```
-K9s.RefreshRate (yaml)
-  → K9s.GetRefreshRate()         // 合并命令行覆盖
-    → K9s.RefreshDuration()      // 转为 time.Duration
-      → model.Table.SetRefreshRate()  // 设置到 model
-```
-
-在 [view/table.go:66](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/view/table.go#L66) 和 [browser.go:116](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/view/browser.go#L116) 中初始化：
-
-```go
-t.GetModel().SetRefreshRate(t.app.Config.K9s.RefreshDuration())
+internal/config/flags.go#L8       DefaultRefreshRate = 2.0 (秒)
+    ↓ (用户可通过 --refresh-rate 覆盖)
+internal/config/k9s.go#L396-L419   GetRefreshRate() → RefreshDuration()
+    ↓ (最低限制不低于 DefaultRefreshRate)
+internal/view/browser.go#L116      SetRefreshRate(Config.K9s.RefreshDuration())
 ```
 
-### 1.3 手动刷新触发
+### 2.3 防重入：CAS 原子锁丢弃并发刷新
 
-除定时刷新外，用户可通过以下方式主动触发：
-
-- **Ctrl+R**：调用 `refreshCmd`（[browser.go:478](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/view/browser.go#L478)），实质是调用 `b.refresh()` → `b.Start()`，重新启动整个 Watch 循环
-- **切换命名空间**：`switchNamespaceCmd`（[browser.go:587](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/view/browser.go#L587)）
-- **过滤器变更**：`BufferActive` 回调（[browser.go:228](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/view/browser.go#L228)），当用户退出搜索模式时触发 `model.Refresh()`
-
----
-
-## 二、节流防抖：怎样避免高频抖动？
-
-K9s 采用 **四层防抖机制** 来避免 UI 高频抖动：
-
-### 2.1 第一层：原子锁 — 丢弃并发刷新请求
-
-[model.Table.refresh](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/model/table.go#L229-L247) 使用 CAS 原子操作防止并发刷新：
-
+`internal/model/table.go#L229-L247` — `refresh()`
 ```go
 func (t *Table) refresh(ctx context.Context) error {
+    // 边界 1：如果上一次 refresh 尚未结束，直接丢弃本次请求
     if !atomic.CompareAndSwapInt32(&t.inUpdate, 0, 1) {
         slog.Debug("Dropping update...")
-        return nil  // 正在更新中，直接丢弃本次请求
+        return nil
     }
     defer atomic.StoreInt32(&t.inUpdate, 0)
-    // ... 执行实际刷新逻辑
+
+    // 边界 2：CAS 成功之后才进入实际数据拉取与计算
+    if err := t.reconcile(ctx); err != nil {
+        return err
+    }
+    // 边界 3：数据计算完成后，Peek() 克隆一份快照再通知
+    data := t.Peek()
+    if data.RowCount() == 0 {
+        t.fireNoData(data)
+    } else {
+        t.fireTableChanged(data)
+    }
+    return nil
 }
 ```
 
-- `inUpdate` 是 `int32` 类型原子变量
-- 如果上一次 `refresh` 尚未完成，新的刷新请求会被**直接丢弃**
-- 这保证同一时刻只有一个 `refresh` 在执行，避免数据竞争和重复渲染
+> **关键边界**：`refresh()` 期间的 CAS 锁保证"同一时刻只有一个 refresh 在执行"，即使用户触发多次也会被合并。
 
-### 2.2 第二层：定时器间隔 — 控制刷新频率
+### 2.4 手动刷新触发点
 
-在 `updater` 的 `select` 循环中：
+除了定时循环，下列操作也会触发立即刷新：
 
-```go
-case <-time.After(rate):
-    rate = t.refreshRate  // 切换到配置的刷新间隔
-```
-
-- 每次循环结束后等待 `refreshRate` 时间（默认 2 秒）才进行下一次刷新
-- 不是"数据一变就刷"，而是"每隔 N 秒拉一次"
-- 这是一种 **拉模式（Pull）**，天然具有节流效果
-
-### 2.3 第三层：指数退避 — 失败时逐步降低刷新压力
-
-```go
-bf := backoff.NewExponentialBackOff()
-bf.InitialInterval = initRefreshRate     // 300ms
-bf.MaxElapsedTime = maxReaderRetryInterval  // 2 分钟
-```
-
-当 `refresh` 失败时：
-- 不立即重试，而是按指数间隔逐步增加重试间隔
-- 避免在 API Server 不可用时产生大量无效请求
-- 如果持续失败超过 2 分钟，`updater` 退出并通知 `TableLoadFailed`
-
-### 2.4 第四层：UI 更新互斥锁 — 防止并发渲染
-
-在 [Browser](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/view/browser.go#L36-L46) 层，`TableDataChanged` 和 `TableNoData` 都使用 `updating` 互斥标志：
-
-```go
-func (b *Browser) TableDataChanged(mdata *model1.TableData) {
-    cdata := b.Update(mdata, b.app.Conn().HasMetrics())
-    b.app.QueueUpdateDraw(func() {
-        if b.getUpdating() {  // 如果正在更新，跳过
-            return
-        }
-        b.setUpdating(true)
-        defer b.setUpdating(false)
-        b.refreshActions()
-        b.UpdateUI(cdata, mdata)
-    })
-}
-```
-
-- `QueueUpdateDraw` 确保渲染逻辑在 tview 主循环中执行（线程安全）
-- `updating` 标志防止多次 `QueueUpdateDraw` 回调并发执行 UI 更新
-- 即使 model 频繁通知，UI 也只会一个一个地串行处理
+| 操作 | 入口代码 | 实际效果 |
+|------|---------|---------|
+| Ctrl+R | `internal/view/browser.go#L478-L483` `refreshCmd` | 调用 `Start()` 重连 Watcher |
+| 切换命名空间 | `internal/view/browser.go#L587` | `b.refresh()` → `Start()` |
+| 退出搜索模式 | `internal/view/browser.go#L228-L251` `BufferActive()` | `model.Refresh()` |
+| 排序、标记、列切换等 | `internal/ui/table.go` 内各 Cmd | 直接走本地 `Refresh()` |
 
 ---
 
-## 三、数据流转全链路
+## 三、数据读取：从哪里取数据？三种 DAO 策略并存
 
-### 3.1 完整刷新流程
+### 3.1 DAO 选择逻辑
 
-```
-1. updater goroutine 定时触发
-       ↓
-2. refresh() — CAS 获取锁（防并发）
-       ↓
-3. reconcile() — 调用 DAO.List() 从 Informer 缓存读取数据
-       ↓
-4. TableData.Render() — 将 []runtime.Object 渲染为 Rows
-       ↓
-5. TableData.Update(rows) — 计算行级增量 Delta
-       ↓
-6. fireTableChanged(data) / fireNoData(data) — 通知 Listener
-       ↓
-7. Browser.TableDataChanged() — View 层回调
-       ↓
-8. b.Update(data) → filtered() → doUpdate() — 过滤、排序
-       ↓
-9. app.QueueUpdateDraw() — 投递到主线程
-       ↓
-10. UpdateUI(cdata, mdata) — 实际渲染到 tview.Table
+`internal/model/helpers.go#L32-L45` — `resourceMeta(gvr)`
+```go
+func resourceMeta(gvr *client.GVR) ResourceMeta {
+    // 优先级 1：在 model.Registry 中查是否有明确配置
+    meta, ok := Registry[gvr]
+    if !ok {
+        // 完全未注册：默认走 HTTP Table 格式 API
+        meta = ResourceMeta{
+            DAO:      new(dao.Table),
+            Renderer: new(render.Table),
+        }
+    }
+    // 优先级 2：Registry 有注册但 DAO 为 nil → 走 Informer 缓存
+    if meta.DAO == nil {
+        meta.DAO = new(dao.Resource)
+    }
+    return meta
+}
 ```
 
-### 3.2 增量计算机制
+### 3.2 三种 DAO 的数据源与性能特征
 
-[model1.TableData.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/model1/table_data.go#L425-L457) 负责计算新旧数据的差异：
+#### A. 走 Informer 缓存（dao.Resource）
 
+`internal/dao/resource.go#L27-L34`
+```go
+func (r *Resource) List(ctx context.Context, ns string) ([]runtime.Object, error) {
+    lsel := labels.Everything()
+    if sel, ok := ctx.Value(internal.KeyLabels).(labels.Selector); ok {
+        lsel = sel
+    }
+    // wait=false：不等待缓存同步，直接读当前状态
+    return r.getFactory().List(r.gvr, ns, false, lsel)
+}
+```
+
+→ 最终到 `internal/watch/factory.go#L75-L99` `Factory.List()`：
+```go
+inf.Lister().List(lbls)       // 读本地内存缓存，无网络开销
+// wait=false 时不等 HasSynced，直接返回
+```
+
+**使用该 DAO 的资源**：Registry 中注册但未指定 DAO 的资源，如：
+`EpsGVR, EpGVR, SaGVR, PvGVR, PvcGVR, NpGVR, ScGVR, PdbGVR, CrbGVR, RoGVR, RobGVR` 等（见 `internal/model/registry.go`）
+
+#### B. 直连 HTTP Table 格式（dao.Table）
+
+`internal/dao/table.go#L59-L100`
+```go
+func (t *Table) List(ctx context.Context, ns string) ([]runtime.Object, error) {
+    // 直接走 REST 接口，Accept: application/json;as=Table
+    o, err := c.Get().
+        SetHeader("Accept", header).
+        Param("includeObject", includeObject).
+        Namespace(ns).Resource(t.gvr.R()).
+        VersionedParams(&metav1.ListOptions{...}, ...).
+        Do(ctx).Get()
+    ...
+    return []runtime.Object{ta}, nil  // 包装成单个 metav1.Table 对象
+}
+```
+
+**使用该 DAO 的资源**：
+- 完全未在 Registry 中注册的 CRD（走默认）
+- `EvGVR (Events)`：`Registry` 中明确指定 `DAO: new(dao.Table)`
+
+#### C. 直连动态 client（dao.Generic）
+
+`internal/dao/generic.go#L41-L72`
+```go
+func (g *Generic) List(ctx context.Context, ns string) ([]runtime.Object, error) {
+    dial, _ := g.dynClient()
+    // dynamic client 直连 API Server
+    ll, err = dial.Namespace(ns).List(ctx, opts)
+    ...
+}
+```
+
+**实际使用极少**，只有当 ResourceMeta 中的 DAO 既不是 nil 也不是明确配置时才会出现。注册过的 Pod/Deployment/Node 等都覆盖了 List 方法（见下）。
+
+#### D. 扩展型 DAO（Informer + 额外数据合并）
+
+如 Pod：`internal/dao/pod.go#L110-L149`
+```go
+func (p *Pod) List(ctx context.Context, ns string) ([]runtime.Object, error) {
+    oo, err := p.Resource.List(ctx, ns)  // 第一步：走 Informer 缓存
+    if err != nil { return oo, err }
+
+    var pmx client.PodsMetricsMap
+    if withMx, ok := ctx.Value(internal.KeyWithMetrics).(bool); ok && withMx {
+        pmx, _ = client.DialMetrics(p.Client()).FetchPodsMetricsMap(ctx, ns)  // 第二步：合并 Metrics API
+    }
+    // 包装成 PodWithMetrics
+}
+```
+
+同类：`Node.List, Deployment.List` 等都继承自 Resource 并做二次加工。
+
+### 3.3 Informer 缓存未同步时的处理
+
+在 View 层 `TableNoData` 中做了保护（`internal/view/browser.go#L298-L335`）：
+```go
+func (b *Browser) TableNoData(mdata *model1.TableData) {
+    // 如果 informer 还没同步完，只提示"Synchronizing..."不显示"无资源"警告
+    if synced, _ := b.app.factory.HasSynced(b.GVR(), b.GetNamespace()); !synced {
+        b.app.QueueUpdateDraw(func() {
+            b.app.Flash().Infof("Synchronizing %s in %q namespace...", ...)
+        })
+        return
+    }
+    // 同步完了还没数据才真正提示 No resources found
+    ...
+}
+```
+
+> **关键边界**：缓存同步检查只在"无数据"时才做；有数据时直接展示，避免误报。
+
+---
+
+## 四、差异标记：增量如何计算？时间列为何不抖动？
+
+完整链路：`reconcile` → `data.Render` → `data.Update(rows)` → `DeltaRow` 计算
+
+### 4.1 Render：runtime.Object → Rows
+
+`internal/model1/table_data.go#L252-L279`
+```go
+func (t *TableData) Render(_ context.Context, r Renderer, oo []runtime.Object) error {
+    var rows Rows
+    if len(oo) > 0 {
+        if r.IsGeneric() {  // 对应 dao.Table 的 HTTP Table 格式
+            table, _ := oo[0].(*metav1.Table)
+            rows = make(Rows, len(table.Rows))
+            GenericHydrate(t.namespace, table, rows, r)
+        } else {            // 对应 unstructured 对象列表
+            rows = make(Rows, len(oo))
+            Hydrate(t.namespace, oo, rows, r)
+        }
+    }
+    t.Update(rows)                    // 计算 Delta 的入口
+    t.SetHeader(t.namespace, r.Header(t.namespace))
+    return nil
+}
+```
+
+### 4.2 Update：新旧 Rows 对比，标记事件类型
+
+`internal/model1/table_data.go#L425-L457`
 ```go
 func (t *TableData) Update(rows Rows) {
     empty := t.Empty()
     kk := sets.New[string]()
     for _, row := range rows {
         kk.Insert(row.ID)
+
+        // 情况 1：空表首次填充 → 全量 EventAdd
         if empty {
-            t.rowEvents.Add(NewRowEvent(EventAdd, row))  // 首次全量添加
+            t.rowEvents.Add(NewRowEvent(EventAdd, row))
             continue
         }
+
+        // 情况 2：ID 已存在 → 算 Delta
         if index, ok := t.rowEvents.FindIndex(row.ID); ok {
-            // 已存在：计算 Delta
             ev, _ := t.rowEvents.At(index)
-            delta := NewDeltaRow(ev.Row, row, t.header)
+            delta := NewDeltaRow(ev.Row, row, t.header)  // ★ 关键：算差异
             if delta.IsBlank() {
-                ev.Kind = EventUnchanged  // 无变化
+                ev.Kind = EventUnchanged                  // 无变化
             } else {
-                t.rowEvents.Set(index, NewRowEventWithDeltas(row, delta))  // 有更新
+                t.rowEvents.Set(index, NewRowEventWithDeltas(row, delta))  // EventUpdate
             }
-        } else {
-            t.rowEvents.Add(NewRowEvent(EventAdd, row))  // 新增行
+            continue
         }
+
+        // 情况 3：新 ID → EventAdd
+        t.rowEvents.Add(NewRowEvent(EventAdd, row))
     }
+
+    // 情况 4：旧数据中出现但新集合没出现的 ID → 做 Delete
     if !empty {
-        t.Delete(kk)  // 删除不再存在的行
+        t.Delete(kk)
     }
 }
 ```
 
-**DeltaRow**（[delta.go:12-24](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/model1/delta.go#L12-L24)）只记录真正变化的字段：
+### 4.3 DeltaRow：时间列被排除，避免 AGE 每秒变导致整行闪
 
+`internal/model1/delta.go#L12-L24`
 ```go
 func NewDeltaRow(o, n Row, h Header) DeltaRow {
     deltas := make(DeltaRow, len(o.Fields))
     for i, old := range o.Fields {
+        if i >= len(n.Fields) {
+            continue
+        }
+        // ★ 边界核心：h.IsTimeCol(i) == true 的列（AGE、Last Seen 等）不参与差异
         if old != "" && old != n.Fields[i] && !h.IsTimeCol(i) {
-            deltas[i] = old  // 仅记录旧值（非时间列变化）
+            deltas[i] = old   // 只保存旧值，用于 UI 层拼接"old→new"提示
         }
     }
     return deltas
 }
 ```
 
-- **时间列不参与 Delta**：`AGE` 等时间列每秒都在变，如果纳入 Delta 会导致整行被标记为"已更新"，产生视觉抖动
-- Delta 信息用于 UI 层显示变化高亮（如 `Deltas()` 函数添加变化标记符号）
+时间列的定义在各 Renderer.Header 中（如 `ageCols = {"Last Seen", "First Seen", "Age"}`，见 `internal/render/table.go#L22`），HeaderColumn.Attrs.Time = true。
 
----
+### 4.4 Delta 在 UI 层的消费
 
-## 四、Informer 缓存与数据源
-
-### 4.1 数据不直接来自 API Server
-
-[watch.Factory](file:///d:/f:/0601-2/solo-dogfeeding/code/1-k9s/internal/watch/factory.go#L29-L35) 使用 Kubernetes Dynamic SharedInformerFactory：
-
+`internal/ui/table.go#L507-L561` `buildRow()`
 ```go
-f.factories[ns] = di.NewFilteredDynamicSharedInformerFactory(
-    dial,
-    defaultResync,  // 10 分钟全量重同步
-    ns,
-    nil,
-)
-```
-
-- `defaultResync = 10 * time.Minute`：Informer 每 10 分钟全量重同步一次
-- `refresh` 操作实际是读取 Informer 的本地缓存，不是直接请求 API Server
-- 这意味着 K9s 的刷新频率（2 秒）与 API Server 的负载无关
-
-### 4.2 缓存同步等待
-
-在首次获取数据时，[Factory.List](file:///d:/fz/0601-2/solo-dogfeeding/code/1-k9s/internal/watch/factory.go#L75-L99) 会等待缓存同步：
-
-```go
-if !wait || (wait && inf.Informer().HasSynced()) {
-    return oo, err
+func (t *Table) buildRow(r int, re, ore model1.RowEvent, h model1.Header, pads MaxyPad) {
+    ...
+    for c, field := range re.Row.Fields {
+        ...
+        // 只在 Delta 非空且非时间列时拼"旧值→新值"的视觉提示
+        if !re.Deltas.IsBlank() && !h.IsTimeCol(c) {
+            var old string
+            if c < len(re.Deltas) {
+                old = re.Deltas[c]
+            }
+            field += Deltas(old, field)  // 拼高亮符号（如 ←xxx）
+        }
+        ...
+    }
 }
-f.waitForCacheSync(ns)  // 最多等 500ms
 ```
-
-- `defaultWaitTime = 500ms`：缓存同步的最长等待时间
-- 如果缓存尚未同步完成，`HasSynced` 检查会在 `TableNoData` 中用于避免误报"无资源"警告
 
 ---
 
-## 五、总结：四层防抖的协作关系
+## 五、界面重绘：从通知到像素，两层串行保障
 
-| 层次 | 机制 | 位置 | 效果 |
-|------|------|------|------|
-| 1 | 原子锁 `inUpdate` | model.Table.refresh | 丢弃并发刷新请求 |
-| 2 | 定时间隔 `refreshRate` | model.Table.updater | 控制拉取频率（默认 2s） |
-| 3 | 指数退避 Backoff | model.Table.updater | 失败时逐步降频 |
-| 4 | UI 互斥 `updating` | Browser.TableDataChanged | 防止并发渲染 |
+### 5.1 三层 Listener 回调链
 
-**核心设计理念**：K9s 不使用 Watch 事件驱动的推送模式，而是采用 **定时拉取 + 增量计算** 的模式。这种设计简化了数据流，同时通过多层防抖机制确保即使在高频变更场景下，UI 也不会产生抖动。Informer 缓存作为中间层，使得 2 秒一次的拉取操作成本极低（本地内存读取），不会对 API Server 造成压力。
+从 Model 到 UI 的通知链路：
+
+```
+model.Table.fireTableChanged(data)           （clone 后的 TableData 快照）
+    ↓ 遍历 listeners 调用 TableDataChanged()
+view.Browser.TableDataChanged(mdata)          （internal/view/browser.go#L338-L365）
+    ↓ 1. b.Update() → filtered + doUpdate()   （过滤、排序列计算）
+    ↓ 2. app.QueueUpdateDraw(func(){...})     （投递到 tview 主循环）
+        ui.Table.UpdateUI(cdata, data)        （internal/ui/table.go#L472-L505）
+            ↓ t.Clear() + 逐行 buildRow()     （全量重建 tview 单元格）
+```
+
+### 5.2 第一层串行：Browser.updating 互斥标志
+
+`internal/view/browser.go#L338-L365`
+```go
+func (b *Browser) TableDataChanged(mdata *model1.TableData) {
+    cdata := b.Update(mdata, b.app.Conn().HasMetrics())  // 在 goroutine 内先算过滤排序
+
+    // 投递到 tview 主线程（QueueUpdateDraw 是线程安全的入队）
+    b.app.QueueUpdateDraw(func() {
+        // 边界：如果上一次 QueueUpdateDraw 的回调尚未跑完，跳过
+        if b.getUpdating() {
+            return
+        }
+        b.setUpdating(true)
+        defer b.setUpdating(false)
+
+        // 真正操作 tview 控件（必须在主线程）
+        b.refreshActions()
+        b.UpdateUI(cdata, mdata)
+    })
+}
+```
+
+> **要点**：`QueueUpdateDraw` 本身是入队操作（串行排队执行），`updating` 又提供了一层"去重"——如果队列中还有没跑完的绘制，新的就丢弃。这两层叠加确保 UI 不会并发操作 tview 树。
+
+### 5.3 第二层串行：UpdateUI 全量重建单元格
+
+`internal/ui/table.go#L472-L505`
+```go
+func (t *Table) UpdateUI(cdata, data *model1.TableData) {
+    t.Clear()                              // 清空所有单元格
+    // 重建 header
+    col := 0
+    for _, h := range cdata.Header() {
+        if t.shouldExcludeColumn(h) { continue }
+        t.AddHeaderCell(col, h)
+        col++
+    }
+    cdata.Sort(t.getSortCol())             // 先排序
+    ComputeMaxColumns(pads, ..., cdata)    // 算对齐用的列宽
+    // 逐行构建
+    cdata.RowsRange(func(row int, re model1.RowEvent) bool {
+        ore, _ := data.FindRow(re.Row.ID)  // 找原表（未过滤）中的 delta 信息
+        t.buildRow(row+1, re, ore, cdata.Header(), pads)
+        return true
+    })
+    t.updateSelection(true)                // 重新定位选中行
+    t.UpdateTitle()                        // 更新标题计数
+}
+```
+
+> **关键边界**：
+> - `cdata` 是过滤后的数据（用于展示行），`data` 是原始数据（用于找 Delta）
+> - `UpdateUI` 每次都是 **Clear 后全量重建**，没有 diff-dom；但因为是本地重建 tcell 单元格且有前面的节奏控制，性能可接受
+> - `cdata.Sort()` 是就地排序，会影响 `rowEvents.index`，`RowsRange` 以排序后顺序遍历
+
+---
+
+## 六、边界关系总表
+
+| 阶段 | 边界位置 | 保障手段 | 失败/异常处理 |
+|------|---------|---------|--------------|
+| **刷新发起频率** | `updater time.After(rate)` + `refreshRate` | 定时器间隔（拉模式） | 指数退避，最长 2min 退出 |
+| **refresh 并发控制** | `refresh()` 首行 | CAS 原子锁 `inUpdate` | 并发请求静默丢弃 |
+| **DAO 数据源选择** | `resourceMeta(gvr)` | Registry 三层 fallback（明确 DAO → nil→Resource → Table） | 未注册资源默认 HTTP Table |
+| **Inform 缓存未就绪** | `Browser.TableNoData` | `HasSynced()` 检查 | 显示 Synchronizing 而非误报 |
+| **增量 Delta 计算** | `TableData.Update` | 按 ID 匹配 + DeltaRow | 无则 Add、有变 Update、无变 Unchanged、缺失 Delete |
+| **时间列防抖动** | `NewDeltaRow` | `h.IsTimeCol(i)` 跳过 | AGE 等变化不计入 Delta |
+| **UI 回调并发** | `Browser.TableDataChanged` | `QueueUpdateDraw` 入队 + `updating` 标志 | 队列中已有绘制时跳过 |
+| **UI 渲染线程** | `UpdateUI` 整体 | 全在 `QueueUpdateDraw` 回调内 | tview 主线程安全 |
+
+---
+
+## 七、常见疑问的代码定位
+
+**Q1：刷新时是不是每次都打 API Server？**
+- 不是。走 `dao.Resource` 的资源读 Informer 本地缓存（`watch/factory.go#L75-L99`）。只有 `dao.Table`（HTTP Table）和 `dao.Generic`（dynamic client）才发网络请求。
+
+**Q2：AGE 列每秒都变，为什么不会整行高亮闪烁？**
+- Delta 计算时显式跳过了时间列（`model1/delta.go#L18` 的 `!h.IsTimeCol(i)` 条件）。时间相关列定义在各 Renderer.Header 的 `Attrs.Time=true`。
+
+**Q3：用户快速切命名空间为什么不会卡？**
+- `Browser.Stop()` 调 `cancelFn()` 终止旧 Watcher goroutine（`view/browser.go#L190-L200`），然后 `Start()` 启动新的。旧 goroutine 因为 `ctx.Done()` 会退出，不会继续刷新。
+
+**Q4：手动 refresh（Ctrl+R）和定时 refresh 有什么不同？**
+- 手动走 `refreshCmd → b.refresh() → b.Start()`，是重走整个 Watch 流程（会重建 context/cancel），定时只在 updater goroutine 内循环调 `t.refresh(ctx)`。
+
+**Q5：UpdateUI 全量重建会不会导致闪烁？**
+- tview 的 Draw 是双缓冲，更新完统一 `Sync()` 到终端；外层还有 `updating` 标志 + 2s 刷新间隔确保不会每秒重建。
