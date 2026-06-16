@@ -7,19 +7,22 @@
 ```
 用户按键 → Prompt UI → FishBuff(命令缓冲+补全) → CmdBuff(底层缓冲)
     → [补全刷新] SuggestionChanged → UI 重绘
-    → [执行] App.keyboard → gotoCmd → gotoResource → Command.run
-        ├── Interpreter 解析（解析命令文本）
-        ├── specialCmd（处理特殊命令）
-        ├── viewMetaFor → Alias.Resolve（别名解析）
-        ├── context 切换（@ctx 语法）
-        ├── namespace 切换
-        ├── 应用 filter/fuzzy/label selector
-        └── exec → 视图创建与注入 → 页面展示 → cmdHistory.Push（历史写入）
+    → [执行] App.keyboard → gotoCmd → gotoResource
+        ├── NewInterpreter + grok()（分词+参数拆解，在 run 之前完成）
+        └── Command.run（收到已解析的 Interpreter）
+            ├── specialCmd（处理特殊命令）
+            ├── viewMetaFor → Alias.Resolve（别名解析）
+            ├── context 切换（@ctx 语法）
+            ├── namespace 切换
+            ├── 应用 filter/fuzzy/label selector
+            └── exec → 视图创建与注入 → 页面展示 → cmdHistory.Push（历史写入）
 ```
 
 > **核心纠正 1**：`BufferCompleted` 事件是纯 UI 重绘信号，不触发资源跳转。资源跳转的唯一触发器是 App 级别的 `tcell.KeyEnter` 键绑定 → `gotoCmd`。
 >
 > **核心纠正 2**：历史写入（`cmdHistory.Push`）发生在整个执行流程的**最后一步**——在解析、别名处理、视图创建与注入都成功完成之后，而不是之前。详见「阶段三：命令执行」。
+>
+> **核心纠正 3**：命令分词和参数拆解在 `NewInterpreter` 构造时通过 `grok()` 一次性完成，**在 `Command.run` 之前**。`run` 收到的 `*Interpreter` 已经是解析完毕的状态（`cmd` + `args` 已就绪），不需要在 `run` 内部再解析。详见「阶段三」。
 
 ---
 
@@ -143,8 +146,16 @@ case tcell.KeyTab, tcell.KeyRight, tcell.KeyCtrlF:
 
 ```
 gotoCmd
-  ├── gotoResource(cmdText, "", true, true)
-  │   └── Command.run(NewInterpreter(cmdText), ...)  [command.go#L176]
+  ├── gotoResource(cmdText, "", true, true)             [app.go#L791]
+  │   │
+  │   ├── 0. NewInterpreter(cmdText) + grok()           [interpreter.go#L24-L33]
+  │   │       ├── strings.Fields 分词                    [interpreter.go#L63]
+  │   │       ├── c.cmd = strings.ToLower(ff[0])         [interpreter.go#L67]
+  │   │       ├── 提取单引号内 label selector             [interpreter.go#L71-L80]
+  │   │       └── newArgs(c, ff) → args map              [interpreter.go#L85]
+  │   │   ← 此时 Interpreter 已完全解析，cmd + args 就绪
+  │   │
+  │   └── Command.run(p, ...)  [command.go#L176]  ← p 是已解析的 Interpreter
   │       ├── 1. specialCmd(p) [L177]                  ← 处理特殊命令
   │       │       (cow/quit/help/alias/xray/rbac/ctx/ns/dir)
   │       │
@@ -170,6 +181,8 @@ gotoCmd
           ├── SetActive(false) → fireActive(false)        ← 隐藏 Prompt
           └── fireBufferCompleted("")                      ← 纯 UI 通知
 ```
+
+**关键纠正**：`NewInterpreter` + `grok()` 在 [interpreter.go#L24-L33](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/interpreter.go#L24-L33) 中一次性完成分词和参数拆解，**发生在 `Command.run` 之前**（在 [gotoResource](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L792) 调用 `run` 时 `p` 已是解析完毕的状态）。`run` 内部的第一步是 `specialCmd`，不是解析。
 
 **关键纠正**：`cmdHistory.Push` [command.go#L382](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L382) 是 `exec` 方法的**最后一个动作**，在 `app.inject`（视图创建与注入）成功完成之后才执行。历史写入是执行边界的收尾动作，而不是开始动作。
 
@@ -306,9 +319,9 @@ func (a *App) lastCommand(evt *tcell.EventKey) *tcell.EventKey {
 │         cmdBuff.Reset（清空缓冲、隐藏 Prompt）                 │
 │         cmdHistory.Push（写入历史）← 历史回填边界的写入点         │
 │  ─────────────────────────────────────────────────────────── │
-│  执行顺序：1.解析 → 2.specialCmd → 3.别名解析 → 4.ctx切换     │
-│           → 5.ns切换 → 6.filter/fuzzy/label → 7.inject       │
-│           → 8.cmdHistory.Push（最后一步）                      │
+│  执行顺序：0.NewInterpreter+grok(在run外) → 1.specialCmd → 2.别名解析 → 3.ctx切换     │
+│           → 4.ns切换 → 5.filter/fuzzy/label → 6.inject       │
+│           → 7.cmdHistory.Push（最后一步）                      │
 └──────────────────────┬──────────────────────────────────────┘
                        │ exec → cmdHistory.Push
                        ▼
@@ -490,20 +503,40 @@ func (a *App) gotoCmd(evt *tcell.EventKey) *tcell.EventKey {
 }
 ```
 
-### 3.2 gotoResource → Command.run
+### 3.2 gotoResource —— 解析器创建与命令调度
 
-[gotoResource](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L791-L797) 是简单委托：
+[gotoResource](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L791-L797) 负责**先创建解析器完成分词拆解，再进入命令调度**：
 
 ```go
 func (a *App) gotoResource(c, path string, clearStack, pushCmd bool) {
     err := a.command.run(cmd.NewInterpreter(c), path, clearStack, pushCmd)
+    //                     ^^^^^^^^^^^^^^^^^^^^
+    //                     NewInterpreter(c) 在此处构造，构造时自动调用 grok()
+    //                     完成分词和参数拆解，返回已解析的 *Interpreter
     ...
 }
 ```
 
+[NewInterpreter](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/interpreter.go#L24-L33) 构造函数：
+
+```go
+func NewInterpreter(s string, aliases ...string) *Interpreter {
+    c := Interpreter{
+        line:    s,
+        args:    make(args),
+        aliases: aliases,
+    }
+    c.grok()     // ← 构造时立即调用，完成分词 + 参数拆解
+
+    return &c    // ← 返回的 Interpreter 已是解析完毕的状态
+}
+```
+
+**关键**：`grok()` 在构造函数内被调用，因此 `Command.run` 收到的 `p *Interpreter` 已经拥有完整的 `cmd` 和 `args`，不需要在 `run` 内部再做任何解析。
+
 ### 3.3 Command.run —— 命令调度中心（**精确顺序，每步都有代码行号**）
 
-[command.go#L176-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L176-L242) 是整个跳转的核心调度，**严格按以下顺序执行**：
+[command.go#L176-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L176-L242) 收到的 `p` 已是解析完毕的 Interpreter，**严格按以下顺序执行**：
 
 ```
 run(p *Interpreter, fqn string, clearStack, pushCmd bool)
@@ -597,14 +630,16 @@ Interpreter {
 }
 ```
 
-### 4.2 grok() 解析流程
+### 4.2 grok() 解析流程（由 NewInterpreter 构造函数自动调用）
 
-[grok](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/interpreter.go#L62-L86) 方法：
+[grok](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/interpreter.go#L62-L86) 在 `NewInterpreter` 构造时自动执行（[interpreter.go#L30](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/interpreter.go#L30)），不需要外部显式调用。解析流程：
 
 1. 用 `strings.Fields` 分词
 2. 第一个词作为 `cmd`（转小写）
 3. 在剩余部分中提取单引号包裹的 label selector
 4. 将剩余词传给 `newArgs` 解析为参数
+
+> **注意**：`grok()` 还在 `Interpreter.Reset`（[interpreter.go#L143-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/interpreter.go#L143-L152)）中被调用，用于别名链展开后重新解析命令行。
 
 ### 4.3 args 参数解析
 
@@ -866,14 +901,19 @@ Prompt.keyboard → SetText(buff+suggestion) → 建议追加到 buff → 重绘
   ▼ App.keyboard → HasAction(KeyEnter) → gotoCmd
   │   ├── CmdBuff.IsActive() && !Empty()? → YES
   │   ├── gotoResource(cmdText, "", true, true)         ← 执行边界开始
-  │   │   └── Command.run(NewInterpreter(cmdText))
-  │   │       ├── [L177] 1. Interpreter 解析 → cmd + args
-  │   │       ├── [L177] 2. specialCmd()
-  │   │       ├── [L180] 3. viewMetaFor() → Alias.Resolve() → GVR
-  │   │       ├── [L188] 4. context 切换（@ctx）
-  │   │       ├── [L213] 5. namespace 切换
-  │   │       ├── [L226] 6. filter/fuzzy/labels 应用
-  │   │       └── [L241] 7. exec()
+  │   │   ├── NewInterpreter(cmdText) + grok()           ← 步骤 0：分词+参数拆解（在 run 之前）
+  │   │   │       ├── strings.Fields 分词 → cmd
+  │   │   │       ├── 提取 label selector
+  │   │   │       └── newArgs() → args map
+  │   │   │   ← Interpreter 已完全解析
+  │   │   │
+  │   │   └── Command.run(p)  ← p 是已解析的 Interpreter
+  │   │       ├── [L177] 1. specialCmd()
+  │   │       ├── [L180] 2. viewMetaFor() → Alias.Resolve() → GVR
+  │   │       ├── [L188] 3. context 切换（@ctx）
+  │   │       ├── [L213] 4. namespace 切换
+  │   │       ├── [L226] 5. filter/fuzzy/labels 应用
+  │   │       └── [L241] 6. exec()
   │   │           ├── [L372] comp.SetCommand(interpreter)
   │   │           ├── [L376] Config.SetActiveView()
   │   │           ├── [L378] app.inject(comp) → PageStack.Push → comp.Start
