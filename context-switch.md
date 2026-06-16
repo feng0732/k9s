@@ -532,103 +532,545 @@ func (a *App) switchNS(ns string) error {
 
 ---
 
-## 七、并发命令处理
+## 七、并发边界全景分析
 
-### 7.1 `Command.mx` — 命令执行互斥锁
+K9s 的并发模型基于**多层锁 + context 取消 + 原子标志**的混合策略。本节详细拆解四组并发要素：普通命令、别名重置、后台刷新、客户端锁之间的协同关系，并逐一指出未受保护的路径。
 
-文件：[command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/command.go#L35-L39)
+### 7.1 并发要素矩阵
+
+以下是关键锁、它们的保护对象、持有者，以及协作关系：
+
+| 锁/机制 | 类型 | 保护对象 | 所在文件 |
+|---------|------|----------|----------|
+| `Command.mx` | `sync.Mutex` | `Command.alias` 读写一致性（仅限 `Reset`/`Init`） | [command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/command.go#L35-L39) |
+| `Aliases.mx` | `sync.RWMutex` | `Aliases.Alias` map 的并发读写 | [alias.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/config/alias.go#L31-L34) |
+| `APIClient.mx` | `sync.RWMutex` | 各客户端字段（client/dClient/mxsClient 等） | [client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L44-L55) |
+| `Config.mx` | `sync.RWMutex` | `Config.flags`（ConfigFlags 指针） | [config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/config.go#L33-L37) |
+| `Factory.mx` | `sync.RWMutex` | `factories` map、`stopChan`、`forwarders` | [factory.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/watch/factory.go#L29-L35) |
+| `K9s.mx` | `sync.RWMutex` | `activeConfig`、`activeContextName`、`contextSwitch`、`conn` | [k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/config/k9s.go#L87-L99) |
+| `cancelFn` | `context.CancelFunc` | 全局后台 goroutine 的生命周期 | [app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/app.go#L334-L362) |
+| `Table.inUpdate` | `atomic.Int32` | 防止同一张表并发刷新 | [table.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/model/table.go#L229-L247) |
+
+### 7.2 `Command.mx` 的保护范围 vs 盲区
+
+`Command.mx` 是最容易被误解的锁。让我们逐一检查 `Command` 的所有方法：
+
+#### 受 `Command.mx` 保护的方法
+
+只有两个方法持有该锁：
+
+1. **`Init`**（初始化时加载别名）
+2. **`Reset`**（上下文/命名空间切换时重建别名）
+
+文件：[command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/command.go#L57-L101)
 
 ```go
-type Command struct {
-    app   *App
-    alias *dao.Alias
-    mx    sync.Mutex    // 命令执行互斥锁
+func (c *Command) Init(path string) error {
+    c.mx.Lock()                    // ✅ 加锁
+    defer c.mx.Unlock()
+    alias := NewAlias(c.app.factory)
+    aliasMap, err := alias.Ensure(path)
+    c.alias = alias
+    c.alias.Alias = aliasMap
+    return nil
+}
+
+func (c *Command) Reset(path string, nuke bool) error {
+    c.mx.Lock()                    // ✅ 加锁
+    defer c.mx.Unlock()
+    if c.alias == nil {
+        c.alias = NewAlias(c.app.factory)
+    }
+    if nuke {
+        c.alias.Clear()            // Clear 有内部 RWMutex，双重保护
+    }
+    aliasMap, err := c.alias.Ensure(path)
+    c.alias.Alias = aliasMap
+    return nil
 }
 ```
 
-`Command.Reset` 方法使用此锁：
+#### **不受 `Command.mx` 保护的方法（盲区）**
 
-文件：[command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/command.go#L71-L87)
+| 方法 | 作用 | 是否操作 alias | 风险 |
+|------|------|----------------|------|
+| `run()` | 执行普通命令（pod/svc/ctx...） | ✅ 通过 `viewMetaFor → alias.Resolve` 读取 | ⚠️ 并发 Reset 可能读到部分填充的 alias map |
+| `exec()` | 创建视图并注入 | ❌ 不操作 alias | 安全 |
+| `defaultCmd()` | 默认视图（ctx 或 pod） | ✅ 间接调用 `run()` | 同 `run` |
+| `specialCmd()` | 特殊命令（ctx/xray/alias） | ✅ 通过 `aliasCmd` 读取 | 同 `run` |
+| `contextCmd()` | `ctx <name>` 命令 | ❌ 不操作 alias | 安全 |
+| `aliasCmd()` | 别名列表视图 | ✅ 创建 `Alias` DAO | 安全（只读） |
+| `xrayCmd()` | Xray 视图 | ❌ 不操作 alias | 安全 |
+| `viewMetaFor()` | 解析命令→GVR | ✅ `alias.Resolve` 读 alias map | ⚠️ 核心风险点 |
+| `AliasesFor()` | 命令补全/提示 | ✅ 遍历 alias map | ⚠️ Reset 期间遍历旧 map |
+
+最关键的风险链路：`Command.run()` → `viewMetaFor()` → `alias.Resolve()` → `Aliases.Get()`
+
+文件：[command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/command.go#L176-L243) + [command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/command.go#L315-L351)
 
 ```go
-func (c *Command) Reset(path string, nuke bool) error {
-    c.mx.Lock()
-    defer c.mx.Unlock()
+func (c *Command) run(p *cmd.Interpreter, fqn string, clearStack, pushCmd bool) error {
+    // ...
+    // ❌ 此处无 Command.mx 保护
+    gvr, meta, interp, err := c.viewMetaFor(p)  // → 调用 alias.Resolve
+    // ...
+}
+
+func (c *Command) viewMetaFor(p *cmd.Interpreter) (*client.GVR, *MetaViewer, *cmd.Interpreter, error) {
+    // ...
+    // ❌ 直接访问 c.alias 指针，无 Command.mx 读保护
+    if c.alias != nil {
+        gvr, ok = c.alias.Resolve(p)   // 内部有 Aliases.mx RLock，但指针本身无保护
+    }
     // ...
 }
 ```
 
-### 7.2 `APIClient.mx` — 客户端字段读写锁
+**风险场景**：线程 A 在 `viewMetaFor` 里读 `c.alias` 指针（刚拿到，还没调用 Resolve），此时线程 B（上下文切换）在 `Reset` 里把 `c.alias.Clear()` + 重新填充。如果刚好 B 的 `Ensure` 正在执行 `Define`，A 的 `Resolve` 可能看到部分别名（即只有 k9s 默认别名，没有 context 特定别名和 CRD 别名）。
 
-文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L44-L55)
+**实际危害等级：低**。因为 `Aliases` 内部有自己的 `mx RWMutex` 保护 map 本身（`Get/Define/Clear` 都加锁），且上下文切换期间 `Halt()` 会停止后台 goroutine 和 UI 事件循环，用户输入的命令在切换期间不会被 tview 的主循环处理。但如果在 `Resume()` 之后、`Reset()` 完成之前有异步 goroutine 触发了命令（例如配置文件 watcher 触发的 Reload），仍有竞态窗口。
+
+### 7.3 后台刷新 goroutine 与客户端锁的协同
+
+有四类后台 goroutine 持续运行（受 `cancelFn` context 控制）：
+
+#### 7.3.1 集群连通性检查循环 `clusterUpdater`
+
+文件：[app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/app.go#L364-L395)
 
 ```go
-type APIClient struct {
-    client, logClient kubernetes.Interface
-    dClient           dynamic.Interface
-    nsClient          dynamic.NamespaceableResourceInterface
-    mxsClient         *versioned.Clientset
-    cachedClient      *disk.CachedDiscoveryClient
-    config            *Config
-    mx                sync.RWMutex      // 保护所有客户端字段
-    cache             *cache.LRUExpireCache
-    connOK            bool
+func (a *App) clusterUpdater(ctx context.Context) {
+    // ...
+    delay := clusterRefresh
+    for {
+        select {
+        case <-ctx.Done():            // ✅ Halt() 时收到取消信号，退出
+            return
+        case <-time.After(delay):
+            if err := a.refreshCluster(ctx); err != nil {
+                // 指数退避
+            }
+        }
+    }
 }
 ```
 
-所有客户端字段的读写都通过 `mx` 保护的 getter/setter：
+`refreshCluster` 调用链：
+
+```
+refreshCluster(ctx)
+  → a.Conn().CheckConnectivity()    // 调用 APIClient.CheckConnectivity()
+  → a.factory.ValidatePortForwards() // 遍历端口转发列表
+```
+
+`CheckConnectivity` 内部通过 `APIClient.mx` 的 getter/setter 保护客户端字段的并发安全。
+
+#### 7.3.2 资源视图刷新循环 `Table.updater`
+
+文件：[table.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/model/table.go#L203-L227)
 
 ```go
-func (a *APIClient) setClient(k kubernetes.Interface) {
-    a.mx.Lock()
-    defer a.mx.Unlock()
-    a.client = k
-}
-
-func (a *APIClient) getClient() kubernetes.Interface {
-    a.mx.RLock()
-    defer a.mx.RUnlock()
-    return a.client
+func (t *Table) updater(ctx context.Context) {
+    rate := initRefreshRate
+    for {
+        select {
+        case <-ctx.Done():           // ✅ 视图 Stop() 时退出
+            return
+        case <-time.After(rate):
+            backoff.Retry(func() error {
+                return t.refresh(ctx)  // → reconcile → list → DAO.List()
+            }, backoff.WithContext(bf, ctx))
+        }
+    }
 }
 ```
 
-### 7.3 `Config.mx` — Kubeconfig 配置读写锁
+`refresh` 用 `atomic.CompareAndSwapInt32(&t.inUpdate, 0, 1)` 防止重入。list 操作最终会走 `factory.Client().Dial()`/`DynDial()`，这些方法内部有 `APIClient.mx` 保护。
 
-文件：[config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/config.go#L33-L37)
+#### 7.3.3 配置/皮肤/自定义视图 文件 watcher
+
+文件：[config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/ui/config.go#L191-L231)
 
 ```go
-type Config struct {
-    flags *genericclioptions.ConfigFlags
-    mx    sync.RWMutex
-    proxy func(*http.Request) (*url.URL, error)
+func (c *Configurator) ConfigWatcher(ctx context.Context, s synchronizer) error {
+    w, _ := fsnotify.NewWatcher()
+    go func() {
+        for {
+            select {
+            case evt := <-w.Events:
+                if evt.Name == AppConfigFile {
+                    c.Config.Load(evt.Name, false)     // ⚠️ 无切换标志保护
+                } else {
+                    c.Config.K9s.Reload()             // ✅ 有 getContextSwitch() 检查
+                }
+                s.QueueUpdateDraw(func() { c.RefreshStyles(s) })
+            case <-ctx.Done():                        // ✅ Halt() 时退出
+                w.Close()
+                return
+            }
+        }
+    }()
 }
 ```
 
-### 7.4 `Factory.mx` — Informer 工厂读写锁
+**关键点**：`K9s.Reload` 会检查 `getContextSwitch()`，如果正在切换上下文则直接返回，避免竞态。但 `Config.Load`（加载全局 k9s.yaml）没有这个检查。
 
-文件：[factory.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/watch/factory.go#L29-L35)
+#### 7.3.4 `ClusterInfo.Reset` 异步 goroutine
+
+文件：[app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/app.go#L519-L521)
 
 ```go
-type Factory struct {
-    factories  map[string]di.DynamicSharedInformerFactory
-    client     client.Connection
-    stopChan   chan struct{}
-    forwarders Forwarders
-    mx         sync.RWMutex
+// 11. 异步重置集群模型
+if a.clusterModel != nil {
+    go a.clusterModel.Reset(a.factory)   // ⚠️ 在 defer Resume() 之前启动
 }
 ```
 
-### 7.5 Halt/Resume 模式 — 上下文切换的并发安全
+这是一个**特殊的并发边界**：`go a.clusterModel.Reset(a.factory)` 启动时，`Halt()` 已经执行但 `Resume()` 还没执行（在 defer 里）。
 
-上下文切换期间，`App` 通过 `Halt()` 取消全局 context 来停止所有后台 goroutine。这确保了：
+`ClusterInfo.Reset` 的实现：
 
-1. **不会有旧集群的 API 请求在飞行**：所有基于旧 context 的 HTTP 请求会被取消
-2. **Informer watches 被关闭**：`Terminate()` 关闭 stopChan，所有 informer 停止
-3. **配置文件不会被覆盖**：`ToggleContextSwitch(true)` 阻止 `Reload()` 在切换期间写入
+文件：[cluster_info.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/model/cluster_info.go#L118-L129)
 
 ```go
-a.Halt()           // 取消 context → 后台 goroutine 退出
-defer a.Resume()   // 重建 context → 重启后台 goroutine
+func (c *ClusterInfo) Reset(f dao.Factory) {
+    c.mx.Lock()
+    c.cluster, c.data = NewCluster(f), NewClusterMeta()   // 替换内部 Cluster 引用
+    c.mx.Unlock()
+
+    c.Refresh()   // → 调用 c.cluster.Metrics() → factory.Client() → APIClient
+}
+```
+
+此处的 `factory` 参数是 `switchContext` 调用方传入的 `a.factory`，其内部的 `client.Connection` 已经完成了 `SwitchContext`，所以**数据是一致的**。但这个 goroutine 与 `Resume()` 之后启动的 `clusterUpdater` 之间存在重叠窗口：
+
+```
+时序：
+  T1: switchContext 中 → Halt() 完成
+  T2: go clusterModel.Reset(factory)  启动 goroutine G1
+  T3: Resume() → go clusterUpdater(ctx) 启动 goroutine G2
+  T4: G1 正在执行 c.Refresh() → 访问 factory.Client().Dial()
+  T5: G2 正在执行 refreshCluster() → 访问 factory.Client().CheckConnectivity()
+```
+
+G1 和 G2 都调用 `APIClient` 的方法，但这些方法内部有 `APIClient.mx` 保护，所以客户端层面是安全的。但 `ClusterInfo.Refresh` 写 `c.data` 用了 `ClusterInfo.mx` 保护，`fireMetaChanged` 回调没有锁，两个 goroutine 可能先后触发 UI 更新，导致闪烁（功能正确但 UX 欠佳）。
+
+### 7.4 别名重置与命令执行的并发细节
+
+#### 7.4.1 别名重置流程
+
+别名有**两层保护**：外层 `Command.mx` 和内层 `Aliases.mx`。
+
+上下文切换时调用 `Command.Reset(aliasesPath, nuke=true)`，内部流程：
+
+```
+Command.Reset(path, true)
+  [Command.mx.Lock]
+    → alias.Clear()
+        [Aliases.mx.Lock]         // 内层锁
+          → delete 所有 alias 条目
+        [Aliases.mx.Unlock]
+    → alias.Ensure(path)
+        → MetaAccess.LoadResources(factory)   // 加载 Discovery API（APIClient.mx 保护）
+        → Alias.load(path)
+            → Aliases.loadDefaultAliases()
+                [Aliases.mx.Lock]
+                  → declare() 设置 h/q/ctx/dir 等默认别名
+                [Aliases.mx.Unlock]
+            → EnsureAliasesCfgFile()
+            → LoadFile(AppAliasesFile)
+                [Aliases.mx.Lock]
+                  → yaml.Unmarshal 到 a.Alias map
+                  → 将所有值重写为 NewGVR 指针
+                [Aliases.mx.Unlock]
+            → LoadFile(contextPath)   // 同上，context 特定别名
+            → 遍历 MetaAccess.AllGVRs()
+              → Define(gvr, ...) 为每个标准资源设别名
+                [Aliases.mx.Lock]
+                  → a.Alias[alias] = gvr
+                [Aliases.mx.Unlock]
+            → 遍历 CRD GVRs → Define()（同上）
+    → c.alias.Alias = aliasMap  // 替换指针
+  [Command.mx.Unlock]
+```
+
+#### 7.4.2 命令执行读取别名的路径
+
+用户在命令行输入 `po <Enter>` 触发：
+
+```
+App.gotoCmd(evt)
+  → a.gotoResource("po", "", true, true)
+      → command.run(NewInterpreter("po"), "", true, true)
+          [❌ 无 Command.mx 保护]
+          → viewMetaFor(p)
+              → c.alias.Resolve(p)     // 指针直接访问
+                  → Aliases.Get("po")    // [Aliases.mx.RLock]
+                    → 查 a.Alias["po"] → 返回 GVR(v1/pods)
+                  → Aliases.mx.RUnlock
+          → exec() → 创建 Browser 视图
+```
+
+**竞态分析**：
+
+| 场景 | 结果 | 原因 |
+|------|------|------|
+| 切换期间 `run` 与 `Reset` 同时调用 `Aliases.Get` 和 `Clear` | ✅ 安全 | `Aliases.mx` 保护 map 本身 |
+| `Reset` 的 `Ensure` 中途，`run` 调用 `Resolve` | ⚠️ 读到部分别名 | 部分别名已 Define，部分还没，可能命令找不到但不会崩溃 |
+| `Reset` 执行 `c.alias.Alias = aliasMap` 指针替换瞬间 | ✅ 安全 | Go 中指针赋值是原子操作（64 位平台） |
+| `run` 拿到旧 `c.alias` 指针后，`Reset` 重建了新指针 | ⚠️ 使用旧别名 | 旧指针内容完整，但没有新 context 的 CRD 别名 |
+
+**实际风险可控**的关键原因：tview 是单线程事件循环。用户按下 Enter 触发 `gotoCmd` 和切换上下文的 `useContext` 都在 tview 主 goroutine 中顺序执行，不会并行。只有以下异步路径可能触发并发：
+
+1. `ClusterInfo.Reset` 的 goroutine（不读 alias，安全）
+2. ConfigWatcher 的 `Reload()`（会跳过切换中状态）
+3. 命令补全 suggestionFn（在用户输入时触发，同样在主循环）
+
+### 7.5 未受命令互斥锁保护的代码路径清单
+
+以下是**所有**绕过 `Command.mx` 直接或间接访问 alias/client 的代码路径：
+
+#### 路径 1：命令补全建议 `suggestCommand`
+
+文件：[app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/app.go#L195-L244)
+
+```go
+func (a *App) suggestCommand() model.SuggestionFunc {
+    return func(s string) (entries sort.StringSlice) {
+        // ❌ 无 Command.mx 保护，直接遍历 alias map
+        for alias := range maps.Keys(a.command.alias.Alias) {
+            if suggest, ok := cmd.ShouldAddSuggest(ls, alias); ok {
+                entries = append(entries, suggest)
+            }
+        }
+        // ❌ 无 Factory.mx 保护
+        namespaceNames, err := a.factory.Client().ValidNamespaceNames()
+    }
+}
+```
+
+**风险**：
+- 直接访问 `a.command.alias.Alias`（没有 `Aliases.mx.RLock`），与 `Reset` 的 `Clear/Define` 并发时可能读到不一致的 map（Go 1.6+ 中并发读写 map 会直接 panic）
+- **这是本分析中发现的最高风险点**。`Reset` 的 `Clear()` 会遍历并删除所有 key，此时 `maps.Keys` 正在遍历同一个 map → **并发读写 panic**。
+
+#### 路径 2：视图标题/菜单中的别名提示
+
+文件：[browser.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/browser.go#L291) + [xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/xray.go#L299) + [table.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/table.go#L171-L177)
+
+```go
+// browser.go:291
+return aliases(b.meta, b.app.command.AliasesFor(client.NewGVRFromMeta(b.meta)))
+// table.go:175
+for _, a := range t.command.Aliases() {
+    cmds = append(cmds, a)
+}
+```
+
+`AliasesFor` 的调用链：
+
+```
+Command.AliasesFor(gvr)
+  → Alias.AliasesFor(gvr)
+      → Aliases.AliasesFor(gvr)
+          [Aliases.mx.RLock]    // ✅ 内层有读锁
+            → 遍历 a.Alias
+          [Aliases.mx.RUnlock]
+```
+
+**风险等级：低**。内层 `Aliases.mx.RLock` 保护了遍历。但指针本身 `Command.alias` 可能在 Reset 中被替换（`Command.Reset` 中 `c.alias.Alias = aliasMap` 是赋值给 map 字段，不是替换指针）。
+
+更正：仔细看代码，`Command.Reset` 没有替换 `c.alias` 指针本身，只是操作内部的 `Alias` map：
+
+```go
+// Command.Reset:
+c.alias.Clear()            // 清空 map
+aliasMap, err := c.alias.Ensure(path)  // 重新填充 map
+c.alias.Alias = aliasMap   // 直接替换 map 字段
+```
+
+指针 `c.alias` 不变（除非第一次 `Init`），变的是 `c.alias.Alias` 字段。而 `AliasesFor` 调用 `a.Aliases.AliasesFor`，有 `Aliases.mx.RLock` 保护，所以安全。
+
+但 `suggestCommand` 的 `maps.Keys(a.command.alias.Alias)` 直接访问 map 字段，**绕过了 `Aliases.mx`**，与 `Clear/Define` 并发 → panic 风险。
+
+#### 路径 3：Table/Browser 刷新循环中的 DAO 调用
+
+`Table.updater` → `refresh` → `list` → `a.List(ctx, ns)` → 最终到 `APIClient.Dial()`/`DynDial()`。
+
+这些路径都有 `APIClient.mx` 保护（每个 Dial 方法内部加锁），**安全**。
+
+但 `CheckConnectivity` 中有一个小窗口：
+
+文件：[client.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L307-L342)
+
+```go
+func (a *APIClient) CheckConnectivity() bool {
+    defer func() {
+        if err := recover(); err != nil {
+            a.setConnOK(false)
+        }
+        if !a.getConnOK() {
+            a.clearCache()   // 重建 LRU cache，无锁（不是 mx，是 cache 自身的锁）
+        }
+    }()
+
+    cfg, err := a.config.RESTConfig()     // Config.mx 保护
+    cfg.Timeout = a.config.CallTimeout()  // Config.mx 保护
+    client, err := kubernetes.NewForConfig(cfg)
+
+    if _, err := client.ServerVersion(); err == nil {
+        a.setClient(client)               // APIClient.mx 保护
+        if !a.getConnOK() {
+            a.reset()                     // APIClient.mx 保护所有字段，但 cache 单独重建
+        }
+    }
+    // ...
+}
+```
+
+`a.clearCache()` 在 defer 中执行：
+
+```go
+func (a *APIClient) clearCache() {
+    a.cache = cache.NewLRUExpireCache(cacheSize)   // ❌ 无 APIClient.mx 保护
+}
+```
+
+与 `Dial()` → `CanI()` → `a.cache.Get()` 并发时，如果正在替换 cache 指针，理论上有风险。但 `cache.NewLRUExpireCache` 返回的是新指针，Go 的指针赋值是原子的（64 位对齐），`cache.Get/Add` 由 `cache` 内部锁保护，所以实际安全。
+
+#### 路径 4：配置文件 watcher 触发的 `K9s.Reload`
+
+文件：[k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/config/k9s.go#L304-L330)
+
+```go
+func (k *K9s) Reload() error {
+    if k.getContextSwitch() {     // ✅ 切换中跳过
+        return nil
+    }
+    ctxName := k.getActiveContextName()
+    ct, _ := k.ks.GetContext(ctxName)
+    cfg, _ := k.dir.Load(k.getActiveContextName(), ct)
+    k.setActiveConfig(cfg)        // K9s.mx 保护
+    if cfg.Context.Proxy != nil {
+        k.conn.Config().SetProxy(...)   // Config.mx 保护
+    }
+    k.Validate(k.conn, ctxName, ct.Cluster)
+    return nil
+}
+```
+
+**安全**：`getContextSwitch()` 检查 + 所有字段读写都有对应锁。
+
+#### 路径 5：`ToggleContextSwitch` 本身的锁范围
+
+文件：[k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/config/k9s.go#L87-L99)
+
+```go
+func (k *K9s) ToggleContextSwitch(b bool) {
+    k.mx.Lock()
+    defer k.mx.Unlock()
+    k.contextSwitch = b
+}
+
+func (k *K9s) getContextSwitch() bool {
+    k.mx.RLock()             // ✅ 对应 RLock
+    defer k.mx.RUnlock()
+    return k.contextSwitch
+}
+```
+
+**安全**：读写都加锁。
+
+### 7.6 并发协同工作的完整时序
+
+上下文切换期间，各并发机制如何协同：
+
+```
+ T1: 用户按 Enter → useContext("prod") 开始（tview 主 goroutine）
+     │
+     ├── Content.Top().Stop()
+     │   └── Browser.Stop()
+     │       ├── cancelFn() → Table.updater 等 goroutine 的 ctx 收到 Done ✅
+     │       └── 移除 cmdBuff listener
+     │
+     ├── ToggleContextSwitch(true)   [K9s.mx.Lock]
+     │   └── ConfigWatcher 后续触发的 Reload 将被跳过 ✅
+     │
+     ├── Config.Save(true)           （保存旧配置快照）
+     │
+     ├── dao.Context.Switch("prod")
+     │   └── APIClient.SwitchContext("prod")  [APIClient.mx 内部保护]
+     │       ├── Config.SwitchContext()        [Config.mx.Lock]
+     │       ├── reset()                        [APIClient.mx 各 setter]
+     │       ├── ResetMetrics()                 (全局单例指针替换，原子)
+     │       ├── CheckConnectivity()            [APIClient.mx getter/setter]
+     │       ├── DynDial()                      [APIClient.mx.Lock]
+     │       └── invalidateCache()
+     │
+     ├── App.switchContext(ci, force=true)
+     │   │
+     │   ├── Halt()
+     │   │   └── cancelFn() → 以下 goroutine 全部退出 ✅
+     │   │       ├── clusterUpdater (连通性检查)
+     │   │       ├── ConfigWatcher / SkinsWatcher / CustomViewsWatcher
+     │   │       └── CustomJumpsWatcher
+     │   │
+     │   ├── Config.Reset() + ActivateContext()  [K9s.mx 各 setter]
+     │   ├── Config.Save(true)
+     │   ├── Factory.Terminate()  [Factory.mx.Lock]
+     │   │   └── close(stopChan) → 所有 Informer 停止 ✅
+     │   ├── Factory.Start(ns)    [Factory.mx 保护]
+     │   │
+     │   ├── Command.Reset(path, nuke=true)  [Command.mx.Lock]
+     │   │   └── Aliases.Clear()/Ensure()    [Aliases.mx 保护]
+     │   │
+     │   ├── gotoResource(activeView)
+     │   │   └── Command.run()  (主 goroutine 串行，无并发)
+     │   │
+     │   ├── go clusterModel.Reset(factory)  ← 启动 goroutine G1
+     │   │   └── (异步执行，此时 Halt 已生效，后台 watcher 都已停)
+     │   │
+     │   └── [defer] Resume()
+     │       ├── 新 ctx + cancelFn
+     │       ├── go clusterUpdater(ctx)  ← 启动 goroutine G2
+     │       ├── go ConfigWatcher(ctx)   ← 启动 goroutine G3
+     │       └── ...重启其他 watcher
+     │
+     └── ToggleContextSwitch(false)  [defer, K9s.mx.Lock]
+         └── ConfigWatcher 的 Reload 恢复正常
+```
+
+### 7.7 发现的并发缺陷汇总
+
+| # | 位置 | 问题 | 触发条件 | 后果 | 严重程度 |
+|---|------|------|----------|------|----------|
+| 1 | [suggestCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/app.go#L195-L244) L210 | `maps.Keys(a.command.alias.Alias)` 绕过 `Aliases.mx` 直接遍历 map | 用户在上下文切换进行中输入命令触发补全（极罕见，但可能） | Go runtime panic: concurrent map read and map write | **高** |
+| 2 | [clearCache](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/client/client.go#L588-L599) | `a.cache = ...` 无 `APIClient.mx` 锁 | `CheckConnectivity` 失败重建 cache 时，另一个 goroutine 在用旧 cache | 理论上的竞态，实际因指针赋值原子性+cache 内部锁，概率极低 | 低 |
+| 3 | [switchContext](file:///d:/fz/0601-2/solo-dogfeeding/code/6-k9s/internal/view/app.go#L519-L521) L519-521 | `go clusterModel.Reset(a.factory)` 与 `Resume` 后 `clusterUpdater` 重叠 | 每次上下文切换 | UI 可能收到两次集群信息更新回调（闪烁） | 低（UX 问题） |
+
+#### 缺陷 1 的修复建议
+
+`suggestCommand` 应通过 `AliasesFor` 或加读锁来遍历：
+
+```go
+// 修复前（有问题）：
+for alias := range maps.Keys(a.command.alias.Alias) {
+    if suggest, ok := cmd.ShouldAddSuggest(ls, alias); ok {
+        entries = append(entries, suggest)
+    }
+}
+
+// 修复后：
+if a.command.alias != nil {
+    // Aliases.ShortNames() 内部有 Aliases.mx.RLock
+    for gvr, aliasList := range a.command.alias.ShortNames() {
+        for _, alias := range aliasList {
+            if suggest, ok := cmd.ShouldAddSuggest(ls, alias); ok {
+                entries = append(entries, suggest)
+            }
+        }
+        _ = gvr // 忽略
+    }
+}
 ```
 
 ---
