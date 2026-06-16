@@ -2,17 +2,24 @@
 
 ## 全景概览
 
-用户在 k9s 命令面板中输入文本，最终跳转到目标资源视图，经历了以下核心阶段：
+用户在 k9s 命令面板中输入文本，最终跳转到目标资源视图，经历了以下核心阶段（**修正后的正确顺序**）：
 
 ```
 用户按键 → Prompt UI → FishBuff(命令缓冲+补全) → CmdBuff(底层缓冲)
     → [补全刷新] SuggestionChanged → UI 重绘
-    → [执行] App.keyboard → gotoCmd → Command.run
-    → [历史回填] exec → cmdHistory.Push
-    → Interpreter 解析 → Alias 解析 → 视图创建与注入 → 页面展示
+    → [执行] App.keyboard → gotoCmd → gotoResource → Command.run
+        ├── Interpreter 解析（解析命令文本）
+        ├── specialCmd（处理特殊命令）
+        ├── viewMetaFor → Alias.Resolve（别名解析）
+        ├── context 切换（@ctx 语法）
+        ├── namespace 切换
+        ├── 应用 filter/fuzzy/label selector
+        └── exec → 视图创建与注入 → 页面展示 → cmdHistory.Push（历史写入）
 ```
 
-> **核心纠正**：`BufferCompleted` 事件是纯 UI 重绘信号，不触发资源跳转。资源跳转的唯一触发器是 App 级别的 `tcell.KeyEnter` 键绑定 → `gotoCmd`。详见下文「关键纠正」章节。
+> **核心纠正 1**：`BufferCompleted` 事件是纯 UI 重绘信号，不触发资源跳转。资源跳转的唯一触发器是 App 级别的 `tcell.KeyEnter` 键绑定 → `gotoCmd`。
+>
+> **核心纠正 2**：历史写入（`cmdHistory.Push`）发生在整个执行流程的**最后一步**——在解析、别名处理、视图创建与注入都成功完成之后，而不是之前。详见「阶段三：命令执行」。
 
 ---
 
@@ -132,16 +139,30 @@ case tcell.KeyTab, tcell.KeyRight, tcell.KeyCtrlF:
 
 **入口条件**：`CmdBuff.IsActive() && !CmdBuff.Empty()`
 
-**触发后的完整链路**：
+**完整执行顺序（精确到代码行）**：
 
 ```
 gotoCmd
   ├── gotoResource(cmdText, "", true, true)
-  │   └── Command.run(NewInterpreter(cmdText), ...)
-  │       ├── specialCmd()   → 处理特殊命令
-  │       ├── viewMetaFor()  → Alias.Resolve → GVR + MetaViewer
-  │       ├── ns/context 切换
-  │       └── exec()         → inject → PageStack.Push → comp.Start
+  │   └── Command.run(NewInterpreter(cmdText), ...)  [command.go#L176]
+  │       ├── 1. specialCmd(p) [L177]                  ← 处理特殊命令
+  │       │       (cow/quit/help/alias/xray/rbac/ctx/ns/dir)
+  │       │
+  │       ├── 2. viewMetaFor(p) [L180]
+  │       │       └── alias.Resolve(p) [L319]           ← 别名解析
+  │       │
+  │       ├── 3. context 切换（@ctxName 语法）[L188-L211]
+  │       │
+  │       ├── 4. namespace 切换 [L213-L224]
+  │       │
+  │       ├── 5. 应用 filter/fuzzy/label selector [L226-L239]
+  │       │
+  │       └── 6. exec(p, gvr, co, clearStack, pushCmd) [L241]
+  │               ├── comp.SetCommand(p) [L372]
+  │               ├── Config.SetActiveView(v) [L376]
+  │               ├── app.inject(comp) [L378]          ← 视图创建与注入
+  │               │       └── comp.Init → PageStack.Push → comp.Start
+  │               └── cmdHistory.Push(p.GetLine()) [L382]  ← 最后一步：历史写入
   │
   └── ResetCmd()
       └── cmdBuff.Reset()
@@ -150,19 +171,17 @@ gotoCmd
           └── fireBufferCompleted("")                      ← 纯 UI 通知
 ```
 
-**关键点**：执行与 `BufferCompleted` 事件完全解耦。`ResetCmd` 中触发的 `BufferCompleted` 仅用于通知 Prompt 清空显示，与跳转逻辑无关。
-
-**执行后写入历史**：`exec` 内部调用 `cmdHistory.Push(p.GetLine())`，这是执行边界的最后一个动作。
+**关键纠正**：`cmdHistory.Push` [command.go#L382](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L382) 是 `exec` 方法的**最后一个动作**，在 `app.inject`（视图创建与注入）成功完成之后才执行。历史写入是执行边界的收尾动作，而不是开始动作。
 
 ### 边界三：历史回填（History Backfill）
 
 **职责**：在命令面板中提供历史命令作为补全建议，或通过快捷键直接跳转到历史命令。
 
-**写入时机**：`Command.exec` → `cmdHistory.Push(p.GetLine())`
+**写入时机**：`Command.exec` → `cmdHistory.Push(p.GetLine())` [command.go#L381-L383](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L381-L383)
 
-**读取时机**（两个独立入口）：
+**读取时机（四个独立入口，按触发频率排序）**：
 
-**入口 A：空输入时作为补全建议**
+#### 入口 A：空输入时作为补全建议
 
 [suggestCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L195-L227) 中：
 
@@ -177,15 +196,90 @@ if s == "" {
 
 这属于**补全刷新边界**的数据源之一。用户按 ↑/↓ 选择，按 Tab 接受（进入补全接受流程），再按 Enter 执行（进入执行边界）。
 
-**入口 B：快捷键直接跳转**
+#### 入口 B：`[` 键 — 后退到上一条命令
 
-| 快捷键 | 方法 | 行为 |
-|--------|------|------|
-| `[` | `previousCommand` | `cmdHistory.Back()` + `gotoResource` |
-| `]` | `nextCommand` | `cmdHistory.Forward()` + `gotoResource` |
-| `-` | `lastCommand` | `cmdHistory.Top()` + `gotoResource` |
+**键绑定**：[view/app.go#L259](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L259)
+```go
+ui.KeyLeftBracket: ui.NewSharedKeyAction("Go Back", a.previousCommand, false),
+```
 
-这些快捷键直接调用 `gotoResource`，**绕过命令面板和补全**，属于执行边界的快捷入口。
+**实现**：[previousCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L734-L745)
+```go
+func (a *App) previousCommand(evt *tcell.EventKey) *tcell.EventKey {
+    // 关键：如果在命令模式下，不拦截，让 Prompt 自己处理
+    if evt != nil && evt.Rune() == rune(ui.KeyLeftBracket) && a.Prompt().InCmdMode() {
+        return evt
+    }
+    c, ok := a.cmdHistory.Back()
+    if !ok {
+        a.App.Flash().Warn("Can't go back any further")
+        return evt
+    }
+    // pushCmd=false：避免重复写入历史
+    a.gotoResource(c, "", true, false)
+    return nil
+}
+```
+
+**行为**：`cmdHistory.Back()` 移动 `currentIdx` 指针 -1，获取历史命令，调用 `gotoResource(..., pushCmd=false)` 跳转。
+
+#### 入口 C：`]` 键 — 前进到下一条命令
+
+**键绑定**：[view/app.go#L260](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L260)
+```go
+ui.KeyRightBracket: ui.NewSharedKeyAction("Go Forward", a.nextCommand, false),
+```
+
+**实现**：[nextCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L748-L761)
+```go
+func (a *App) nextCommand(evt *tcell.EventKey) *tcell.EventKey {
+    if evt != nil && evt.Rune() == rune(ui.KeyRightBracket) && a.Prompt().InCmdMode() {
+        return evt
+    }
+    c, ok := a.cmdHistory.Forward()
+    if !ok {
+        a.App.Flash().Warn("Can't go forward any further")
+        return evt
+    }
+    // We go to the resource before updating the history so that
+    // gotoResource doesn't add this command to the history
+    a.gotoResource(c, "", true, false)
+    return nil
+}
+```
+
+**注释特别说明**：先跳转再更新历史（实际上 `Forward()` 已经移动了指针），核心是 `pushCmd=false`，避免 `gotoResource` 将这条命令再次添加到历史中。
+
+#### 入口 D：`-` 键 — 切换到上一条命令（类似 `cd -`）
+
+**键绑定**：[view/app.go#L261](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L261)
+```go
+ui.KeyDash: ui.NewSharedKeyAction("Last View", a.lastCommand, false),
+```
+
+**实现**：[lastCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L764-L776)
+```go
+func (a *App) lastCommand(evt *tcell.EventKey) *tcell.EventKey {
+    if evt != nil && evt.Rune() == ui.KeyDash && a.Prompt().InCmdMode() {
+        return evt
+    }
+    c, ok := a.cmdHistory.Top()
+    if !ok {
+        a.App.Flash().Warn("No previous view to switch to")
+        return evt
+    }
+    // pushCmd=false：避免重复写入历史
+    a.gotoResource(c, "", true, false)
+    return nil
+}
+```
+
+**行为**：`cmdHistory.Top()` 只取栈顶（不移动指针），在当前命令和上一条命令之间切换。
+
+**历史快捷键的共同特征**：
+- 都检查 `a.Prompt().InCmdMode()`，在命令模式下不拦截（让 Prompt 自己处理输入）
+- 都调用 `gotoResource(..., pushCmd=false)`，**避免重复写入历史**
+- 都直接进入执行边界，绕过命令面板和补全
 
 ### 三大边界交互图
 
@@ -198,7 +292,7 @@ if s == "" {
 │  副作用：无（仅 UI 重绘）                                      │
 │  ─────────────────────────────────────────────────────────── │
 │  特殊：空输入时读取 cmdHistory.List() 作为建议源               │
-│        ← 历史回填边界为补全刷新边界提供数据                     │
+│        ← 历史回填边界为补全刷新边界提供数据（入口 A）             │
 └──────────────────────┬──────────────────────────────────────┘
                        │ Tab 接受建议
                        │ （修改 buff 内容）
@@ -208,20 +302,24 @@ if s == "" {
 │  触发：App 级 tcell.KeyEnter → gotoCmd                      │
 │  输入：CmdBuff.GetText() 确认后的文本                         │
 │  输出：视图创建 + 页面注入                                     │
-│  副作用：cmdHistory.Push（写入历史）                           │
-│         Config.SetActiveView（持久化当前视图）                  │
+│  副作用：Config.SetActiveView（持久化当前视图）                  │
 │         cmdBuff.Reset（清空缓冲、隐藏 Prompt）                 │
+│         cmdHistory.Push（写入历史）← 历史回填边界的写入点         │
 │  ─────────────────────────────────────────────────────────── │
-│  注意：Reset 触发的 BufferCompleted 仅为 UI 清理通知           │
-│        与跳转逻辑完全无关                                      │
+│  执行顺序：1.解析 → 2.specialCmd → 3.别名解析 → 4.ctx切换     │
+│           → 5.ns切换 → 6.filter/fuzzy/label → 7.inject       │
+│           → 8.cmdHistory.Push（最后一步）                      │
 └──────────────────────┬──────────────────────────────────────┘
                        │ exec → cmdHistory.Push
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    历史回填边界（History）                      │
 │  写入：Command.exec → cmdHistory.Push                         │
-│  读取 A：suggestCommand（空输入时）→ 补全刷新边界               │
-│  读取 B：[/]/- 快捷键 → 直接 gotoResource → 执行边界           │
+│  读取：                                                       │
+│    A: suggestCommand（空输入时）→ 补全刷新边界                 │
+│    B: [ 键 → cmdHistory.Back() → gotoResource → 执行边界       │
+│    C: ] 键 → cmdHistory.Forward() → gotoResource → 执行边界    │
+│    D: - 键 → cmdHistory.Top() → gotoResource → 执行边界        │
 │  副作用：SwitchNS 修正历史命令中的命名空间                      │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -403,19 +501,84 @@ func (a *App) gotoResource(c, path string, clearStack, pushCmd bool) {
 }
 ```
 
-### 3.3 Command.run —— 命令调度中心
+### 3.3 Command.run —— 命令调度中心（**精确顺序，每步都有代码行号**）
 
-[command.go#L176-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L176-L242) 是整个跳转的核心调度：
+[command.go#L176-L242](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L176-L242) 是整个跳转的核心调度，**严格按以下顺序执行**：
 
 ```
 run(p *Interpreter, fqn string, clearStack, pushCmd bool)
-  ├─ specialCmd(p) → 处理特殊命令（cow/quit/help/alias/xray/rbac/context/ns/dir）
-  ├─ viewMetaFor(p) → 通过 Alias 解析获取 GVR + MetaViewer
-  ├─ 处理 context 切换（@ctxName 语法）
-  ├─ 处理 namespace 切换
-  ├─ 应用 filter/fuzzy/label selector
-  └─ exec(p, gvr, component, clearStack, pushCmd)
+  │
+  ├── [L177] 1. specialCmd(p)
+  │          → 处理特殊命令：cow/quit/help/alias/xray/rbac/context/ns/dir
+  │
+  ├── [L180] 2. viewMetaFor(p) → Alias.Resolve(p)
+  │          → 别名解析，将短名映射为 GVR
+  │
+  ├── [L188-L211] 3. context 切换（@ctxName 语法）
+  │          → 如果命令包含 @ctx 且 ctx 不同，切换上下文
+  │
+  ├── [L213-L224] 4. namespace 切换
+  │          → 如果资源是命名空间级别的，切换到指定 ns
+  │
+  ├── [L226-L239] 5. 应用 filter/fuzzy/label selector
+  │          → co.SetFilter / co.SetLabelSelector
+  │
+  └── [L241] 6. exec(p, gvr, co, clearStack, pushCmd)
+              │
+              ├── [L372] comp.SetCommand(p)
+              ├── [L376] Config.SetActiveView(v)
+              ├── [L378] app.inject(comp, clearStack) → 视图创建与注入
+              │       └── comp.Init → PageStack.Push → comp.Start
+              │
+              └── [L382] cmdHistory.Push(p.GetLine())  ← 最后一步：历史写入
 ```
+
+> **关键注意**：`cmdHistory.Push` [L382](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L382) 是 `exec` 方法的最后一个动作，在 `app.inject` 成功完成之后才执行。历史写入是**成功执行的确认动作**，而不是开始动作。
+
+### 3.4 exec —— 执行命令并管理历史
+
+[command.go#L352-L387](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L352-L387)：
+
+```go
+func (c *Command) exec(p *cmd.Interpreter, gvr *client.GVR, comp model.Component, clearStack, pushCmd bool) (err error) {
+    defer func() { /* panic recovery */ }()
+
+    if comp == nil { return ... }
+    comp.SetCommand(p)                          // [L372]
+
+    if clearStack {
+        v := contextRX.ReplaceAllString(p.GetLine(), "")
+        c.app.Config.SetActiveView(v)           // [L376]
+    }
+    if err := c.app.inject(comp, clearStack); err != nil {  // [L378]
+        return err
+    }
+    if pushCmd {
+        c.app.cmdHistory.Push(p.GetLine())      // [L382] 最后一步才写入历史
+    }
+    slog.Debug("History (exec)", slogs.Stack, strings.Join(c.app.cmdHistory.List(), "|"))
+
+    return
+}
+```
+
+### 3.5 inject —— 页面栈管理
+
+[app.go#L799-L814](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L799-L814)：
+
+```go
+func (a *App) inject(c model.Component, clearStack bool) error {
+    ctx := context.WithValue(context.Background(), internal.KeyApp, a)
+    if err := c.Init(ctx); err != nil { ... }
+    if clearStack {
+        a.Content.Clear()
+    }
+    a.Content.Push(c)
+    return nil
+}
+```
+
+`PageStack.Push` 会触发 `StackPushed` 回调，调用 `c.Start()` 并聚焦。
 
 ---
 
@@ -563,51 +726,6 @@ func (*Command) componentFor(gvr *client.GVR, fqn string, v *MetaViewer) Resourc
 }
 ```
 
-### 6.2 exec —— 执行命令并管理历史
-
-[command.go#L352-L387](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L352-L387)：
-
-```go
-func (c *Command) exec(p *cmd.Interpreter, gvr *client.GVR, comp model.Component, clearStack, pushCmd bool) error {
-    comp.SetCommand(p)
-    if clearStack {
-        v := contextRX.ReplaceAllString(p.GetLine(), "")
-        c.app.Config.SetActiveView(v)
-    }
-    if err := c.app.inject(comp, clearStack); err != nil {
-        return err
-    }
-    if pushCmd {
-        c.app.cmdHistory.Push(p.GetLine())
-    }
-    ...
-}
-```
-
-关键步骤：
-1. `comp.SetCommand(p)`：将解析后的 Interpreter 传递给组件
-2. `Config.SetActiveView(v)`：持久化当前视图到配置（去掉 @context 部分）
-3. `app.inject(comp, clearStack)`：将组件推入页面栈
-4. `cmdHistory.Push(p.GetLine())`：将命令推入历史
-
-### 6.3 inject —— 页面栈管理
-
-[app.go#L799-L814](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L799-L814)：
-
-```go
-func (a *App) inject(c model.Component, clearStack bool) error {
-    ctx := context.WithValue(context.Background(), internal.KeyApp, a)
-    if err := c.Init(ctx); err != nil { ... }
-    if clearStack {
-        a.Content.Clear()
-    }
-    a.Content.Push(c)
-    return nil
-}
-```
-
-`PageStack.Push` 会触发 `StackPushed` 回调，调用 `c.Start()` 并聚焦。
-
 ---
 
 ## 阶段七：历史回填（History）
@@ -620,21 +738,25 @@ func (a *App) inject(c model.Component, clearStack bool) error {
 - `currentIdx int`：当前位置索引
 - `limit int`：最大容量（默认 20）
 
-### 7.2 历史写入
+### 7.2 历史写入（执行边界的最后一步）
 
-命令执行成功后在 `exec` 中调用 `cmdHistory.Push(p.GetLine())`。
+命令执行成功后在 `exec` 的末尾调用 `cmdHistory.Push(p.GetLine())` [command.go#L381-L383](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go#L381-L383)：
 
-Push 规则：
+```go
+if pushCmd {
+    c.app.cmdHistory.Push(p.GetLine())  // 仅当 pushCmd=true 时写入
+}
+```
+
+**Push 规则**：
 - 空命令不推入
 - 超过 limit 不推入
 - 与栈顶相同的命令不推入（去重）
 - 推入后截断当前位置之后的历史（类似浏览器前进栈清除）
 
-### 7.3 历史回填触发
+### 7.3 历史回填触发的四个入口
 
-回填有两个入口：
-
-**入口一：命令面板空输入时**（补全刷新边界读取历史）
+#### 入口 A：命令面板空输入时（补全刷新边界）
 
 在 `suggestCommand` 中，当输入为空时返回历史列表作为补全建议：
 
@@ -649,15 +771,27 @@ if s == "" {
 
 用户按 ↑/↓ 可在历史建议中切换，按 Tab 接受，按 Enter 执行跳转。
 
-**入口二：快捷键导航**（直接进入执行边界）
+#### 入口 B：`[` 键 — 后退（执行边界快捷入口）
 
-| 快捷键 | 方法 | 行为 |
-|--------|------|------|
-| `[` | `previousCommand` | `cmdHistory.Back()` + `gotoResource` |
-| `]` | `nextCommand` | `cmdHistory.Forward()` + `gotoResource` |
-| `-` | `lastCommand` | `cmdHistory.Top()` + `gotoResource` |
+[previousCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L734-L745)：
+- 检查 `InCmdMode()` → 命令模式下不拦截
+- `cmdHistory.Back()` → 指针 -1
+- `gotoResource(c, "", true, false)` → `pushCmd=false` 避免重复写入历史
 
-这些方法直接跳转到历史命令对应的资源视图，不经过命令面板。
+#### 入口 C：`]` 键 — 前进（执行边界快捷入口）
+
+[nextCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L748-L761)：
+- 检查 `InCmdMode()` → 命令模式下不拦截
+- `cmdHistory.Forward()` → 指针 +1
+- `gotoResource(c, "", true, false)` → `pushCmd=false` 避免重复写入历史
+- 代码注释特别说明：先跳转再更新历史（实际上 Forward 已移动指针），目的是不重复写入
+
+#### 入口 D：`-` 键 — 切换（执行边界快捷入口）
+
+[lastCommand](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go#L764-L776)：
+- 检查 `InCmdMode()` → 命令模式下不拦截
+- `cmdHistory.Top()` → 取栈顶，不移动指针
+- `gotoResource(c, "", true, false)` → `pushCmd=false` 避免重复写入历史
 
 ### 7.4 History.SwitchNS —— 命名空间切换时的历史修正
 
@@ -699,7 +833,7 @@ if rule, ok := b.App().CustomJumps().GetRule(b.GVR()); ok {
 
 ---
 
-## 完整数据流图（修正版）
+## 完整数据流图（修正版，顺序精确）
 
 ```
 用户按 ":"
@@ -718,7 +852,7 @@ FishBuff.Add(r)
   │   └── 100ms 后 fireBufferCompleted → Prompt.BufferCompleted → 重绘（无业务效果）
   │
   └── Notify → suggestionFn(buff)
-      ├── 空 → cmdHistory.List()（历史回填边界提供数据）
+      ├── 空 → cmdHistory.List()（历史回填入口 A）
       └── 非空 → alias 前缀匹配 + SuggestSubCommand
       └── fireSuggestionChanged → Prompt.SuggestionChanged → 灰色建议显示
   │
@@ -731,19 +865,19 @@ Prompt.keyboard → SetText(buff+suggestion) → 建议追加到 buff → 重绘
   │
   ▼ App.keyboard → HasAction(KeyEnter) → gotoCmd
   │   ├── CmdBuff.IsActive() && !Empty()? → YES
-  │   ├── gotoResource(cmdText, ...)         ← 执行边界开始
+  │   ├── gotoResource(cmdText, "", true, true)         ← 执行边界开始
   │   │   └── Command.run(NewInterpreter(cmdText))
-  │   │       ├── Interpreter.grok() → cmd + args
-  │   │       ├── specialCmd()
-  │   │       ├── Alias.Resolve() → GVR
-  │   │       ├── viewMetaFor() → MetaViewer
-  │   │       ├── ns/context 切换
-  │   │       ├── filter/fuzzy/labels 应用
-  │   │       └── exec()
-  │   │           ├── comp.SetCommand(interpreter)
-  │   │           ├── Config.SetActiveView()
-  │   │           ├── app.inject(comp) → PageStack.Push → comp.Start
-  │   │           └── cmdHistory.Push()             ← 历史回填边界写入
+  │   │       ├── [L177] 1. Interpreter 解析 → cmd + args
+  │   │       ├── [L177] 2. specialCmd()
+  │   │       ├── [L180] 3. viewMetaFor() → Alias.Resolve() → GVR
+  │   │       ├── [L188] 4. context 切换（@ctx）
+  │   │       ├── [L213] 5. namespace 切换
+  │   │       ├── [L226] 6. filter/fuzzy/labels 应用
+  │   │       └── [L241] 7. exec()
+  │   │           ├── [L372] comp.SetCommand(interpreter)
+  │   │           ├── [L376] Config.SetActiveView()
+  │   │           ├── [L378] app.inject(comp) → PageStack.Push → comp.Start
+  │   │           └── [L382] cmdHistory.Push()              ← 最后一步：历史写入
   │   │
   │   └── ResetCmd()
   │       └── cmdBuff.Reset()
@@ -752,6 +886,13 @@ Prompt.keyboard → SetText(buff+suggestion) → 建议追加到 buff → 重绘
   │           └── fireBufferCompleted("") → Prompt 重绘（清空）
   │
   └── return nil  ← 事件被消费，Prompt.keyboard 永远看不到 Enter
+
+─────────────────────────────────────────────────────────────
+历史快捷键入口（任何时刻可触发，不经过命令面板）：
+  │
+  ├── 按 [ → previousCommand → cmdHistory.Back() → gotoResource(..., pushCmd=false)
+  ├── 按 ] → nextCommand → cmdHistory.Forward() → gotoResource(..., pushCmd=false)
+  └── 按 - → lastCommand → cmdHistory.Top() → gotoResource(..., pushCmd=false)
 ```
 
 ---
@@ -770,7 +911,7 @@ Prompt.keyboard → SetText(buff+suggestion) → 建议追加到 buff → 重绘
 | [view/cmd/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/types.go) | 命令类型关键字定义 |
 | [view/cmd/helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/cmd/helpers.go) | 补全辅助，SuggestSubCommand |
 | [view/app.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/app.go) | 应用视图，gotoCmd/gotoResource/历史导航/suggestCommand |
-| [view/command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go) | 命令调度中心，run/specialCmd/viewMetaFor/exec |
+| [view/command.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/command.go) | 命令调度中心，run/specialCmd/viewMetaFor/exec（历史写入在 L382） |
 | [config/alias.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/config/alias.go) | 别名配置，Resolve 解析与别名链 |
 | [dao/alias.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/dao/alias.go) | 别名数据访问，动态生成 K8s 资源别名 |
 | [view/browser.go](file:///d:/fz/0601-2/solo-dogfeeding/code/3-k9s/internal/view/browser.go) | 资源浏览器视图，FilterBuffer 的 BufferCompleted 有业务语义 |
