@@ -509,6 +509,242 @@ func (f *Flash) SetMessage(m model.LevelMessage) {
 
 ---
 
+### 2.6 执行状态回传可见性差异详解
+
+本节深入对比前台 exec/attach 的**成功路径**、**失败路径**和**信号终止路径**，分析每条路径如何进入调试输出、错误通道和 Flash 显示。
+
+#### 2.6.1 三条路径总览
+
+| 路径 | 用户可见（Flash） | 调试日志（slog） | statusChan | errChan | 调用方返回值 |
+|------|-------------------|-----------------|------------|---------|-------------|
+| **成功路径** | ❌ 无任何提示 | ✅ Debug 级别 2 条 | ✅ 1 条成功消息 | ❌ 空 | `nil` |
+| **失败路径** | ✅ **两层 Flash**（后显示的覆盖先显示的） | ✅ Debug + Error 各 1 条 | ❌ 无消息 | ✅ 1 条错误 | `error` |
+| **信号终止 (Ctrl+C)** | ❌ 无任何提示（静默成功） | ✅ Debug 1 条 | ❌ **无 close**（潜在阻塞点） | ❌ 空 | `nil` |
+
+> **⚠️ 重要发现**：成功时用户看不到任何成功提示，失败时用户能看到 Flash 错误，Ctrl+C 退出时用户也看不到任何提示（就像什么都没发生一样）。
+
+---
+
+#### 2.6.2 成功路径完整追踪
+
+**调用链**：`pipe` → `execute` → `run` 闭包 → `runK` → `shellIn`/`attachIn` → `resumeShellIn`/`resumeAttachIn` → `shellCmd`
+
+**逐层分析**：
+
+| 层级 | 代码位置 | 动作 | 可见性 |
+|------|----------|------|--------|
+| L1 pipe | [exec.go:578](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L578) | `cmd.Run()` 返回 `nil` | 内部 |
+| L1 pipe | [exec.go:577](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L577) | `slog.Debug("Exec started")` | **Debug 日志** |
+| L1 pipe | [exec.go:584](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L584) | `slog.Debug("Command exec done", err=nil)` | **Debug 日志** |
+| L1 pipe | [exec.go:585-L587](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L585-L587) | `statusChan <- "Command completed successfully: ..."` | statusChan 写入 |
+| L1 pipe | [exec.go:588](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L588) | `close(statusChan)` | statusChan 关闭 |
+| L1 pipe | [exec.go:590-L594](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L590-L594) | `return nil`（无错误） | 内部 |
+| L2 execute | [exec.go:229-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L229-L238) | `pipe` 返回 nil → `return nil` | 内部 |
+| L3 run 闭包 | [exec.go:115-L121](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L115-L121) | `execute` 返回 nil → 不进 `if err` → **不调用 Flash** | UI 无变化 |
+| L3 run 闭包 | [exec.go:120](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L120) | `close(errChan)` | errChan 关闭（空） |
+| L4 runK | [exec.go:88-L90](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L88-L90) | `for v := range stChan { slog.Debug("stdout", v) }` | **Debug 日志**（1 条） |
+| L4 runK | [exec.go:92-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L92-L94) | `for e := range errChan { errs = errors.Join(errs, e) }` | 无错误 |
+| L4 runK | [exec.go:96](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L96) | `return errs`（nil） | 内部 |
+| L5 shellIn | [pod.go:412-L417](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L412-L417) | `return runK(...)`（nil） | 内部 |
+| L6 resumeShellIn | [pod.go:388-L401](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L388-L401) | `err = shellIn(...)` → `err == nil` → **defer 中不调用 Flash** | UI 无变化 |
+| L7 containerShellIn | [pod.go:358-L386](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L358-L386) | `resumeShellIn` 无返回值 → `return nil` | 内部 |
+| L8 shellCmd | [pod.go:233-L235](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L233-L235) | `err == nil` → **不调用 Flash** | UI 无变化 |
+
+**成功路径可视化**：
+```
+用户退出 kubectl（exit 或 Ctrl+D）
+    ↓
+cmd.Run() 返回 nil
+    ↓
+pipe:
+  slog.Debug("Exec started")   ──→ Debug 日志
+  slog.Debug("Command exec done") ─→ Debug 日志
+  statusChan <- "成功消息"     ──→ statusChan
+  close(statusChan)
+  return nil
+    ↓
+execute: return nil
+    ↓
+run 闭包:
+  不进 if err → 【不调用 Flash】
+  close(errChan)
+    ↓
+Suspend 返回 → TUI 恢复
+    ↓
+runK:
+  range statusChan → slog.Debug("stdout", ...) ─→ Debug 日志
+  range errChan → 无错误
+  return nil
+    ↓
+resumeShellIn defer:
+  err == nil → 【不调用 Flash】
+    ↓
+shellCmd: err == nil → 【不调用 Flash】
+
+最终用户看到: TUI 恢复正常，无任何提示
+```
+
+---
+
+#### 2.6.3 失败路径完整追踪
+
+**失败场景示例**：kubectl 命令执行失败（如 Pod 不存在、网络错误等）
+
+| 层级 | 代码位置 | 动作 | 可见性 |
+|------|----------|------|--------|
+| L1 pipe | [exec.go:578](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L578) | `cmd.Run()` 返回 `error` | 内部 |
+| L1 pipe | [exec.go:579-L583](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L579-L583) | 检查信号终止 → 不是信号 → 继续 | 内部 |
+| L1 pipe | [exec.go:584](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L584) | `slog.Debug("Command exec done", err)` | **Debug 日志** |
+| L1 pipe | [exec.go:588](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L588) | `close(statusChan)`（**注意：失败时没写成功消息**） | statusChan 关闭（空） |
+| L1 pipe | [exec.go:590-L594](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L590-L594) | `return fmt.Errorf("command failed. Check k9s logs: %w", err)` | 包装错误返回 |
+| L2 execute | [exec.go:229-L236](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L229-L236) | `err != nil && !interrupted` → `return errors.Join(err, stderr内容)` | 合并错误 |
+| L3 run 闭包 | [exec.go:116-L119](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L116-L119) | `errChan <- err` → errChan 写入 | errChan 写入 |
+| L3 run 闭包 | [exec.go:118](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L118) | `a.Flash().Errf("Exec failed %q: %s", opts, err)` → **QueueUpdateDraw 排队** | **Flash 第 1 层** |
+| L3 run 闭包 | [exec.go:120](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L120) | `close(errChan)` | errChan 关闭 |
+| L4 runK | [exec.go:88-L90](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L88-L90) | `range statusChan` → 空 channel，直接结束 | 无输出 |
+| L4 runK | [exec.go:92-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L92-L94) | `range errChan` → 收集错误 | 内部 |
+| L4 runK | [exec.go:96](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L96) | `return errs`（非 nil） | 内部 |
+| L5 shellIn | [pod.go:412-L417](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L412-L417) | `return runK(...)`（非 nil） | 内部 |
+| L6 resumeShellIn | [pod.go:388-L398](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L388-L398) | `err != nil` → `a.QueueUpdate(func() { a.Flash().Errf("Shell exec failed: %s", err) })` → **Flash 第 2 层** | **Flash 第 2 层** |
+| L7 containerShellIn | [pod.go:358-L386](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L358-L386) | `return nil`（co != "" 时；或 Picker 回调无返回） | 内部 |
+| L8 shellCmd | [pod.go:233-L235](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L233-L235) | `err == nil`（因为 containerShellIn 返回 nil） → **不调用 Flash** | UI 无变化 |
+
+> **⚠️ 两层 Flash 的覆盖关系**：第 1 层（run 闭包内）先入队，消息为 `"Exec failed ..."`；第 2 层（resumeShellIn defer 内）后入队，消息为 `"Shell exec failed: ..."`。后入队的会覆盖先入队的，因此用户最终看到的是第 2 层的消息。
+
+**失败路径可视化**：
+```
+kubectl 执行失败（非信号终止）
+    ↓
+cmd.Run() 返回 error
+    ↓
+pipe:
+  slog.Debug("Command exec done", err) ─→ Debug 日志
+  close(statusChan)         （空，无成功消息）
+  return fmt.Errorf("command failed...")
+    ↓
+execute:
+  err != nil && !interrupted
+  return errors.Join(err, stderr内容)
+    ↓
+run 闭包 (Suspend 内部):
+  errChan <- err             ──→ errChan
+  a.Flash().Errf("Exec failed...") ─→ Flash 第 1 层 (QueueUpdateDraw 排队)
+  close(errChan)
+    ↓
+Suspend 返回 → TUI 恢复 → Flash 队列开始执行
+    ↓
+runK:
+  range statusChan → 空，直接跳过
+  range errChan → 收集错误
+  return errs (非 nil)
+    ↓
+resumeShellIn defer:
+  err != nil
+  a.QueueUpdate(func() {
+    a.Flash().Errf("Shell exec failed: ...")  ─→ Flash 第 2 层 (后入队，覆盖第 1 层)
+  })
+    ↓
+最终用户看到: "Shell exec failed: ..."（第 2 层消息）
+```
+
+---
+
+#### 2.6.4 信号终止路径（Ctrl+C）完整追踪
+
+**特殊机制**：被信号终止的命令被视为「正常退出」，不产生错误，不显示 Flash。
+
+| 层级 | 代码位置 | 动作 | 可见性 |
+|------|----------|------|--------|
+| 用户按 Ctrl+C | - | 内核向前台进程组发 `SIGINT` | - |
+| k9s 信号 goroutine | [exec.go:187-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L187-L197) | 收到信号 → `cancel()` → `interrupted = true` | 内部 |
+| kubectl 子进程 | - | 收到 `SIGINT`，开始退出流程 | 内部 |
+| L1 pipe | [exec.go:578](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L578) | `cmd.Run()` 返回 `*exec.ExitError` | 内部 |
+| L1 pipe | [exec.go:579-L583](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L579-L583) | `errors.As(err, &ex) && !ex.Exited()` → **true** → `return nil` | 内部（**直接返回，跳过后面的代码**） |
+| ⚠️ 注意 | - | **`close(statusChan)` 没被执行！** | statusChan 未关闭 |
+| L2 execute | [exec.go:229-L238](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L229-L238) | `pipe` 返回 nil，但 `interrupted == true` → `return nil` | 内部 |
+| L3 run 闭包 | [exec.go:115-L121](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L115-L121) | `execute` 返回 nil → **不调用 Flash** | UI 无变化 |
+| L3 run 闭包 | [exec.go:120](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L120) | `close(errChan)` | errChan 关闭（空） |
+| ⚠️ L4 runK | [exec.go:88-L90](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L88-L90) | `for v := range stChan` → **statusChan 未关闭，可能永久阻塞？** | 需确认 |
+| L4 runK | [exec.go:92-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L92-L94) | 如果前面能退出 → errChan 为空 | 内部 |
+| L4 runK | [exec.go:96](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L96) | `return errs`（nil） | 内部 |
+
+> **⚠️ 潜在问题**：信号终止路径中，`pipe` 函数直接 `return nil`，**跳过了 `close(statusChan)`**。如果 `runK` 中的 `for range` 真的会阻塞，这就是一个 bug。但实际测试中 Ctrl+C 能正常恢复 TUI，可能是因为 context 取消或其他机制间接导致了退出。
+
+**信号终止路径可视化**：
+```
+用户按 Ctrl+C
+    ↓
+内核发 SIGINT 给前台进程组 (k9s + kubectl)
+    ↓
+k9s 信号 goroutine:
+  收到 SIGINT → cancel() → interrupted = true
+    ↓
+kubectl: 收到 SIGINT，开始退出
+    ↓
+cmd.Run() 返回 *exec.ExitError
+    ↓
+pipe:
+  errors.As(err, &ex) && !ex.Exited() → true
+  return nil  ⚠️（直接返回，没执行 close(statusChan)！）
+    ↓
+execute:
+  pipe 返回 nil 但 interrupted == true
+  return nil
+    ↓
+run 闭包:
+  execute 返回 nil → 【不调用 Flash】
+  close(errChan)
+    ↓
+Suspend 返回 → TUI 恢复
+    ↓
+用户视角：TUI 恢复，无任何提示（静默成功）
+```
+
+---
+
+#### 2.6.5 Shell vs Attach 调用链差异
+
+虽然 `shellIn` 和 `attachIn` 都调用 `runK`，但上层调用方式不同，导致 Flash 调用层数有差异：
+
+**Shell 路径**（3 层潜在 Flash 调用）：
+1. `run` 闭包内 → `a.Flash().Errf("Exec failed %q: ...")` [exec.go:118]
+2. `resumeShellIn` defer → `a.Flash().Errf("Shell exec failed: %s", err)` [pod.go:395]
+3. `shellCmd` → `p.App().Flash().Err(err)` [pod.go:234]（但 containerShellIn 常返回 nil，所以这层常不触发）
+
+**Attach 路径**（3 层潜在 Flash 调用）：
+1. `run` 闭包内 → `a.Flash().Errf("Exec failed %q: ...")` [exec.go:118]
+2. `attachIn` 内部 → `a.Flash().Errf("Attach exec failed: %s", err)` [pod.go:457]
+3. `attachCmd` → `p.App().Flash().Err(err)` [pod.go:252]（但 containerAttachIn 常返回 nil，所以这层常不触发）
+
+**关键区别**：
+| 差异点 | Shell | Attach |
+|--------|-------|--------|
+| 第 2 层 Flash 位置 | `resumeShellIn` defer 中，通过 `a.QueueUpdate()` 包装 | `attachIn` 函数中直接调用 |
+| 第 2 层消息内容 | `"Shell exec failed: ..."` | `"Attach exec failed: ..."` |
+| runK 返回值处理 | 赋值给 err 变量，defer 中判断 | if err != nil 直接调用 |
+
+但**用户感知相同**：都是最后入队的 Flash 消息覆盖前面的，最终看到 Shell/Attach 特定的失败消息。
+
+---
+
+#### 2.6.6 可见性总结表
+
+| 输出类型 | 成功路径 | 失败路径 | 信号终止 | 代码位置 |
+|----------|---------|---------|----------|----------|
+| **Flash（用户可见）** | ❌ 无 | ✅ 2 层（后层覆盖前层） | ❌ 无 | [exec.go:118](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L118), [pod.go:395](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/pod.go#L395) |
+| **statusChan 消息** | ✅ 1 条（成功消息） | ❌ 0 条 | ❌ 0 条（且 channel 未 close） | [exec.go:586](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L586) |
+| **errChan 错误** | ❌ 无 | ✅ 1 条 | ❌ 无 | [exec.go:117](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L117) |
+| **Debug 日志** | ✅ 3 条（start + done + stdout） | ✅ 1 条（done） | ✅ 0-1 条 | [exec.go:577](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L577), [exec.go:584](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L584), [exec.go:89](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L89) |
+| **调用方返回值** | `nil` | `error` | `nil` | [exec.go:96](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L96) |
+| **Banner 输出** | ✅ 有（绿色背景） | ✅ 有（命令失败前已输出） | ✅ 有（信号前已输出） | [exec.go:575](file:///d:/fz/0601-2/solo-dogfeeding/code/4-k9s/internal/view/exec.go#L575) |
+
+**设计意图推测**：
+- 成功时不弹 Flash：避免打扰用户，用户主动 exit 退出时知道成功了
+- 失败时弹 Flash：需要告知用户出了什么错
+- 信号终止不弹 Flash：用户主动 Ctrl+C 退出，不需要提示
+
+---
+
 ## 3. 终端尺寸同步功能深度分析
 
 尺寸同步是 exec/attach 最复杂的部分。K9s 采取「完全移交」策略：TUI 挂起后，终端尺寸同步**完全由 kubectl 子进程自行处理**，K9s 不参与。
