@@ -249,9 +249,11 @@ func (t *TableData) Filter(f FilterOpts) *TableData {
 |----------|--------|----------|----------|
 | ``（空） | 无 | - | 不过滤 |
 | `nginx` | 文本/正则 | 客户端 | 在所有列中模糊匹配 nginx |
+| `nginx pod` | 无（含空格，正则短路） | 客户端（实际不生效） | 含空格，rxFilter 短路，**无过滤效果** |
 | `app=nginx` | 标签选择器 | 服务器端 | 从 K8s API 获取带 app=nginx 标签的资源 |
 | `-l app=nginx` | 标签选择器 | 服务器端 | 同上，显式标记 |
-| `-f nginx` | Fuzzy 过滤 | 客户端 | 按名称进行模糊匹配 |
+| `-f nginx` | Fuzzy 过滤 | 客户端 | 按名称（ID 列）进行模糊匹配 |
+| `-f nginx pod` | Fuzzy 过滤 | 客户端 | **只捕获 `nginx` 进入 Fuzzy，`pod` 被静默丢弃** |
 | `!nginx` | 反向正则 | 客户端 | 显示不包含 nginx 的行 |
 
 ### 4.3 Fuzzy 过滤 vs 正则过滤的区别
@@ -354,10 +356,11 @@ func IsLabelSelector(s string) bool {
 | 输入 | 含空格？ | `IsLabelSelector` 结果 | 实际过滤类型 |
 |------|----------|------------------------|-------------|
 | `app=nginx` | 否 | `true` | 标签选择器（服务器端） |
-| `app=nginx, env=prod` | **是**（逗号后有空格） | `false` | 正则/文本（客户端） |
+| `app=nginx, env=prod` | **是**（逗号后有空格） | `false` | 正则/文本 → 空格短路 → **无过滤** |
 | `app=nginx,env=prod` | 否 | `true` | 标签选择器（服务器端） |
-| `-l app=nginx` | 是 | `true`（匹配 `-l` 前缀优先） | 标签选择器（服务器端） |
-| `-l  app=nginx` | 是 | `true`（匹配 `-l` 前缀优先） | 标签选择器（服务器端） |
+| `-l app=nginx, env=prod` | 是 | `true`（匹配 `-l` 前缀优先，跳过空格检查） | 标签选择器（服务器端，**两个标签完整解析**） |
+| `-l  app=nginx` | 是（两空格） | `true`（匹配 `-l` 前缀优先） | 标签选择器（服务器端） |
+| `-l environment in (production, staging)` | 是（多个空格） | `true`（匹配 `-l` 前缀优先） | 标签选择器（服务器端，**in 操作符完整解析**） |
 
 > **⚠️ 陷阱**：`app=nginx, env=prod`（逗号后多了一个空格）不会被识别为标签选择器，而会被当作正则表达式处理！但正则路径中含空格的查询也会被短路（见 7.1.2），所以实际效果等于**完全没有过滤**。
 
@@ -381,14 +384,14 @@ func (t *TableData) rxFilter(q string, inverse bool) (*RowEvents, error) {
 
 | 输入 | `IsLabelSelector` | `IsFuzzySelector` | `rxFilter` 空格检查 | 最终行为 |
 |------|-------------------|-------------------|--------------------|---------|
-| `nginx` | `false` | `false` | 通过 | 正则匹配所有可见列 |
-| `nginx pod` | `false`（含空格） | `false` | **短路返回全量** | **无过滤，显示全部** |
+| `nginx` | `false` | `("", false)` | 通过 | 正则匹配所有可见列 |
+| `nginx pod` | `false`（含空格） | `("", false)` | **短路返回全量** | **无过滤，显示全部** |
 | `app=nginx` | `true` | - | - | 服务器端标签过滤 |
-| `app=nginx, env=prod` | `false`（含空格） | `false` | **短路返回全量** | **无过滤，显示全部** |
-| `-f nginx pod` | `false` | `false`（`-f` 只匹配 `\A-f\s?([\w-]+)\b`，空格后多词不匹配） | **短路返回全量** | **无过滤，显示全部** |
-| `-f nginx` | `false` | `true`（提取 `nginx`） | - | Fuzzy 匹配名称列 |
+| `app=nginx, env=prod` | `false`（含空格） | `("", false)` | **短路返回全量** | **无过滤，显示全部** |
+| `-f nginx pod` | `false`（含空格，但 fuzzy 优先级更高） | `("nginx", true)`（`fuzzyRx` 捕获第一个词 `nginx`，空格后的 `pod` 不参与匹配） | 不进入 rxFilter 路径 | **Fuzzy 按 nginx 匹配名称列，pod 被丢弃** |
+| `-f nginx` | `false` | `("nginx", true)` | 不进入 rxFilter 路径 | Fuzzy 匹配名称列 |
 
-> **核心结论**：空格是正则过滤的"杀手"。任何含空格的非标签查询都等于没有过滤，而且系统对此静默处理，没有任何反馈。
+> **核心结论**：空格对不同类型的查询影响完全不同——普通文本查询因空格短路等于没过滤，Fuzzy 前缀查询虽然含空格但正则只捕获首词仍能进入 fuzzy 路径，只有带 `-l` 前缀的标签选择器能完整利用空格后的所有内容。
 
 ---
 
