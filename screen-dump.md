@@ -255,36 +255,198 @@ func SanitizeFileName(name string) string {
 
 ---
 
-## 四、目录结构与生命周期
+## 四、目录配置来源与覆盖关系
 
-### 4.1 目录层级
+### 4.1 三个配置来源
+
+Screen dump 目录有三个配置来源，按优先级从低到高：
+
+| 优先级 | 来源 | 存储/传入方式 | 代码位置 |
+|--------|------|-------------|---------|
+| 1（最低） | 系统默认 `AppDumpsDir` | 全局变量 | [files.go#L60-L61](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L60-L61) |
+| 2 | 配置文件 `k9s.screenDumpDir` | YAML 字段 | [k9s.go#L39](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L39) |
+| 3（最高） | 命令行 `--screen-dump-dir` | CLI 标志 | [root.go#L267-L272](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L267-L272) |
+
+### 4.2 启动时的初始化流程
+
+在 [root.go#L133-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L133-L178) 的 `loadConfiguration()` 中，按以下顺序执行：
 
 ```
-screen-dumps/                    # 基础目录 (AppDumpsDir)
-└── {cluster-name}/              # 集群名（已清洗）
-    └── {context-name}/          # 上下文名（已清洗）
-        ├── pods-xxx.csv         # 快照文件
-        ├── nodes-xxx.csv
-        └── xxx.log
+步骤1: config.InitLocs()                     ← root.go#L77
+    ↓  初始化 AppDumpsDir 全局变量（系统默认值）
+步骤2: NewK9s()                               ← config.go#L34
+    ↓  K9s.ScreenDumpDir = AppDumpsDir        ← k9s.go#L75
+步骤3: k9sCfg.Load(AppConfigFile, false)      ← root.go#L146
+    ↓  从 YAML 文件读取 screenDumpDir 字段
+    ↓  通过 Merge() 覆盖 K9s.ScreenDumpDir    ← k9s.go#L140
+步骤4: k9sCfg.K9s.Override(k9sFlags)          ← root.go#L149
+    ↓  如果命令行指定了 --screen-dump-dir
+    ↓  存入 K9s.manualScreenDumpDir           ← k9s.go#L348
+步骤5: k9sCfg.Refine()                        ← root.go#L150
+    ↓  调用 AppScreenDumpDir() 确定最终目录
+    ↓  并确保该目录存在                         ← config.go#L146
 ```
 
-### 4.2 基础目录 - `AppDumpsDir`
+### 4.3 来源一：系统默认 `AppDumpsDir`
 
-位置：[files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L60-L61)
+位置：[files.go#L115-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L115-L122)
 
-基础目录的确定有两种方式：
+`AppDumpsDir` 是一个包级全局变量，在 `InitLocs()` 中初始化，有两种路径：
 
-1. **K9S_CONFIG_DIR 环境变量方式**：
-   - `AppDumpsDir = $K9S_CONFIG_DIR/screen-dumps`
-   - 位置：[files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L124-L133)
+**情况 A：设置了 `K9S_CONFIG_DIR` 环境变量**
 
-2. **XDG 标准方式**：
-   - `AppDumpsDir = $XDG_STATE_HOME/k9s/screen-dumps`
-   - 位置：[files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L166-L193)
+```
+AppDumpsDir = $K9S_CONFIG_DIR/screen-dumps
+```
 
-### 4.3 上下文目录 - `ContextScreenDumpDir`
+- 位置：[files.go#L124-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L124-L133)
+- 初始化时立即创建目录
+- `K9S_CONFIG_DIR` 环境变量通过 `isEnvSet()` 检测（值不为空即视为设置）
 
-位置：[k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L172-L175)
+**情况 B：未设置 `K9S_CONFIG_DIR`（默认）**
+
+```
+AppDumpsDir = $XDG_STATE_HOME/k9s/screen-dumps
+```
+
+- 位置：[files.go#L166-L193](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L190-L193)
+- 使用 `xdg.StateFile()` 计算路径
+- 在 Linux 上默认为 `~/.local/state/k9s/screen-dumps`
+- 在 macOS 上默认为 `~/Library/Application Support/k9s/screen-dumps`
+
+**`AppDumpsDir` 的角色**：它是最低优先级的兜底值，只在配置文件和命令行都未指定时生效。
+
+### 4.4 来源二：配置文件 `k9s.screenDumpDir`
+
+位置：[k9s.go#L39](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L39)
+
+```yaml
+k9s:
+  screenDumpDir: /tmp/screen-dumps
+```
+
+**读取流程**：
+
+1. `k9sCfg.Load(AppConfigFile)` 从 `config.yaml` 读取（[config.go#L271-L293](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/config.go#L271-L293)）
+2. 反序列化 YAML 到 `Config.K9s.ScreenDumpDir` 字段
+3. 通过 `Config.Merge()` → `K9s.Merge()` 将值写入当前配置（[k9s.go#L140](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L140)）
+
+```go
+func (k *K9s) Merge(k1 *K9s) {
+    // ...
+    k.ScreenDumpDir = k1.ScreenDumpDir  // 直接覆盖
+    // ...
+}
+```
+
+**注意**：`Merge()` 是无条件覆盖，即使 YAML 中的值为空字符串也会覆盖掉 `NewK9s()` 中设置的默认值。但 YAML 标签有 `omitempty`，所以保存时如果值为空不会写入文件。
+
+### 4.5 来源三：命令行 `--screen-dump-dir`
+
+**标志注册**：[root.go#L267-L272](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L267-L272)
+
+```go
+rootCmd.Flags().StringVar(
+    k9sFlags.ScreenDumpDir,
+    "screen-dump-dir",
+    "",                          // 默认值为空字符串
+    "Sets a path to a dir for a screen dumps",
+)
+```
+
+**Flags 初始化**：[flags.go#L49](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/flags.go#L49)
+
+```go
+func NewFlags() *Flags {
+    return &Flags{
+        // ...
+        ScreenDumpDir: strPtr(AppDumpsDir),  // 默认值是 AppDumpsDir！
+    }
+}
+```
+
+**注入到 K9s 配置**：[k9s.go#L348](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L348)
+
+```go
+func (k *K9s) Override(k9sFlags *Flags) {
+    // ...
+    k.manualScreenDumpDir = k9sFlags.ScreenDumpDir
+}
+```
+
+**关键细节**：`Override()` 是无条件赋值，不区分用户是否实际在命令行指定了该标志。这意味着：
+- 如果用户**未指定** `--screen-dump-dir`：`k9sFlags.ScreenDumpDir` 的值是 `NewFlags()` 中设置的 `AppDumpsDir`（非空）
+- 如果用户**指定了** `--screen-dump-dir /my/path`：`k9sFlags.ScreenDumpDir` 的值是 `/my/path`
+
+两者都会被存入 `k.manualScreenDumpDir`。
+
+### 4.6 `AppScreenDumpDir()` 的回退逻辑
+
+位置：[k9s.go#L158-L170](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L158-L170)
+
+```go
+func (k *K9s) AppScreenDumpDir() string {
+    d := k.ScreenDumpDir                    // 来源：配置文件或默认值
+    if isStringSet(k.manualScreenDumpDir) { // 来源：命令行
+        d = *k.manualScreenDumpDir
+        k.ScreenDumpDir = d                 // 回写到 ScreenDumpDir
+    }
+    if d == "" {                            // 兜底：系统默认
+        d = AppDumpsDir
+    }
+
+    return d
+}
+```
+
+`isStringSet` 定义（[helpers.go#L25-L27](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/helpers.go#L25-L27)）：
+
+```go
+func isStringSet(s *string) bool {
+    return s != nil && *s != ""
+}
+```
+
+**完整决策流程图**：
+
+```
+AppScreenDumpDir()
+    ↓
+d = k.ScreenDumpDir          ← 配置文件值（或 NewK9s 的默认值 AppDumpsDir）
+    ↓
+isStringSet(k.manualScreenDumpDir)?
+    ├─ YES → d = *k.manualScreenDumpDir     ← 命令行值覆盖
+    │         k.ScreenDumpDir = d             ← 回写确保一致性
+    └─ NO  → d 不变（使用配置文件值）
+    ↓
+d == "" ?
+    ├─ YES → d = AppDumpsDir                ← 系统默认兜底
+    └─ NO  → d 不变
+    ↓
+return d
+```
+
+### 4.7 实际场景下的目录确定
+
+| 场景 | 配置文件 | 命令行 | `k.ScreenDumpDir` | `k.manualScreenDumpDir` | 最终目录 |
+|-----|---------|--------|--------------------|-----------------------|---------|
+| 全部默认 | 未设置 | 未指定 | `AppDumpsDir` | `AppDumpsDir`（非空） | **命令行值** = `AppDumpsDir` |
+| 仅配置文件 | `/my/dumps` | 未指定 | `/my/dumps` | `AppDumpsDir`（非空） | **命令行值** = `AppDumpsDir` ❗ |
+| 仅命令行 | 未设置 | `/my/dumps` | `AppDumpsDir` | `/my/dumps` | **命令行值** = `/my/dumps` |
+| 两者都设置 | `/cfg/dumps` | `/cli/dumps` | `/cfg/dumps` | `/cli/dumps` | **命令行值** = `/cli/dumps` |
+| 命令行空字符串 | `/my/dumps` | `--screen-dump-dir ""` | `/my/dumps` | `""` | `isStringSet("") = false` → **配置文件值** = `/my/dumps` |
+| 配置文件空字符串 | `""` | 未指定 | `""` | `AppDumpsDir`（非空） | **命令行值** = `AppDumpsDir` |
+| 全空 | `""` | `--screen-dump-dir ""` | `""` | `""` | `isStringSet("") = false` → `d == ""` → **系统默认** = `AppDumpsDir` |
+
+**重要发现**：由于 `NewFlags()` 中 `ScreenDumpDir` 默认值是 `AppDumpsDir`（非空），且 `Override()` 无条件赋值，`manualScreenDumpDir` 在**用户未指定命令行标志时也是非空的**。这意味着 `isStringSet(k.manualScreenDumpDir)` 始终为 `true`，**命令行标志始终"覆盖"配置文件值**——即使它们值相同。
+
+实际效果：当用户未指定 `--screen-dump-dir` 时，`manualScreenDumpDir` 的值就是 `AppDumpsDir`，它会在 `AppScreenDumpDir()` 中"覆盖" `ScreenDumpDir`，并将 `ScreenDumpDir` 回写为 `AppDumpsDir`。如果配置文件指定了自定义目录，该值会被覆盖回 `AppDumpsDir`。
+
+**这是一个潜在的 bug**：配置文件的 `screenDumpDir` 设置在用户未指定命令行标志时会被忽略，因为命令行默认值（`AppDumpsDir`）始终通过 `Override()` 注入并"覆盖"了它。
+
+### 4.8 `ContextScreenDumpDir()` - 上下文子目录
+
+位置：[k9s.go#L172-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L172-L175)
 
 ```go
 func (k *K9s) ContextScreenDumpDir() string {
@@ -292,9 +454,7 @@ func (k *K9s) ContextScreenDumpDir() string {
 }
 ```
 
-上下文路径由 `contextPath()` 计算：
-
-位置：[k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L177-L186)
+`contextPath()` 计算逻辑（[k9s.go#L177-L186](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L177-L186)）：
 
 ```go
 func (k *K9s) contextPath() string {
@@ -308,27 +468,24 @@ func (k *K9s) contextPath() string {
 }
 ```
 
-即：`{cluster}/{context}`，两级目录都经过文件名清洗。
+最终目录结构：
 
-### 4.4 目录生命周期
+```
+{AppScreenDumpDir()}/{cluster-name}/{context-name}/
+```
+
+- 两级子目录都经过 `SanitizeFileName` 清洗
+- 如果无活跃配置，使用 `"na"` 作为子目录名
+
+### 4.9 目录生命周期
 
 | 阶段 | 时机 | 操作 | 代码位置 |
 |-----|------|------|---------|
-| 初始化 | 应用启动时 | 创建 `AppDumpsDir` 基础目录 | [files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L130-L133) |
-| 视图切换 | ScreenDump 视图初始化 | 确保上下文目录存在 | [screen_dump.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/screen_dump.go#L38-L46) |
-| 保存时 | 每次保存快照 | 确保目录存在（`ensureDir`） | [table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go#L26-L28) |
-| 上下文切换 | 切换 k8s 上下文 | 目录路径随之变化 | [k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L173-L175) |
-
-### 4.5 自定义目录
-
-可通过以下方式自定义 screen dump 目录：
-
-1. **配置文件**：`k9s.screenDumpDir`
-   - 位置：[k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L39)
-
-2. **命令行标志**：`--screen-dump-dir`
-   - 位置：[flags.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/flags.go)
-   - 优先级高于配置文件
+| 系统默认初始化 | `InitLocs()` 应用启动 | 创建 `AppDumpsDir` 基础目录 | [files.go#L115-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go#L115-L122) |
+| 配置确定后 | `Refine()` 中 | 确保 `AppScreenDumpDir()` 目录存在 | [config.go#L146](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/config.go#L146) |
+| 视图切换 | ScreenDump 视图初始化 | 确保上下文子目录存在 | [screen_dump.go#L38-L46](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/screen_dump.go#L38-L46) |
+| 保存时 | 每次保存快照 | `ensureDir` 确保目录存在 | [table_helper.go#L26-L28](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go#L26-L28) |
+| 上下文切换 | 切换 k8s 上下文 | `contextPath()` 变化，目录路径随之变化 | [k9s.go#L172-L175](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L172-L175) |
 
 ---
 
@@ -481,8 +638,13 @@ render/screen_dump.go: Render() 渲染文件列表
 | [internal/view/log.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/log.go) | 日志保存函数 |
 | [internal/dao/screen_dump.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/dao/screen_dump.go) | Screen Dump DAO 层 |
 | [internal/render/screen_dump.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/render/screen_dump.go) | Screen Dump 渲染器 |
-| [internal/config/k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go) | 目录配置相关 |
-| [internal/config/files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go) | 目录初始化 |
+| [cmd/root.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L133-L178) | 启动流程和配置加载 |
+| [cmd/root.go#L267-L272](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L267-L272) | --screen-dump-dir 标志注册 |
+| [internal/config/k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go) | 目录配置、覆盖和回退逻辑 |
+| [internal/config/config.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/config.go) | 配置加载和 Refine |
+| [internal/config/files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go) | 系统默认目录初始化 |
+| [internal/config/flags.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/flags.go) | 命令行标志定义和默认值 |
+| [internal/config/helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/helpers.go) | isStringSet、isEnvSet 辅助函数 |
 | [internal/config/data/helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/data/helpers.go) | 文件名清洗 |
 | [internal/client/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/types.go#L16-L55) | 命名空间相关常量定义 |
 | [internal/client/helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/helpers.go#L20-L23) | IsClusterWide 函数 |
