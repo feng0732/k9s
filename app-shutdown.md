@@ -175,7 +175,14 @@ func (a *App) BailOut(exitCode int) {
 }
 ```
 
-**注意顺序**：先清理 k8s 资源（pod/端口转发），再恢复终端退出。外层 `defer recover` 在 BailOut 函数返回时才执行，如果 `nukeK9sShell` panic，后面三行不会被执行。
+**注意顺序**：先清理 k8s 资源（pod/端口转发），再恢复终端退出。BailOut 自身的 `defer recover` 在函数返回时才执行，如果 `nukeK9sShell` panic，后面三行不会被执行。
+
+**重要副作用 —— os.Exit 导致上层 defer 全部不执行**：
+- `a.App.BailOut(exitCode)` 内部最终调用 `os.Exit(exitCode)`（见 `internal/ui/app.go:L155-L162`）
+- `os.Exit` 直接终止进程，**不会返回到 `run()` 函数**
+- 因此 `cmd/root.go:L88-L92` 中的 `defer logFile.Close()` 永远不会在正常退出路径上执行
+- `cmd/root.go:L93-L101` 中的 `defer recover()` 也不会执行
+- 日志文件 buffer 可能未 flush，日志可能不完整
 
 ### 3.2 Halt / Resume 事件循环控制
 
@@ -646,7 +653,7 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 | `forwarders.DeleteAll()` 关端口转发 stopChan | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `Config.Save()` 保存配置 | ✅ | ✅ | ❌ | ❌ | ❌ |
 | `tcell.Screen.Fini()` 恢复终端 | ✅ | ✅ | ❌ | ❌ | ❌ |
-| logFile defer Close() | ✅（cmd/root.go defer） | ✅ | ❌ | ❌ | ❌ |
+| `cmd/root.go` 中 `defer logFile.Close()` | ❌（os.Exit 跳过） | ❌（os.Exit 跳过） | ❌ | ❌ | ❌ |
 
 ### 6.2 资源残留的实际后果
 
@@ -671,8 +678,12 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 **配置更改丢失**：
 - 没走 `Config.Save()`，当前 session 对 context/namespace/view 的变更不会写盘
 
-**日志丢失**：
-- 没走 logFile `defer Close()`，slog buffer 中未 flush 的日志丢失
+**日志文件不完整（所有退出路径都有此问题）**：
+- `cmd/root.go:L88-L92` 中的 `defer logFile.Close()` 是 `run()` 函数的 defer
+- 由于所有退出路径最终都走 `os.Exit`（包括 Ctrl+C 正常退出和连接丢失退出），进程不会返回到 `run()` 函数
+- 因此 `defer logFile.Close()` **永远不会执行**
+- slog buffer 中未 flush 的日志可能丢失，日志文件结尾可能不完整
+- 注意：`tint.NewHandler` 内部通常是行缓冲的，每行写完会自动 flush，所以大部分日志仍能落盘，但退出前最后几条可能丢失
 
 ### 6.3 关于 goroutine 的说明
 
@@ -714,6 +725,8 @@ func (p *PageStack) StackPopped(o, top model.Component) {
                         │      ├─ tcsetattr 恢复 termios
                         │      └─ Close(tty fd)
                         └─ os.Exit(exitCode) → 进程终止
+                           ⚠️  注意：os.Exit 直接终止进程，不会返回到 cmd/root.go 的 run() 函数
+                                因此 run() 中的 defer logFile.Close() 和 defer recover() 都不会执行
 ```
 
 ### 7.2 连接丢失退出链
@@ -739,9 +752,9 @@ func (p *PageStack) StackPopped(o, top model.Component) {
          └─ internal/view/app.go:L187 signal.Notify(sig, syscall.SIGHUP)
             └─ goroutine internal/view/app.go:L189-L192 从 sig channel 读出
                └─ os.Exit(0)
-                  ├─ ⚠️  不执行任何 defer（包括 cmd/root.go 中的 logFile.Close）
                   ├─ ⚠️  不恢复终端
                   └─ ⚠️  不删除 k9s-shell pod
+                  （注：其他走 os.Exit 的退出路径也不会执行 cmd/root.go 的 defer logFile.Close()）
 ```
 
 ---
@@ -755,7 +768,7 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 - ✅ 终端：tcell Screen.Fini() 恢复 termios 和正常屏幕
 - ✅ k9s-shell pod：尝试删除（500ms 超时，失败只打日志）
 - ✅ 配置：调用 Config.Save(true) 持久化 YAML
-- ✅ 日志文件：cmd/root.go 的 defer Close()
+- ❌ 日志文件：`defer logFile.Close()` 永远不执行（os.Exit 跳过上层 defer）
 
 ### 8.2 缺失与不足
 
