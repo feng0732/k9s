@@ -43,7 +43,7 @@ type PulseListener interface {
 
 **关键事实**：`view.Pulse` **没有实现该接口**，也没有通过 `AddListener` 注册。原因：
 - `view.Pulse.PulseChanged` 签名是 `PulseChanged(pt model.HealthPoint)`，参数是 `HealthPoint` 而非接口要求的 `*health.Check`
-- `internal/model/pulse_health.go#L19-L22` 中传输的 `HealthPoint` 与 `internal/health/check.go#L13-L17` 中 `health.Check` 是**两个独立的数据结构**
+- `HealthPoint` 与 `health.Check` 是**两个独立的数据结构**
 
 ### 2.2 实际使用的是 channel 直连模式
 
@@ -353,7 +353,25 @@ func (p *Pulse) PulseChanged(pt model.HealthPoint) {
 2. `nn` 变量后续完全没有被使用（没有传入 `SetLegend`）
 3. `Gauge.SetColorIndex` 是空实现，阈值系统也无法影响 Gauge 颜色
 
-### 5.3 Gauge 真正的零值显示在 Draw() → drawNum() 中
+### 5.3 Gauge 数字格式化：fmt.Sprintf("%d") 不会产生前导零
+
+[internal/tchart/gauge.go#L88-L90](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L88-L90)：
+
+```go
+var (
+    fmat = "%d"
+)
+d1, d2 := fmt.Sprintf(fmat, g.state.OK), fmt.Sprintf(fmat, g.state.Fault)
+```
+
+**关键事实**：`fmt.Sprintf("%d", n)` **永远不会产生前导零**，`%d` 格式符只输出数字的有效位数：
+- `fmt.Sprintf("%d", 0)` → `"0"`
+- `fmt.Sprintf("%d", 42)` → `"42"`
+- `fmt.Sprintf("%d", 100)` → `"100"`
+
+只有 `%0nd`（如 `%04d`）才会补零产生 `"0042"`。代码中使用的是 `%d`，**前导零逻辑永远不可达**。
+
+### 5.4 Gauge 真正的零值显示：只有 val==0 整体灰化
 
 [internal/tchart/gauge.go#L78-L139](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L78-L139)：
 
@@ -378,11 +396,11 @@ func (g *Gauge) drawNum(sc tcell.Screen, o image.Point, n number, style tcell.St
     }
 
     dm, significant := NewDotMatrix(), n.val == 0
-    if significant {                             // ★ 值为 0：整组数字 dimmed
+    if significant {                             // ★ val==0：整组数字 dimmed
         style = g.dimmed                         // 灰色暗淡样式
     }
     for i := range len(n.str) {
-        if n.str[i] == '0' && !significant {     // ★ 前导零：单个数字 dimmed
+        if n.str[i] == '0' && !significant {     // ★ 前导零：永远不可达（%d 不补零）
             g.drawDial(sc, dm.Print(...), o, g.dimmed)
         } else {
             significant = true
@@ -402,16 +420,27 @@ dimmed: tcell.StyleDefault.
     Dim(true)  // 灰色 + 暗淡显示
 ```
 
-**Gauge 零值显示完整判定表**：
+**Gauge 零值显示完整判定表（修正版）**：
 
-| 场景 | 触发条件 | 代码位置 | 效果 |
-|------|---------|---------|------|
-| 整体灰化 | `n.val == 0`（数值本身就是0） | [internal/tchart/gauge.go#L122-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L122-L125) | 整组数字 `style = g.dimmed`，seriesColors 被完全覆盖 |
-| 前导零灰化 | 数值>0，但数字串中有前导0（如 `"0042"` 中的前两个 0） | [internal/tchart/gauge.go#L127-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L127-L128) | 前导零使用 `g.dimmed`，有效数字使用 seriesColors 颜色 |
-| 正常显示 | 数值>0，且不是前导零 | [internal/tchart/gauge.go#L129-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L129-L132) | 使用 `style`（OK→seriesColors[0]，Fault→seriesColors[1]） |
-| 边框颜色(独立) | `Faults > 0` 或 `Faults == 0` | [internal/view/pulse.go#L260-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L260-L264) | Faults>0 → DarkRed 边框，否则 → DarkOliveGreen 边框 |
+| 场景 | 触发条件 | 代码位置 | 可达性 | 效果 |
+|------|---------|---------|--------|------|
+| 整体灰化 | `n.val == 0`（数值本身就是0） | [internal/tchart/gauge.go#L122-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L122-L125) | ✅ **可达** | 整组数字 `style = g.dimmed`，seriesColors 被完全覆盖 |
+| 前导零灰化 | `n.str[i] == '0' && !significant` | [internal/tchart/gauge.go#L127-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L127-L128) | ❌ **死代码** | `fmt.Sprintf("%d")` 不补零，`n.str` 永远没有前导零，该条件永不满足 |
+| 正常显示 | 数值>0，且不是前导零 | [internal/tchart/gauge.go#L129-L132](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L129-L132) | ✅ **可达** | 使用 `style`（OK→seriesColors[0]，Fault→seriesColors[1]） |
+| 边框颜色(独立) | `Faults > 0` 或 `Faults == 0` | [internal/view/pulse.go#L260-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L260-L264) | ✅ **可达** | Faults>0 → DarkRed 边框，否则 → DarkOliveGreen 边框 |
 
-### 5.4 SparkLine：SeriesChanged 中的 nn[] 修改仅影响 legend 文字
+### 5.5 Gauge 边框颜色机制（独立于零值显示）
+
+边框颜色设置仅在 Gauge 中实现，SparkLine 没有动态边框颜色：
+
+- **Gauge 边框**：[internal/view/pulse.go#L260-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L260-L264)
+  - `Faults > 0` → `tcell.ColorDarkRed`（红色边框）
+  - `Faults == 0` → `tcell.ColorDarkOliveGreen`（绿色边框）
+  - 初始化：[internal/view/pulse.go#L513](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L513) `g.SetBorder(true)`
+
+- **SparkLine 边框**：没有动态颜色变化，使用默认边框样式
+
+### 5.6 SparkLine：SeriesChanged 中的 nn[] 修改仅影响 legend 文字
 
 [internal/view/pulse.go#L206-L222](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L206-L222)：
 
@@ -447,44 +476,44 @@ cpu.SetLegend(fmt.Sprintf(cpuFmt,
 ## 六、完整数据流图
 
 ```
-view.Pulse.Start()                                [internal/view/pulse.go#L308]
+view.Pulse.Start()                                internal/view/pulse.go#L308
     │
-    ├── model.Pulse.Watch(ctx)                    [internal/model/pulse.go#L43]
+    ├── model.Pulse.Watch(ctx)                    internal/model/pulse.go#L43
     │       │
-    │       ├── PulseHealth.Watch(ctx, ns)         [internal/model/pulse_health.go#L76]
+    │       ├── PulseHealth.Watch(ctx, ns)         internal/model/pulse_health.go#L76
     │       │     ├── KeyWithMetrics=false (关闭metrics)
     │       │     ├── 立即执行一次 checkPulse()
     │       │     └── ticker: 每 10s 轮询
     │       │           │
     │       │           └── 遍历 PulseGVRs(16 种资源)
     │       │                 │
-    │       │                 └── check(ctx, ns, gvr)  [internal/model/pulse_health.go#L112]
+    │       │                 └── check(ctx, ns, gvr)  internal/model/pulse_health.go#L112
     │       │                       ├── Registry[gvr] 查找 DAO + Renderer
     │       │                       ├── 未注册 → Table DAO/Renderer (Healthy 恒 nil)
     │       │                       ├── DAO.List() 获取资源
     │       │                       ├── isTable() 选择分支
     │       │                       └── Renderer.Healthy() → Faults++
     │       │
-    │       └── Recorder.Watch(ctx, ns)            [internal/dao/recorder.go#L104]
-    │             ├── dispatchSeries(最近 1h 历史)  [internal/dao/recorder.go#L75]
+    │       └── Recorder.Watch(ctx, ns)            internal/dao/recorder.go#L104
+    │             ├── dispatchSeries(最近 1h 历史)  internal/dao/recorder.go#L75
     │             └── ticker: 每 1min 采集
     │                   ├── Node 模式(全NS): 聚合节点容量
     │                   └── Pod 模式(特定NS): 累加容器Usage 注意:Allocatable=Current
     │
     └── goroutine select 消费:
             ├── gaugeChan   → QueueUpdateDraw → PulseChanged(HealthPoint)
-            │     [internal/view/pulse.go#L245]
+            │     internal/view/pulse.go#L245
             │     ├── nn[] 修改: 死代码(副本+未使用)
-            │     ├── SetBorderColor: Faults>0? Red : Green
+            │     ├── SetBorderColor: Faults>0? Red : Green  (仅Gauge)
             │     └── Gauge.Add(Total, Faults)
             │           └── Gauge.Draw()
             │                 ├── colorForSeries() 取 OK/Fault 颜色
-            │                 ├── drawNum(): val==0 → 整体 dimmed
-            │                 ├── drawNum(): 前导0 → dimmed
+            │                 ├── drawNum(): val==0 → 整体 dimmed  (唯一可达的零值显示)
+            │                 ├── drawNum(): 前导0 dimmed  (死代码, %d 不补零)
             │                 └── tview.Print(legend, 白色居中)
             │
             └── metricsChan → QueueUpdateDraw → SeriesChanged(TimeSeries)
-                  [internal/view/pulse.go#L180]
+                  internal/view/pulse.go#L180
                   ├── SparkLine.SetMax / AddMetric
                   ├── Thresholds.LevelFor → SetColorIndex → 折线柱体颜色
                   ├── nn[] 修改: 副本不影响 seriesColors
@@ -501,8 +530,8 @@ view.Pulse.Start()                                [internal/view/pulse.go#L308]
 
 ### 7.1 健康检查入口
 
-| 功能 | 可定位引用 |
-|------|-----------|
+| 功能 | 引用 |
+|------|------|
 | PulseListener 接口定义 | [internal/model/pulse.go#L14-L23](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/model/pulse.go#L14-L23) |
 | model.Pulse.Watch 返回两个 channel | [internal/model/pulse.go#L43-L56](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/model/pulse.go#L43-L56) |
 | view.Pulse.Start 消费 channel | [internal/view/pulse.go#L308-L339](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L308-L339) |
@@ -513,8 +542,8 @@ view.Pulse.Start()                                [internal/view/pulse.go#L308]
 
 ### 7.2 指标窗口
 
-| 功能 | 可定位引用 |
-|------|-----------|
+| 功能 | 引用 |
+|------|------|
 | 采集参数常量 | [internal/dao/recorder.go#L23-L29](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/dao/recorder.go#L23-L29) |
 | Recorder.Watch 主入口 | [internal/dao/recorder.go#L104-L139](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/dao/recorder.go#L104-L139) |
 | Node 级别采集 | [internal/dao/recorder.go#L148-L207](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/dao/recorder.go#L148-L207) |
@@ -527,8 +556,8 @@ view.Pulse.Start()                                [internal/view/pulse.go#L308]
 
 ### 7.3 阈值判断
 
-| 功能 | 可定位引用 |
-|------|-----------|
+| 功能 | 引用 |
+|------|------|
 | Threshold.LevelFor 三级判断 | [internal/config/threshold.go#L78-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/config/threshold.go#L78-L91) |
 | Threshold.SeverityColor 颜色映射 | [internal/config/threshold.go#L94-L104](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/config/threshold.go#L94-L104) |
 | CPU/MEM 常量 key | [internal/config/types.go#L10-L14](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/config/types.go#L10-L14) |
@@ -537,25 +566,26 @@ view.Pulse.Start()                                [internal/view/pulse.go#L308]
 | SparkLine.SetColorIndex | [internal/tchart/sparkline.go#L61-L63](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/sparkline.go#L61-L63) |
 | Draw 中 colorIndex 取色画柱体 | [internal/tchart/sparkline.go#L141-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/sparkline.go#L141-L147) |
 
-### 7.4 零值显示
+### 7.4 零值显示与边框颜色
 
-| 功能 | 可定位引用 |
-|------|-----------|
+| 功能 | 引用 |
+|------|------|
 | GetSeriesColorNames 返回独立副本 | [internal/tchart/component.go#L98-L115](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/component.go#L98-L115) |
 | colorForSeries 返回原引用 | [internal/tchart/component.go#L117-L121](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/component.go#L117-L121) |
 | seriesColors 默认值 | [internal/tchart/component.go#L30-L34](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/component.go#L30-L34) |
 | dimmed 样式定义 | [internal/tchart/component.go#L35](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/component.go#L35) |
 | Gauge.PulseChanged nn[] 修改（死代码） | [internal/view/pulse.go#L251-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L251-L257) |
 | Gauge.Draw 主流程 | [internal/tchart/gauge.go#L78-L113](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L78-L113) |
-| Gauge.drawNum 值为0 → 整体 dimmed | [internal/tchart/gauge.go#L122-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L122-L125) |
-| Gauge.drawNum 前导零 → dimmed | [internal/tchart/gauge.go#L127-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L127-L128) |
-| Gauge 边框颜色指示 | [internal/view/pulse.go#L260-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L260-L264) |
+| Gauge.drawNum val==0 → 整体 dimmed（真实生效） | [internal/tchart/gauge.go#L122-L125](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L122-L125) |
+| Gauge.drawNum 前导零 → dimmed（死代码，%d 不补零） | [internal/tchart/gauge.go#L127-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L127-L128) |
+| Gauge 边框颜色动态设置 | [internal/view/pulse.go#L260-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L260-L264) |
+| Gauge 初始化 SetBorder(true) | [internal/view/pulse.go#L513](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L513) |
 | SparkLine.SeriesChanged nn[] 修改 | [internal/view/pulse.go#L206-L212](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L206-L212) |
 
 ### 7.5 各资源 Healthy 实现
 
-| 资源 | 可定位引用 |
-|------|-----------|
+| 资源 | 引用 |
+|------|------|
 | Pod Healthy | [internal/render/pod.go#L214-L253](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/render/pod.go#L214-L253) |
 | Pod diagnose 判定 | [internal/render/pod.go#L242-L253](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/render/pod.go#L242-L253) |
 | Node Healthy | [internal/render/node.go#L171-L218](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/render/node.go#L171-L218) |
@@ -563,3 +593,13 @@ view.Pulse.Start()                                [internal/view/pulse.go#L308]
 | Namespace Healthy | [internal/render/ns.go#L100-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/render/ns.go#L100-L122) |
 | Event Healthy | [internal/render/ev.go#L20-L32](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/render/ev.go#L20-L32) |
 | Base Healthy 默认实现 | [internal/render/base.go#L69-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/render/base.go#L69-L72) |
+
+---
+
+## 八、死代码汇总
+
+| 代码位置 | 描述 | 为何不可达 |
+|---------|------|-----------|
+| [internal/view/pulse.go#L251-L257](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/view/pulse.go#L251-L257) | Gauge.PulseChanged 中 `nn[0] = "gray"` / `nn[1] = "gray"` | 1. `GetSeriesColorNames()` 返回副本，不影响 `seriesColors`；2. `nn` 后续未传入 `SetLegend` |
+| [internal/tchart/gauge.go#L127-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/tchart/gauge.go#L127-L128) | Gauge.drawNum 中 `n.str[i] == '0' && !significant` 前导零灰化 | `fmt.Sprintf("%d")` 不补零，`n.str` 永远没有前导零 |
+| [internal/model/pulse.go#L14-L23](file:///d:/fz/0601-2/solo-dogfeeding/code/8-k9s/internal/model/pulse.go#L14-L23) | PulseListener 接口 | `view.Pulse` 未实现该接口，且 `Start()` 直接消费 channel，不走 listener 机制 |
