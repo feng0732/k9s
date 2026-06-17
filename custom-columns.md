@@ -832,22 +832,35 @@ spec = "{.status.containerStatuses[]|select(.ready==false)|name}"
     gojq.Run(o) → 正确求值 → 返回 JQ 结果
 ```
 
-**但如果用户只写了 1 个管道符**：
+**但如果用户只写了 1 个管道符 + 非法尾段**：
 
 ```
 用户输入: "MY_COL:.spec.foo|bar"
     │
-    ▼ parse() 正则匹配
-  → mm[1]="MY_COL", mm[2]=".spec.foo", mm[3]="bar"
-  → "bar" 不在 [NTWSLRH] 中 → newColFlags 打 Warn 但不报错
-  → spec = "{.spec.foo}"
+    ▼ parse() 正则匹配（尾锚定约束导致回退）
+  → mm[1]="MY_COL", mm[2]=".spec.foo|bar", mm[3]=""
+  → 'b' ∉ [NTWSLRH]，组3只能匹配 0 次（空串），整段 |bar 回溯进表达式段
+  → newColFlags("")：无标志字符，不打 Warn
+  → spec = "{.spec.foo|bar}"
     │
-    ▼ isJQSpec("{.spec.foo}") → 1段 → 不是 JQ
+    ▼ isJQSpec("{.spec.foo|bar}")
+    Split("{.spec.foo|bar}", "|") = ["{.spec.foo", "bar}"] → 2段
+    → 2 > 2? false → 不是 JQ
     │
-    ▼ 走 JSONPath 求值（而非 JQ）
+    ▼ 走 JSONPath 路径（但 parser.Parse("{.spec.foo|bar}") 大概率语法错误）
 ```
 
-这种情况下管道符被截断为 FLAGS 部分，spec 内部没有管道符，JQ 判定为 false。
+这种情况下管道符回退进入表达式段，spec 内含 1 个管道符，但由于 isJQSpec 要求 `Split 段数 > 2`（即至少 2 个管道符），所以 JQ 判定仍为 false，最终走 JSONPath。
+
+### 13.3.1 单管道的最终统一结论
+
+对任何单管道列定义（管道后无论是否合法 FLAGS）：
+
+- 管道后跟合法 FLAGS(≤3)：管道归分隔符，spec 内无管道 → Split=1段 → 不触发 JQ
+- 管道后跟非法尾段：管道回退入表达式段，spec 内含 1 管道 → Split=2段 → 仍不触发 JQ
+- 管道后跟合法 FLAGS>3：多余部分+管道回退入表达式段，spec 内含 1 管道 → Split=2段 → 仍不触发 JQ
+
+**JQ 触发的唯一条件：包装后的 spec 内至少包含 2 个管道符（即表达式段含 ≥2 个 `|`），使 Split 结果 ≥ 3 段。**
 
 ### 13.4 边界情况 3：JQ 运行时错误不中断
 
