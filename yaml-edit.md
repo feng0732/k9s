@@ -1,5 +1,9 @@
 # K9s 资源描述与 YAML 编辑器链路分析
 
+> 代码证据路径：所有代码引用均使用相对于仓库根目录 `internal/` 的相对路径，如 `internal/view/exec.go#L57-L97`
+
+---
+
 ## 一、整体架构概览
 
 K9s 的资源描述和 YAML 编辑器功能采用分层架构，核心设计哲学是：
@@ -20,15 +24,129 @@ dir.go                -                    -
 
 ---
 
-## 二、资源描述链路 (Describe)
+## 二、外部命令调用路径全景（★ 核心修正）
 
-### 2.1 触发入口
+K9s 调用外部命令有三条独立路径，其中只有部分路径会注入 `K9S_EDITOR`：
 
-资源描述功能通过快捷键 `d` 触发，入口在 [workload.go:156-L169](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/workload.go#L156-L169) 的 `describeCmd` 函数。
+```
+                      用户操作
+                         │
+         ┌───────────────┴───────────────┐
+         ▼                               ▼
+  走通用执行入口                   绕开通用执行入口
+  (经过 execute())                (不经过 execute())
+         │                               │
+  ┌──────┴──────┐                  ┌─────┴──────┐
+  ▼             ▼                  ▼            ▼
+runK()       edit()             runKu()    DAO 层 client API
+  │             │                  │            │（不创建外部进程）
+  └──────┬──────┘                  │            ├─ Get()/List()
+         ▼                         │            ├─ ToYAML()
+       run()                       │            └─ Describe()
+         │                         │
+         ▼                         ▼
+     execute()                 oneShoot()
+         │（K9S_EDITOR 注入点）     │（无 K9S_EDITOR 注入）
+         ▼                         ▼
+       pipe()               exec.Command 直接运行
+  stdin/stdout/stderr 直通
+```
 
-### 2.2 View 层处理
+### 2.1 路径一：走通用执行入口（会注入 K9S_EDITOR）
 
-`describeResource` 函数在 [helpers.go:126-L131](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/helpers.go#L126-L131)：
+**调用链**：`XXX → runK()/edit() → run() → execute() → pipe()`
+
+**K9S_EDITOR 注入位置**：`execute()` 函数中无条件执行（`internal/view/exec.go#L203-L214`）
+
+**具体调用点（共 6 个场景）**：
+
+| 场景 | 触发 | 入口函数 | 调用链 | 代码位置 |
+|------|------|---------|--------|----------|
+| 资源编辑 (kubectl edit) | 列表/YAML页按 `e` | `editRes()` | `editRes() → runK() → run() → execute()` | `internal/view/browser.go#L533-L558` |
+| 容器 exec | Pod 按 `s` | `shellIn()` | `shellIn() → runK() → run() → execute()` | `internal/view/pod.go#L412-L416` |
+| 容器 attach | Pod 按 `a` | `attachIn()` | `attachIn() → runK() → run() → execute()` | `internal/view/pod.go#L453-L458` |
+| Node shell | Node 按 `s` | `sshIn()` | `sshIn() → runK() → run() → execute()` | `internal/view/exec.go#L369-L373` |
+| Xray 编辑 | Xray 按 `e` | `editCmd()` | `editCmd() → runK() → run() → execute()` | `internal/view/xray.go#L458-L484` |
+| 本地文件编辑 | ScreenDump/Dir 按 `e` | `edit()` | `edit() → run() → execute()` | `internal/view/screen_dump.go#L48-L56`<br/>`internal/view/dir.go#L132-L137` |
+
+**★ 关键细节**：
+- `execute()` 中的 K9S_EDITOR 注入逻辑是**无条件**的，没有 `if opts.binary == "kubectl"` 判断
+- 所有经过 `execute()` 的命令（包括 `vim`、`code` 等编辑器）都会被注入 `KUBE_EDITOR` 环境变量
+- 对于非 kubectl 命令，注入 `KUBE_EDITOR` 无实际影响（它们不读这个环境变量）
+
+### 2.2 路径二：绕开通用执行入口（不会注入 K9S_EDITOR）
+
+**调用链**：`XXX → runKu() → oneShoot() → exec.Command 直接运行`
+
+**为什么不注入？** `oneShoot()` 直接创建 `exec.Command`，不经过 `execute()` 函数，所以不会执行 K9S_EDITOR 注入逻辑。
+
+**具体调用点（共 2 个场景）**：
+
+| 场景 | 触发 | 入口函数 | 调用链 | 代码位置 |
+|------|------|---------|--------|----------|
+| Dir 页面 Apply | Dir 选中文件按 `a` | `applyCmd()` | `applyCmd() → runKu() → oneShoot()` | `internal/view/dir.go#L217-L232` |
+| Dir 页面 Delete | Dir 选中文件按 `d` | `deleteCmd()` | `deleteCmd() → runKu() → oneShoot()` | `internal/view/dir.go#L258-L273` |
+
+**oneShoot() 实现**（`internal/view/exec.go#L270-L288`）：
+```go
+func oneShoot(ctx context.Context, opts *shellOpts) (string, error) {
+    cmd := exec.CommandContext(ctx, opts.binary, opts.args...)
+    buff := bytes.NewBufferString("")
+    cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, buff, buff  // 输出收集到 buffer，不直通
+    err := cmd.Run()
+    return strings.Trim(buff.String(), "\n"), err
+}
+```
+
+### 2.3 路径三：DAO 层读取（完全不调用外部 kubectl）
+
+**特点**：直接使用 Go client 库调用 Kubernetes API，不创建外部进程，因此**完全不会触发 K9S_EDITOR 注入**。
+
+**包含的操作**：
+- `Get()` / `List()` - 资源读取
+- `ToYAML()` - YAML 序列化
+- `Describe()` - 资源描述
+- `Patch()` - 资源更新（如重启）
+- 所有 DAO 层数据访问
+
+**代码位置**：
+- `internal/dao/resource.go#L41-L53` - `ToYAML()`
+- `internal/dao/describe.go#L14-L58` - `Describe()`
+- `internal/dao/helpers.go#L85-L104` - 通用 `ToYAML()`
+- `internal/dao/dp.go#L398-L444` - `restartRes()`
+
+---
+
+## 三、K9S_EDITOR 注入边界总结表
+
+| 功能场景 | 调用入口 | 执行路径 | 是否注入 K9S_EDITOR | 代码位置 |
+|---------|---------|---------|---------------------|----------|
+| K8s 资源编辑 | `e` 键 | `editRes() → runK() → execute()` | ✅ 是 | `internal/view/browser.go#L553` |
+| 容器 exec | `s` 键 | `shellIn() → runK() → execute()` | ✅ 是 | `internal/view/pod.go#L412` |
+| 容器 attach | `a` 键 | `attachIn() → runK() → execute()` | ✅ 是 | `internal/view/pod.go#L456` |
+| Node shell | `s` 键 | `sshIn() → runK() → execute()` | ✅ 是 | `internal/view/exec.go#L369` |
+| Xray 编辑 | `e` 键 | `editCmd() → runK() → execute()` | ✅ 是 | `internal/view/xray.go#L478` |
+| ScreenDump 编辑 | `e` 键 | `edit() → run() → execute()` | ✅ 是 | `internal/view/screen_dump.go#L53` |
+| Dir 本地文件编辑 | `e` 键 | `edit() → run() → execute()` | ✅ 是 | `internal/view/dir.go#L135` |
+| Dir Apply Manifest | `a` 键 | `applyCmd() → runKu() → oneShoot()` | ❌ 否 | `internal/view/dir.go#L222` |
+| Dir Delete Manifest | `d` 键 | `deleteCmd() → runKu() → oneShoot()` | ❌ 否 | `internal/view/dir.go#L263` |
+| YAML 查看 (y 键) | `y` 键 | DAO 层 ToYAML(), client API | ❌ 否 | `internal/dao/resource.go#L41` |
+| 资源描述 (d 键) | `d` 键 | DAO 层 Describe(), client API | ❌ 否 | `internal/dao/describe.go#L14` |
+| 资源列表刷新 | 自动/手动 | DAO 层 List(), client API | ❌ 否 | `internal/dao/` 各文件 |
+| 重启 Deployment | `ctrl-r` | DAO 层 Patch(), client API | ❌ 否 | `internal/dao/dp.go#L398` |
+| 本地保存 YAML | `Ctrl+S` | os.OpenFile() 写本地文件 | ❌ 否 | `internal/view/yaml.go#L72` |
+
+---
+
+## 四、资源描述链路 (Describe)
+
+### 4.1 触发入口
+
+资源描述功能通过快捷键 `d` 触发，入口在 `internal/view/workload.go#L156-L169` 的 `describeCmd` 函数。
+
+### 4.2 View 层处理
+
+`describeResource` 函数在 `internal/view/helpers.go#L126-L131`：
 
 ```go
 func describeResource(app *App, _ ui.Tabular, gvr *client.GVR, path string) {
@@ -39,13 +157,13 @@ func describeResource(app *App, _ ui.Tabular, gvr *client.GVR, path string) {
 
 创建 `LiveView` 并注入 `Describe` 模型。
 
-### 2.3 Model 层 - Describe 模型
+### 4.3 Model 层 - Describe 模型
 
 `model.NewDescribe` 创建描述模型，通过 `Watch` 方法定期刷新数据。
 
-### 2.4 DAO 层 - 核心描述逻辑
+### 4.4 DAO 层 - 核心描述逻辑
 
-实际的资源描述在 [describe.go:14-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/describe.go#L14-L58) 的 `Describe` 函数：
+实际的资源描述在 `internal/dao/describe.go#L14-L58` 的 `Describe` 函数：
 
 ```go
 func Describe(c client.Connection, gvr *client.GVR, path string) (string, error) {
@@ -54,33 +172,33 @@ func Describe(c client.Connection, gvr *client.GVR, path string) (string, error)
     gvk, _ := m.KindFor(gvr.GVR())         // 2. 获取 GVK
     ns, n := client.Namespaced(path)       // 3. 解析命名空间和名称
     mapping, _ := mapper.ResourceFor(...)  // 4. 获取资源映射
-    d, _ := describe.Describer(...)        // 5. 使用 kubectl describer
+    d, _ := describe.Describer(...)        // 5. 使用 kubectl describer 包（非外部命令）
     return d.Describe(ns, n, describe.DescriberSettings{ShowEvents: true})
 }
 ```
 
 **关键点**：
-- 直接使用 `k8s.io/kubectl/pkg/describe` 包的 `Describer`
+- 使用 `k8s.io/kubectl/pkg/describe` 包（Go 库），**不调用外部 kubectl 命令**
 - 支持显示事件信息 (`ShowEvents: true`)
 
 ---
 
-## 三、YAML 读取链路
+## 五、YAML 读取链路
 
-### 3.1 触发入口
+### 5.1 触发入口
 
-YAML 查看通过快捷键 `y` 触发，入口在 [workload.go:192-L208](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/workload.go#L192-L208) 的 `yamlCmd` 函数：
+YAML 查看通过快捷键 `y` 触发，入口在 `internal/view/workload.go#L192-L208` 的 `yamlCmd` 函数：
 
 ```go
 v := NewLiveView(w.App(), yamlAction, model.NewYAML(gvr, fqn))
 ```
 
-### 3.2 Model 层 - YAML 模型
+### 5.2 Model 层 - YAML 模型
 
-YAML 模型在 [model/yaml.go:26-L36](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/model/yaml.go#L26-L36) 中定义，**精确字段类型**如下：
+YAML 模型在 `internal/model/yaml.go#L26-L36` 中定义，**精确字段类型**如下：
 
 ```go
-// [types.go:32] ViewerToggleOpts 是 map[string]bool 的类型别名
+// internal/model/types.go#L32: ViewerToggleOpts 是 map[string]bool 的类型别名
 type ViewerToggleOpts map[string]bool
 
 type YAML struct {
@@ -95,7 +213,7 @@ type YAML struct {
 }
 ```
 
-**相关接口定义** ([types.go:26-L46](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/model/types.go#L26-L46))：
+**相关接口定义**（`internal/model/types.go#L26-L46`）：
 
 ```go
 type ResourceViewerListener interface {
@@ -126,19 +244,19 @@ type ResourceViewer interface {
 
 特殊处理：Secret 支持解码，通过 `EncDecResourceViewer` 接口的 `Toggle()` 切换。
 
-### 3.3 DAO 层 - YAML 序列化
+### 5.3 DAO 层 - YAML 序列化
 
-分为两层：
+分为两层，**均不调用外部 kubectl 命令**：
 
-**第一层：Resource.ToYAML** ([resource.go:41-L53](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/resource.go#L41-L53))
+**第一层：Resource.ToYAML**（`internal/dao/resource.go#L41-L53`）
 ```go
 func (r *Resource) ToYAML(path string, showManaged bool) (string, error) {
-    o, _ := r.Get(context.Background(), path)  // 从 API 获取资源
+    o, _ := r.Get(context.Background(), path)  // 从 API 获取资源（client-go）
     return ToYAML(o, showManaged)              // 序列化为 YAML
 }
 ```
 
-**第二层：ToYAML 通用函数** ([helpers.go:85-L104](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/helpers.go#L85-L104))
+**第二层：ToYAML 通用函数**（`internal/dao/helpers.go#L85-L104`）
 ```go
 func ToYAML(o runtime.Object, showManaged bool) (string, error) {
     var p printers.ResourcePrinter = &printers.YAMLPrinter{}
@@ -147,49 +265,49 @@ func ToYAML(o runtime.Object, showManaged bool) (string, error) {
         p = &printers.OmitManagedFieldsPrinter{Delegate: p}
     }
     var buff bytes.Buffer
-    p.PrintObj(o, &buff)        // 使用 Kubernetes 官方 YAMLPrinter
+    p.PrintObj(o, &buff)        // 使用 Kubernetes 官方 YAMLPrinter（Go 库）
     return buff.String(), nil
 }
 ```
 
-### 3.4 View 层 - LiveView 展示
+### 5.4 View 层 - LiveView 展示
 
-[LiveView](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/live_view.go) 核心功能：
+`LiveView`（`internal/view/live_view.go`）核心功能：
 - 自动刷新（`autoRefresh` 开关，默认启用）
 - 搜索过滤（模糊/正则）
-- YAML 语法高亮（[yaml.go:33-L62](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/yaml.go#L33-L62)）
+- YAML 语法高亮（`internal/view/yaml.go#L33-L62`）
 - 快捷键：
   - `Ctrl+S` → 本地保存 YAML
-  - `E` → 编辑资源（调用 `editRes`）
+  - `E` → 编辑资源（调用 `editRes`，走 `runK()` 路径）
   - `M` → 切换 ManagedFields 显示
   - `X` → 切换 Secret 解码
 
 ---
 
-## 四、编辑器拉起链路：两条完全独立的路径
+## 六、编辑器拉起链路：两条完全独立的编辑路径
 
 **重要澄清**：代码中存在两个命名相似但用途**完全不同**的编辑入口，之前常被混淆：
 
-| 函数 | 调用路径 | 用途 | 编辑对象 |
-|------|----------|------|----------|
-| `editRes()` + `runK()` | 资源编辑链路 | 编辑 K8s 资源 | kubectl 管理的临时 YAML |
-| `edit()` 函数 | 本地文件编辑链路 | 编辑本地文件 | ScreenDump / 目录中的本地文件 |
+| 函数 | 调用路径 | 用途 | 编辑对象 | K9S_EDITOR 处理 |
+|------|----------|------|----------|----------------|
+| `editRes()` + `runK()` | 资源编辑链路 | 编辑 K8s 资源 | kubectl 管理的临时 YAML | execute() 中转成 KUBE_EDITOR 传给 kubectl |
+| `edit()` 函数 | 本地文件编辑链路 | 编辑本地文件 | ScreenDump / 目录中的本地文件 | edit() 中自己查 + execute() 中再次注入 |
 
 ---
 
-### 4.1 路径一：资源编辑（kubectl edit）—— 快捷键 `e`
+### 6.1 路径一：资源编辑（kubectl edit）—— 快捷键 `e`
 
 这是用户编辑 K8s 资源的主链路。
 
-#### 4.1.1 触发入口
+#### 6.1.1 触发入口
 
 两个入口最终都调用 `editRes`：
-1. **资源列表页**：[workload.go:172-L189](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/workload.go#L172-L189)
-2. **YAML 查看页**：[live_view.go:182-L194](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/live_view.go#L182-L194)
+1. **资源列表页**：`internal/view/workload.go#L172-L189`
+2. **YAML 查看页**：`internal/view/live_view.go#L182-L194`
 
-#### 4.1.2 权限检查与命令构建
+#### 6.1.2 权限检查与命令构建
 
-[editRes](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/browser.go#L533-L558)：
+`editRes`（`internal/view/browser.go#L533-L558`）：
 
 ```go
 func editRes(app *App, gvr *client.GVR, path string) error {
@@ -211,9 +329,9 @@ func editRes(app *App, gvr *client.GVR, path string) error {
 }
 ```
 
-#### 4.1.3 runK：kubectl 命令包装
+#### 6.1.3 runK：kubectl 命令包装
 
-[runK](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L57-L97) 负责找到 kubectl 并注入 K8s 连接参数：
+`runK`（`internal/view/exec.go#L57-L97`）负责找到 kubectl 并注入 K8s 连接参数：
 
 ```go
 func runK(a *App, opts *shellOpts) error {
@@ -247,9 +365,9 @@ func runK(a *App, opts *shellOpts) error {
 }
 ```
 
-#### 4.1.4 run：终端挂起/恢复管理
+#### 6.1.4 run：终端挂起/恢复管理
 
-[run](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L99-L122)：
+`run`（`internal/view/exec.go#L99-L122`）：
 
 ```go
 func run(a *App, opts *shellOpts) (ok bool, errC chan error, outC chan string) {
@@ -265,9 +383,9 @@ func run(a *App, opts *shellOpts) (ok bool, errC chan error, outC chan string) {
 }
 ```
 
-#### 4.1.5 execute：进程执行 + K9S_EDITOR 传递（★ 关键细节）
+#### 6.1.5 execute：进程执行 + K9S_EDITOR 传递（★ 关键细节）
 
-[execute](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L172-L239) 是**所有外部命令**的通用执行入口，包含**K9S_EDITOR 传递给 kubectl** 的关键逻辑：
+`execute`（`internal/view/exec.go#L172-L239`）是**所有外部命令**的通用执行入口，包含**K9S_EDITOR 传递给 kubectl** 的关键逻辑：
 
 ```go
 func execute(opts *shellOpts, statusChan chan<- string) error {
@@ -307,7 +425,7 @@ func execute(opts *shellOpts, statusChan chan<- string) error {
 }
 ```
 
-**pipe 函数中单命令分支** ([exec.go:554-L595](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L554-L595))：
+**pipe 函数中单命令分支**（`internal/view/exec.go#L554-L595`）：
 
 ```go
 func pipe(...) error {
@@ -328,9 +446,9 @@ func pipe(...) error {
 
 ---
 
-### 4.2 K9S_EDITOR 注入的完整时序（★ 再次核准）
+### 6.2 K9S_EDITOR 注入的完整时序（★ 再次核准）
 
-#### 4.2.1 资源编辑路径（kubectl edit）
+#### 6.2.1 资源编辑路径（kubectl edit）
 
 ```
 用户按 'e'
@@ -389,7 +507,7 @@ cmd.Run() 返回
 刷新资源列表
 ```
 
-#### 4.2.2 本地文件编辑路径（edit 函数）
+#### 6.2.2 本地文件编辑路径（edit 函数）
 
 ```
 用户在 ScreenDump/Dir 页按 'e'
@@ -432,12 +550,12 @@ cmd.Run() 返回
 
 ---
 
-#### 4.2.3 KUBE_EDITOR / EDITOR 由谁处理？
+#### 6.2.3 KUBE_EDITOR / EDITOR 由谁处理？
 
 | 场景 | 处理主体 | 优先级 | 代码位置 |
 |------|---------|--------|----------|
 | **资源编辑** (kubectl edit) | **kubectl 自身** | `KUBE_EDITOR` → `EDITOR` → 默认(vi/notepad) | kubectl 源码（不在 k9s 中），k9s 只负责把 K9S_EDITOR 转成 KUBE_EDITOR 注入 |
-| **本地文件编辑** (edit 函数) | **k9s 自身** | `K9S_EDITOR` → `KUBE_EDITOR` → `EDITOR` | [edit:129-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L129-L152)，k9s 自己遍历环境变量 |
+| **本地文件编辑** (edit 函数) | **k9s 自身** | `K9S_EDITOR` → `KUBE_EDITOR` → `EDITOR` | `internal/view/exec.go#L129-L152`，k9s 自己遍历环境变量 |
 
 **k9s 的作用仅限于**（资源编辑时）：
 - 如果用户设置了 `K9S_EDITOR`，把它转成 `KUBE_EDITOR` 注入 kubectl 子进程
@@ -445,7 +563,7 @@ cmd.Run() 返回
 
 ---
 
-### 4.3 两条路径对比表
+### 6.3 两条编辑路径对比表
 
 | 维度 | 资源编辑 (kubectl edit) | 本地文件编辑 (edit 函数) |
 |------|------------------------|------------------------|
@@ -461,13 +579,13 @@ cmd.Run() 返回
 
 ---
 
-## 五、YAML 回写与保存链路
+## 七、YAML 回写与保存链路
 
-### 5.1 模式一：本地保存 (Ctrl+S / ScreenDump)
+### 7.1 模式一：本地保存 (Ctrl+S / ScreenDump)
 
 用于把当前 LiveView 中显示的 YAML/描述内容保存到本地文件，**不涉及集群回写**。
 
-**入口**：[live_view.go:379-L388](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/live_view.go#L379-L388)
+**入口**：`internal/view/live_view.go#L379-L388`
 ```go
 func (v *LiveView) saveCmd(*tcell.EventKey) *tcell.EventKey {
     name := fmt.Sprintf("%s--%s",
@@ -479,7 +597,7 @@ func (v *LiveView) saveCmd(*tcell.EventKey) *tcell.EventKey {
 }
 ```
 
-**saveYAML 实现**：[yaml.go:72-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/yaml.go#L72-L101)
+**saveYAML 实现**：`internal/view/yaml.go#L72-L101`
 ```go
 func saveYAML(dir, name, raw string) (string, error) {
     ensureDir(dir)
@@ -496,15 +614,15 @@ func saveYAML(dir, name, raw string) (string, error) {
 
 ---
 
-### 5.2 模式二：资源编辑回写 (kubectl edit)
+### 7.2 模式二：资源编辑回写 (kubectl edit)
 
 这是真正把编辑后的 YAML 写回 K8s 集群的模式。
 
-#### 5.2.1 K9s 是否参与回写？
+#### 7.2.1 K9s 是否参与回写？
 
 **答案：完全不参与。** 回写流程 100% 由 kubectl 完成。
 
-**代码证据**（来自 [pipe 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L554-L595) 的单命令分支）：
+**代码证据**（来自 `pipe` 函数的单命令分支，`internal/view/exec.go#L554-L595`）：
 ```go
 if len(cmds) == 1 {
     cmd := cmds[0]
@@ -528,7 +646,7 @@ if len(cmds) == 1 {
 - ❌ 不处理任何版本冲突逻辑
 - ✅ 只负责：挂起/恢复终端、等待进程退出、收集退出状态
 
-#### 5.2.2 kubectl edit 的完整流程（k9s 视角下的黑盒）
+#### 7.2.2 kubectl edit 的完整流程（k9s 视角下的黑盒）
 
 ```
 k9s 挂起终端
@@ -557,9 +675,9 @@ k9s 恢复终端，刷新资源列表
 
 ---
 
-## 六、版本冲突处理
+## 八、版本冲突处理
 
-### 6.1 kubectl edit 的版本冲突：K9s 完全不参与
+### 8.1 kubectl edit 的版本冲突：K9s 完全不参与
 
 **核心结论**：编辑 K8s 资源时，从获取资源、版本比对、冲突提示到重试，**全部由 kubectl 处理**，k9s 代码中没有任何处理版本冲突的逻辑。
 
@@ -600,34 +718,35 @@ k9s 恢复终端 → flash 显示 "Edit command failed: ..."
 
 ---
 
-### 6.2 K9s 内部 Patch 操作：也无显式冲突处理
+### 8.2 K9s 内部 Patch 操作：也无显式冲突处理
 
-K9s 自身有一些 Patch 操作（如重启 Deployment/StatefulSet/DaemonSet），流程在 [dp.go:398-L444](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/dp.go#L398-L444)：
+K9s 自身有一些 Patch 操作（如重启 Deployment/StatefulSet/DaemonSet），流程在 `internal/dao/dp.go#L398-L444`：
 
 ```go
 func restartRes[T runtime.Object](ctx context.Context, f Factory, gvr *client.GVR, path string, opts *metav1.PatchOptions) error {
-    o, _ := f.Get(gvr, path, true, labels.Everything())    // 1. 拉取当前资源
+    o, _ := f.Get(gvr, path, true, labels.Everything())    // 1. 拉取当前资源（client API）
     // ... 权限检查
     before, _ := runtime.Encode(..., *r)                    // 2. 序列化当前状态
     after, _ := polymorphichelpers.ObjectRestarterFn(*r)    // 3. 生成重启后的状态（加 annotation）
     diff, _ := strategicpatch.CreateTwoWayMergePatch(...)   // 4. 生成 Strategic Merge Patch
-    dial.AppsV1().Deployments(ns).Patch(                    // 5. 直接发送 Patch 请求
+    dial.AppsV1().Deployments(ns).Patch(                    // 5. 直接发送 Patch 请求（client API）
         ctx, n, types.StrategicMergePatchType, diff, *opts)
 }
 ```
 
 **特点**：
 - 使用 `StrategicMergePatchType`，不是 `Update`
+- 走 client-go API，**不调用外部 kubectl 命令**
 - Patch 操作不强制匹配 resourceVersion（取决于 API Server 的配置）
 - **没有任何冲突重试或冲突提示逻辑**，出错直接返回给上层 UI
 
 ---
 
-### 6.3 YAML Model 的并发控制：仅防止刷新冲突
+### 8.3 YAML Model 的并发控制：仅防止刷新冲突
 
 唯一的"冲突"处理在 YAML Model 的刷新逻辑中，使用原子锁防止**同一个 model 被并发刷新**：
 
-[model/yaml.go:149-L161](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/model/yaml.go#L149-L161)：
+`internal/model/yaml.go#L149-L161`：
 ```go
 func (y *YAML) refresh(ctx context.Context) error {
     // CAS 原子操作：确保同一时刻只有一个协程在刷新
@@ -644,18 +763,18 @@ func (y *YAML) refresh(ctx context.Context) error {
 
 ---
 
-## 七、K9s 源码证据 vs kubectl 黑盒边界
+## 九、K9s 源码证据 vs kubectl 黑盒边界
 
-### 7.1 源码证据边界表
+### 9.1 源码证据边界表
 
 | 功能模块 | K9s 源码中有证据 | kubectl 黑盒推断 | 代码位置 |
 |---------|-----------------|-----------------|----------|
-| 挂起 K9s UI | ✅ | ❌ | [run()](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L99-L122) |
+| 挂起 K9s UI | ✅ | ❌ | `internal/view/exec.go#L99-L122` |
 | 挂起终端到原始模式 | ✅ | ❌ | `a.Suspend()`（tview 库） |
-| 查找 kubectl 路径 | ✅ | ❌ | [runK()](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L57-L97) |
-| 注入 --as/--context 等参数 | ✅ | ❌ | [runK()](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L57-L97) |
-| K9S_EDITOR → KUBE_EDITOR 注入 | ✅ | ❌ | [execute()](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L203-L214) |
-| stdin/stdout/stderr 直通终端 | ✅ | ❌ | [pipe()](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L554-L595) |
+| 查找 kubectl 路径 | ✅ | ❌ | `internal/view/exec.go#L57-L97` |
+| 注入 --as/--context 等参数 | ✅ | ❌ | `internal/view/exec.go#L57-L97` |
+| K9S_EDITOR → KUBE_EDITOR 注入 | ✅ | ❌ | `internal/view/exec.go#L203-L214` |
+| stdin/stdout/stderr 直通终端 | ✅ | ❌ | `internal/view/exec.go#L554-L595` |
 | 等待进程退出 + 收集退出码 | ✅ | ❌ | `cmd.Run()` in pipe() |
 | 恢复 K9s UI 和终端 | ✅ | ❌ | `defer a.Resume()` in run() |
 | 从 API Server GET 资源 | ❌ | ✅ | kubectl 内部（edit 命令） |
@@ -669,7 +788,7 @@ func (y *YAML) refresh(ctx context.Context) error {
 | 版本冲突处理 + 提示 | ❌ | ✅ | kubectl 内部（edit 命令） |
 | 删除临时文件 | ❌ | ✅ | kubectl 内部 |
 
-### 7.2 关键边界结论
+### 9.2 关键边界结论
 
 1. **k9s 不读取 kubectl 产生的任何临时文件**
 2. **k9s 不解析或处理编辑后的 YAML 内容**
@@ -679,15 +798,15 @@ func (y *YAML) refresh(ctx context.Context) error {
 
 ---
 
-## 八、关键数据流转图
+## 十、关键数据流转图
 
-### 8.1 资源编辑（kubectl edit）链路
+### 10.1 资源编辑（kubectl edit）链路
 
 ```
 用户按 'e' 编辑 K8s 资源
     │
     ▼
-[workload.go:172 / live_view.go:182] editCmd()
+[workload.go / live_view.go] editCmd()
     │  取 path → 解析 gvr, fqn
     ▼
 [browser.go:533] editRes(app, gvr, fqn)
@@ -747,13 +866,13 @@ app.Resume() → K9s UI 恢复
 刷新资源列表，显示最新状态
 ```
 
-### 8.2 本地文件编辑（edit 函数）链路
+### 10.2 本地文件编辑（edit 函数）链路
 
 ```
 用户在 ScreenDump/Dir 页按 e 编辑本地文件
     │
     ▼
-[screen_dump.go:53 / dir.go:135] 调用 edit(app, opts{args: [localPath]})
+[screen_dump.go / dir.go] 调用 edit(app, opts{args: [localPath]})
     │
     ▼
 [exec.go:124] edit(a *App, opts)   ★ 注意：不是 editRes！
@@ -786,24 +905,24 @@ K9s UI 恢复
 
 ---
 
-## 九、安全与设计要点
+## 十一、安全与设计要点
 
-### 9.1 安全设计
+### 11.1 安全设计
 
 | 措施 | 位置 | 说明 |
 |------|------|------|
-| Patch 权限检查 | [browser.go:544](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/browser.go#L544) | 编辑前检查 `PatchAccess`，不是 `UpdateAccess` |
-| 文件权限 0600 | [yaml.go:80](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/yaml.go#L80) | 本地保存的 YAML 仅所有者可读写 |
-| Secret 默认编码 | [model/yaml.go:209-L211](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/model/yaml.go#L209-L211) | Secret 不解码，用户按 `X` 手动切换 |
-| 只读模式 | [live_view.go:160-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/live_view.go#L160-L162) | `IsReadOnly()` 时不注册 `E` 键绑定 |
-| ManagedFields 默认隐藏 | [helpers.go:92-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/helpers.go#L92-L94) | 避免大段管理字段干扰阅读，`M` 键切换 |
+| Patch 权限检查 | `internal/view/browser.go#L544` | 编辑前检查 `PatchAccess`，不是 `UpdateAccess` |
+| 文件权限 0600 | `internal/view/yaml.go#L80` | 本地保存的 YAML 仅所有者可读写 |
+| Secret 默认编码 | `internal/model/yaml.go#L209-L211` | Secret 不解码，用户按 `X` 手动切换 |
+| 只读模式 | `internal/view/live_view.go#L160-L162` | `IsReadOnly()` 时不注册 `E` 键绑定 |
+| ManagedFields 默认隐藏 | `internal/dao/helpers.go#L92-L94` | 避免大段管理字段干扰阅读，`M` 键切换 |
 
-### 9.2 并发控制
+### 11.2 并发控制
 
 - YAML Model 刷新：`atomic.CompareAndSwapInt32(&inUpdate, 0, 1)` 防并发刷新（仅 UI 内部去抖）
 - 后台刷新协程：`context.WithCancel` + select，退出时及时释放
 
-### 9.3 扩展点
+### 11.3 扩展点
 
 1. **K9S_EDITOR 环境变量**：支持带参数，如 `K9S_EDITOR="code -w"`
 2. **`EncDecResourceViewer` 接口**：Secret 解码的扩展点
@@ -811,20 +930,20 @@ K9s UI 恢复
 
 ---
 
-## 十、总结表
+## 十二、总结表
 
 | 功能 | 实现方式 | 处理主体 | 代码位置 |
 |------|----------|----------|----------|
-| 资源描述 | kubectl describer | k9s 调用 kubectl 包 | [describe.go](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/describe.go) |
-| YAML 读取 | K8s YAMLPrinter | k9s 调用 k8s 包 | [helpers.go:85](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/helpers.go#L85) |
-| K8s 资源编辑 | kubectl edit 子进程 | **kubectl**（k9s 只挂起终端） | [editRes](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/browser.go#L533) → [runK](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L57) |
-| 本地文件编辑 | exec 拉起编辑器 | **k9s** 自己查环境变量 | [edit 函数](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L124) |
-| K9S_EDITOR → kubectl | 子进程 Env 设置 KUBE_EDITOR | k9s 中转 | [execute:203-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L203-L214) |
-| K9S_EDITOR 注入范围 | **所有经过 execute() 的命令**（包括非 kubectl） | k9s（无条件） | [execute:203-L214](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L203-L214) |
+| 资源描述 | kubectl describer 包（Go 库） | k9s 调用 Go 库 | `internal/dao/describe.go` |
+| YAML 读取 | K8s YAMLPrinter（Go 库） | k9s 调用 Go 库 | `internal/dao/helpers.go#L85` |
+| K8s 资源编辑 | kubectl edit 子进程 | **kubectl**（k9s 只挂起终端） | `internal/view/browser.go#L533` → `internal/view/exec.go#L57` |
+| 本地文件编辑 | exec 拉起编辑器 | **k9s** 自己查环境变量 | `internal/view/exec.go#L124` |
+| K9S_EDITOR → kubectl | 子进程 Env 设置 KUBE_EDITOR | k9s 中转 | `internal/view/exec.go#L203-L214` |
+| K9S_EDITOR 注入范围 | **所有经过 execute() 的命令**（包括非 kubectl） | k9s（无条件） | `internal/view/exec.go#L203-L214` |
 | KUBE_EDITOR/EDITOR 查找（资源编辑时） | kubectl 内部实现 | **kubectl** | kubectl 源码（不在 k9s 中） |
-| KUBE_EDITOR/EDITOR 查找（本地文件时） | k9s 遍历 env vars | **k9s** | [edit:129-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/exec.go#L129-L152) |
+| KUBE_EDITOR/EDITOR 查找（本地文件时） | k9s 遍历 env vars | **k9s** | `internal/view/exec.go#L129-L152` |
 | 版本冲突处理（kubectl edit 时） | resourceVersion 比对 + 提示 | **kubectl**（k9s 零参与） | kubectl 源码（不在 k9s 中） |
-| 本地 YAML 保存 | os.OpenFile + 0600 | k9s | [saveYAML](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/view/yaml.go#L72) |
-| K9s 内部 Patch 冲突处理 | 无，直接透传错误 | k9s（无重试） | [restartRes](file:///d:/fz/0601-2/solo-dogfeeding/code/16-k9s/internal/dao/dp.go#L398) |
+| 本地 YAML 保存 | os.OpenFile + 0600 | k9s | `internal/view/yaml.go#L72` |
+| K9s 内部 Patch 冲突处理 | 无，直接透传错误 | k9s（无重试） | `internal/dao/dp.go#L398` |
 
 **核心设计哲学**：编辑 K8s 资源时，k9s 的角色是「**透明的终端切换器**」—— 把终端交给 kubectl，等 kubectl 跑完再把终端切回来。编辑器选择、YAML 读写、版本比对、冲突处理、API 请求，**全部由 kubectl 完成**，k9s 完全不介入。
