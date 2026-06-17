@@ -272,6 +272,13 @@ Screen dump 目录有三个配置来源，按优先级从低到高：
 在 [root.go#L133-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L133-L178) 的 `loadConfiguration()` 中，按以下顺序执行：
 
 ```
+步骤0: init() 函数执行                ← root.go#L55-L67
+    ↓  NewFlags() → ScreenDumpDir = &AppDumpsDir
+    ↓  initK9sFlags() 注册 StringVar，pflag 默认值为 ""
+    ↓  cobra.Execute() 解析命令行参数
+    ├─  用户未指定 --screen-dump-dir → *ScreenDumpDir = ""（覆盖！）
+    └─  用户指定了 → *ScreenDumpDir = 用户值
+
 步骤1: config.InitLocs()                     ← root.go#L77
     ↓  初始化 AppDumpsDir 全局变量（系统默认值）
 步骤2: NewK9s()                               ← config.go#L34
@@ -280,11 +287,14 @@ Screen dump 目录有三个配置来源，按优先级从低到高：
     ↓  从 YAML 文件读取 screenDumpDir 字段
     ↓  通过 Merge() 覆盖 K9s.ScreenDumpDir    ← k9s.go#L140
 步骤4: k9sCfg.K9s.Override(k9sFlags)          ← root.go#L149
-    ↓  如果命令行指定了 --screen-dump-dir
-    ↓  存入 K9s.manualScreenDumpDir           ← k9s.go#L348
+    ↓  k.manualScreenDumpDir = k9sFlags.ScreenDumpDir  ← 无条件赋值指针
+    ├─  用户未指定 → 指向的值为 ""
+    └─  用户指定了 → 指向的值为用户路径
 步骤5: k9sCfg.Refine()                        ← root.go#L150
     ↓  调用 AppScreenDumpDir() 确定最终目录
-    ↓  并确保该目录存在                         ← config.go#L146
+    ├─  isStringSet(manualScreenDumpDir) 判断
+    ├─  命令行非空则覆盖，否则用配置文件值
+    └─  确保最终目录存在                         ← config.go#L146
 ```
 
 ### 4.3 来源一：系统默认 `AppDumpsDir`
@@ -349,7 +359,7 @@ func (k *K9s) Merge(k1 *K9s) {
 rootCmd.Flags().StringVar(
     k9sFlags.ScreenDumpDir,
     "screen-dump-dir",
-    "",                          // 默认值为空字符串
+    "",                          // pflag 默认值为空字符串 ← 关键！
     "Sets a path to a dir for a screen dumps",
 )
 ```
@@ -360,25 +370,41 @@ rootCmd.Flags().StringVar(
 func NewFlags() *Flags {
     return &Flags{
         // ...
-        ScreenDumpDir: strPtr(AppDumpsDir),  // 默认值是 AppDumpsDir！
+        ScreenDumpDir: strPtr(AppDumpsDir),  // NewFlags 默认值是 AppDumpsDir
     }
 }
 ```
+
+**关键细节 - pflag 的值覆盖行为**：
+
+pflag 的 `StringVar` 工作方式是：
+- 它接收一个指针 `p *string` 和默认值 `value`
+- 在命令行解析阶段，**如果用户没有指定该标志**，它会将 `*p` 设置为 `value`（即 `""`）
+- 如果用户指定了，它会将 `*p` 设置为用户输入的值
+
+**执行时序**：
+
+```
+1. NewFlags() 执行                    → *ScreenDumpDir = AppDumpsDir（非空）
+2. initK9sFlags() 注册 StringVar     → pflag 记住这个指针和默认值 ""
+3. 命令行解析阶段（cobra.Execute）    → 如果用户未指定，*ScreenDumpDir = ""（覆盖！）
+                                          如果用户指定了，*ScreenDumpDir = 用户值
+```
+
+所以 `NewFlags()` 中设置的 `AppDumpsDir` 实际上会被 pflag **覆盖**，它只在注册标志时作为指针的初始值存在。
 
 **注入到 K9s 配置**：[k9s.go#L348](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go#L348)
 
 ```go
 func (k *K9s) Override(k9sFlags *Flags) {
     // ...
-    k.manualScreenDumpDir = k9sFlags.ScreenDumpDir
+    k.manualScreenDumpDir = k9sFlags.ScreenDumpDir  // 无条件赋值指针
 }
 ```
 
-**关键细节**：`Override()` 是无条件赋值，不区分用户是否实际在命令行指定了该标志。这意味着：
-- 如果用户**未指定** `--screen-dump-dir`：`k9sFlags.ScreenDumpDir` 的值是 `NewFlags()` 中设置的 `AppDumpsDir`（非空）
-- 如果用户**指定了** `--screen-dump-dir /my/path`：`k9sFlags.ScreenDumpDir` 的值是 `/my/path`
-
-两者都会被存入 `k.manualScreenDumpDir`。
+`Override()` 是无条件赋值，但此时 `*k9sFlags.ScreenDumpDir` 的值已经是 pflag 解析后的结果：
+- 如果用户**未指定** `--screen-dump-dir`：值为 `""`（空字符串）
+- 如果用户**指定了** `--screen-dump-dir /my/path`：值为 `"/my/path"`
 
 ### 4.6 `AppScreenDumpDir()` 的回退逻辑
 
@@ -387,9 +413,9 @@ func (k *K9s) Override(k9sFlags *Flags) {
 ```go
 func (k *K9s) AppScreenDumpDir() string {
     d := k.ScreenDumpDir                    // 来源：配置文件或默认值
-    if isStringSet(k.manualScreenDumpDir) { // 来源：命令行
+    if isStringSet(k.manualScreenDumpDir) { // 来源：命令行（仅当用户实际指定时）
         d = *k.manualScreenDumpDir
-        k.ScreenDumpDir = d                 // 回写到 ScreenDumpDir
+        k.ScreenDumpDir = d                 // 回写到 ScreenDumpDir 确保一致性
     }
     if d == "" {                            // 兜底：系统默认
         d = AppDumpsDir
@@ -403,9 +429,21 @@ func (k *K9s) AppScreenDumpDir() string {
 
 ```go
 func isStringSet(s *string) bool {
-    return s != nil && *s != ""
+    return s != nil && *s != ""  // 指针非空 且 指向的值非空
 }
 ```
+
+**关键判断逻辑**：
+
+当用户**未指定** `--screen-dump-dir` 时：
+- `*k.manualScreenDumpDir = ""`（pflag 默认值）
+- `isStringSet("")` → `s != nil` 为 `true`，`*s != ""` 为 `false` → 返回 `false`
+- 不覆盖，使用配置文件值（如果有）
+
+当用户**指定了** `--screen-dump-dir /my/path` 时：
+- `*k.manualScreenDumpDir = "/my/path"`（用户输入）
+- `isStringSet("/my/path")` → `true` → 返回 `true`
+- 覆盖为命令行值
 
 **完整决策流程图**：
 
@@ -415,9 +453,9 @@ AppScreenDumpDir()
 d = k.ScreenDumpDir          ← 配置文件值（或 NewK9s 的默认值 AppDumpsDir）
     ↓
 isStringSet(k.manualScreenDumpDir)?
-    ├─ YES → d = *k.manualScreenDumpDir     ← 命令行值覆盖
-    │         k.ScreenDumpDir = d             ← 回写确保一致性
-    └─ NO  → d 不变（使用配置文件值）
+    ├─ YES（用户指定了命令行）→ d = *k.manualScreenDumpDir  ← 命令行值覆盖
+    │                           k.ScreenDumpDir = d          ← 回写确保一致性
+    └─ NO（用户未指定命令行） → d 不变（使用配置文件值）
     ↓
 d == "" ?
     ├─ YES → d = AppDumpsDir                ← 系统默认兜底
@@ -428,21 +466,31 @@ return d
 
 ### 4.7 实际场景下的目录确定
 
-| 场景 | 配置文件 | 命令行 | `k.ScreenDumpDir` | `k.manualScreenDumpDir` | 最终目录 |
-|-----|---------|--------|--------------------|-----------------------|---------|
-| 全部默认 | 未设置 | 未指定 | `AppDumpsDir` | `AppDumpsDir`（非空） | **命令行值** = `AppDumpsDir` |
-| 仅配置文件 | `/my/dumps` | 未指定 | `/my/dumps` | `AppDumpsDir`（非空） | **命令行值** = `AppDumpsDir` ❗ |
-| 仅命令行 | 未设置 | `/my/dumps` | `AppDumpsDir` | `/my/dumps` | **命令行值** = `/my/dumps` |
-| 两者都设置 | `/cfg/dumps` | `/cli/dumps` | `/cfg/dumps` | `/cli/dumps` | **命令行值** = `/cli/dumps` |
-| 命令行空字符串 | `/my/dumps` | `--screen-dump-dir ""` | `/my/dumps` | `""` | `isStringSet("") = false` → **配置文件值** = `/my/dumps` |
-| 配置文件空字符串 | `""` | 未指定 | `""` | `AppDumpsDir`（非空） | **命令行值** = `AppDumpsDir` |
-| 全空 | `""` | `--screen-dump-dir ""` | `""` | `""` | `isStringSet("") = false` → `d == ""` → **系统默认** = `AppDumpsDir` |
+| 场景 | 配置文件 | 命令行 | `k.ScreenDumpDir` | `*k.manualScreenDumpDir` | `isStringSet` | 最终目录 | 说明 |
+|-----|---------|--------|--------------------|-------------------------|--------------|---------|------|
+| 全部默认 | 未设置 | 未指定 | `AppDumpsDir` | `""` | `false` | `AppDumpsDir` | 配置文件值就是 AppDumpsDir |
+| 仅配置文件 | `/my/dumps` | 未指定 | `/my/dumps` | `""` | `false` | `/my/dumps` | ✅ 配置文件生效 |
+| 仅命令行 | 未设置 | `/my/dumps` | `AppDumpsDir` | `/my/dumps` | `true` | `/my/dumps` | 命令行覆盖默认值 |
+| 两者都设置 | `/cfg/dumps` | `/cli/dumps` | `/cfg/dumps` | `/cli/dumps` | `true` | `/cli/dumps` | 命令行优先级更高 |
+| 命令行空字符串 | `/my/dumps` | `--screen-dump-dir ""` | `/my/dumps` | `""` | `false` | `/my/dumps` | 空字符串视为未设置，配置文件生效 |
+| 配置文件空字符串 | `""` | 未指定 | `""` | `""` | `false` | `AppDumpsDir` | 兜底到系统默认 |
+| 全空 | `""` | `--screen-dump-dir ""` | `""` | `""` | `false` | `AppDumpsDir` | 兜底到系统默认 |
 
-**重要发现**：由于 `NewFlags()` 中 `ScreenDumpDir` 默认值是 `AppDumpsDir`（非空），且 `Override()` 无条件赋值，`manualScreenDumpDir` 在**用户未指定命令行标志时也是非空的**。这意味着 `isStringSet(k.manualScreenDumpDir)` 始终为 `true`，**命令行标志始终"覆盖"配置文件值**——即使它们值相同。
+**正确的优先级关系**：
 
-实际效果：当用户未指定 `--screen-dump-dir` 时，`manualScreenDumpDir` 的值就是 `AppDumpsDir`，它会在 `AppScreenDumpDir()` 中"覆盖" `ScreenDumpDir`，并将 `ScreenDumpDir` 回写为 `AppDumpsDir`。如果配置文件指定了自定义目录，该值会被覆盖回 `AppDumpsDir`。
+1. **命令行 `--screen-dump-dir`（非空值）** - 最高优先级，仅当用户实际传入非空值时生效
+2. **配置文件 `k9s.screenDumpDir`** - 中优先级，用户未指定命令行时生效
+3. **系统默认 `AppDumpsDir`** - 最低优先级，兜底使用
 
-**这是一个潜在的 bug**：配置文件的 `screenDumpDir` 设置在用户未指定命令行标志时会被忽略，因为命令行默认值（`AppDumpsDir`）始终通过 `Override()` 注入并"覆盖"了它。
+**与其他标志的行为差异**：
+
+值得注意的是 `--log-file` 标志的行为不同。在 [flags.go#L39](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/flags.go#L39) 中：
+- `LogFile: strPtr(AppLogFile)` - NewFlags 默认值
+- 但在 `initK9sFlags()` 中，`LogFile` **没有**注册 `StringVar`（看 [root.go#L267-L272](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L267-L272)）
+- 所以 `LogFile` 的值不会被 pflag 覆盖，始终是 `AppLogFile`
+- 在 `run()` 中直接使用 `*k9sFlags.LogFile`（[root.go#L81](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/cmd/root.go#L81)）
+
+而 `--screen-dump-dir` 注册了 `StringVar`，所以会被 pflag 管理和覆盖。这是两种不同的设计模式。
 
 ### 4.8 `ContextScreenDumpDir()` - 上下文子目录
 
