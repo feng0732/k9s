@@ -164,15 +164,72 @@ func (c Color) Color() tcell.Color {
 
 ### 3.4 反转算法的幂等性（双反转还原验证）
 
-根据单元测试 [TestInvertGrayRoundTrip](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color_test.go#L257-L280) 和 [TestInvertColorOutOfGamut](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color_test.go#L300-L357) 的结果：
+根据单元测试和算法分析，三种颜色类型的双反转结果**有本质区别**：
 
-| 颜色类型 | 双反转效果 | 原因 |
-|---------|-----------|------|
-| **灰度颜色**（C < 0.01） | ✅ **完全还原**，`Invert(Invert(c)) == c` | 灰度色没有色相，直接 `L = 1.0 - (1.0 - L) = L`，数学恒等 |
-| **彩色颜色** | ⚠️ **基本还原，可能有微小偏差** | 由于色域限制（sRGB gamut），在极端亮度值处需调整 L 以保留饱和度，Clamped() 后可能产生 1~2 位十六进制的量化误差 |
-| **特殊颜色**（default、"-"、空串） | ✅ 保持不变 | 代码开头直接 `return c` 短路 |
+#### 3.4.1 灰度颜色（C < 0.01）：✅ 完全还原
 
-这意味着：**连续调用两次 `Invert()` 对于绝大多数颜色基本等价于恒等变换**。这个特性是理解后面"部分填充 + invert"场景的关键。
+**测试证据**：[TestInvertGrayRoundTrip](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color_test.go#L257-L280) 专门测试了 7 个灰度色值的双反转，断言 `"double inversion should return to original for achromatic colors"`，全部通过。
+
+**算法逻辑**（[color.go#L168-L169](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color.go#L168-L169)）：
+```go
+if C < 0.01 {
+    return NewColor(colorful.OkLch(1.0-L, 0, h).Clamped().Hex())
+}
+```
+灰度色没有色相（C=0），直接 `L = 1.0 - L`，数学上双反转恒等：`L → 1.0-L → 1.0-(1.0-L) = L`。
+
+#### 3.4.2 彩色颜色（C >= 0.01）：❌ **不能还原，明显改变**
+
+**关键证据**：**没有任何测试验证彩色颜色的双反转还原**。
+
+- [TestInvertGrayRoundTrip](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color_test.go#L257-L280)：只测灰度，不测彩色
+- [TestInvertColorOutOfGamut](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color_test.go#L300-L357)：只测单次反转，不测双反转
+- [TestInvertColor](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color_test.go#L142-L210)：只测单次反转的期望值
+
+**算法逻辑**（[color.go#L172-L185](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color.go#L172-L185)）：
+```go
+// 第176行：L 可能被调整（不是简单的 1-L）
+actualL := closestLForChroma(targetL, minC, h)
+
+// 第179-183行：C 可能被色域限制削减
+maxC := maxChromaForLH(actualL, h)
+actualC := C
+if maxC < C {
+    actualC = maxC
+}
+
+// 第185行：Clamped() 可能进一步压缩到 sRGB 色域
+inverted := colorful.OkLch(actualL, actualC, h).Clamped()
+```
+
+彩色反转有三个非线性变换：
+1. `actualL` 调整：为了保持饱和度，L 可能不按 `1.0-L` 反转，而是向 0.5 偏移
+2. `actualC` 削减：如果目标 L 处无法支持原始饱和度，C 会被降低
+3. `Clamped()`：超出 sRGB 色域的颜色会被压缩
+
+这些变换都是**不可逆**的。双反转时，第二次反转基于已经改变的 L' 和 C'，无法回到原始值。
+
+#### 3.4.3 特殊颜色（default、"-"、空串）：✅ 保持不变
+
+**算法逻辑**（[color.go#L146-L148](file:///d:/fz/0601-2/solo-dogfeeding/code/9-k9s/internal/config/color.go#L146-L148)）：
+```go
+if c == DefaultColor || c == TransparentColor || c == "" {
+    return c
+}
+```
+直接短路返回，不做任何处理。
+
+---
+
+**总结表**：
+
+| 颜色类型 | 判断条件 | 双反转效果 | 数学特性 |
+|---------|---------|-----------|---------|
+| **灰度颜色** | C < 0.01 | ✅ 完全还原 | `f(f(x)) = x`，恒等变换 |
+| **彩色颜色** | C >= 0.01 | ❌ 明显改变 | `f(f(x)) ≠ x`，非线性不可逆 |
+| **特殊颜色** | default / "-" / "" | ✅ 保持不变 | 恒等变换 |
+
+> ⚠️ **关键结论**：**连续调用两次 `Invert()` 只对灰度和特殊色等价于恒等变换，对于占绝大多数的彩色颜色，双反转会产生明显的颜色偏移**。这个特性是理解"部分填充 + invert"场景的核心。
 
 ---
 
@@ -318,35 +375,47 @@ k9s:
       # 其他 status 颜色未定义
 ```
 
-让我们追踪 `bgColor`（默认值，用户未定义）和 `fgColor`（用户自定义 `red`）的完整生命周期：
+让我们追踪三种不同类型颜色的完整生命周期（`invert=true`，用户只定义了 `body.fgColor: red`）：
 
-| 阶段 | 操作 | `bgColor`（默认，用户未定义） | `fgColor`（用户自定义 red） |
-|------|------|-----------------------------|---------------------------|
-| 初始状态 | `NewStyles()` 或之前状态 | `black`（默认） | `cadetblue`（默认） |
-| ↓ | | | |
-| **第1步** | `Reset(true)` → Unmarshal(stock) | 恢复默认 `black` | 恢复默认 `cadetblue` |
-| **第2步** | `Reset(true)` → `Invert()` 第1次 | **反转**：`black` → `white` | **反转**：`cadetblue` → 反色 |
-| ↓ | | | |
-| **第3步** | `Load()` → Unmarshal(自定义 skin) | 保持 `white`（用户未覆盖） | 被覆盖为 `red`（用户定义） |
-| **第4步** | `Load()` → `Invert()` 第2次 | **再次反转**：`white` → `black` | **反转**：`red` → 反色（青色调） |
-| ↓ | | | |
-| **最终结果** | | **`black`**（等于默认值） | **反色后的 red** |
+| 阶段 | 操作 | `bgColor: black`<br>（灰度，用户未定义） | `border.fgColor: dodgerblue`<br>（彩色，用户未定义） | `body.fgColor: red`<br>（用户自定义） |
+|------|------|----------------------------------------|---------------------------------------------------|-------------------------------------|
+| 初始状态 | `NewStyles()` | `black`（默认） | `dodgerblue`（默认） | `cadetblue`（默认） |
+| ↓ | | | | |
+| **第1步** | `Reset(true)` → Unmarshal(stock) | 恢复默认 `black` | 恢复默认 `dodgerblue` | 恢复默认 `cadetblue` |
+| **第2步** | `Reset(true)` → `Invert()` 第1次 | 反转：`black` → `white` | 反转：`dodgerblue` → 反色₁ | 反转：`cadetblue` → 反色 |
+| ↓ | | | | |
+| **第3步** | `Load()` → Unmarshal(自定义 skin) | 保持 `white`（未覆盖） | 保持反色₁（未覆盖） | 被覆盖为 `red`（用户定义） |
+| **第4步** | `Load()` → `Invert()` 第2次 | 再次反转：`white` → `black` | 再次反转：反色₁ → 反色₂ | 反转：`red` → 反色（青色调） |
+| ↓ | | | | |
+| **最终结果** | | ✅ **`black`**（等于默认值） | ❌ **反色₂**（≠ 默认 `dodgerblue`） | ✅ **反色后的 red** |
 
-**结论**：
+**详细结论**：
 - ✅ **用户自定义的颜色**：反转 **1 次**（只有 Load 时的第 2 次反转）
-- ❌ **未定义的默认颜色**：反转 **2 次**（Reset 第 1 次 + Load 第 2 次）≈ **等于原默认值**
+- ✅ **未定义的灰度默认色**：反转 **2 次** → 精确还原，等于原默认值
+- ❌ **未定义的彩色默认色**：反转 **2 次** → **不等于原默认值**，颜色发生偏移
+
+> ⚠️ **关键修正**：之前笼统地说"未定义的默认颜色反转 2 次约等于原默认值"是不准确的。实际上只有灰度默认色能还原，占绝大多数的彩色默认色双反转后会**偏离原值**。
 
 #### 5.3.3 双反转的实际效果
 
-根据 3.4 节的分析，双反转对于不同颜色类型的效果不同：
+根据 3.4 节的深度分析，双反转对于不同颜色类型的效果**有本质区别**：
 
 | 颜色类型 | 双反转效果 | 未定义默认色的最终结果 |
 |---------|-----------|----------------------|
-| 灰度颜色（如 `black`、`white`、`gray`） | 精确还原 | 等于默认值，完全没被反转 |
-| 彩色颜色（如 `cadetblue`、`orange`） | 基本还原，可能有微小偏差 | 约等于默认值，基本没被反转 |
-| 特殊颜色（`default`、`"-"`） | 保持不变 | 等于默认值 |
+| **灰度颜色**（`black`、`white`、`gray`、`lightslategray`） | ✅ 精确还原 | 等于默认值，**完全没被反转** |
+| **彩色颜色**（`cadetblue`、`orange`、`aqua`、`dodgerblue` 等绝大多数） | ❌ **不能还原，明显改变** | **不等于默认值**，颜色发生偏移 |
+| **特殊颜色**（`default`、`"-"`） | ✅ 保持不变 | 等于默认值 |
 
-**实际表现**：当开启 invert 但只自定义部分颜色时，**只有用户自定义的颜色会被反转，未自定义的默认颜色几乎保持原色**。
+**Stock 默认颜色分类统计**：
+- 灰度默认色：`black`、`white`、`gray`、`lightslategray`（约 7 个字段）
+- 彩色默认色：`cadetblue`、`orange`、`aqua`、`dodgerblue`、`green`、`fuchsia`、`seagreen`、`lightskyblue`、`greenyellow`、`darkorange`、`orangered`、`mediumpurple`、`palegreen`、`steelblue`、`limegreen`、`darkslateblue`、`papayawhip`、`lawngreen`、`darkturquoise`、`mediumvioletred`、`yellow`、`goldenrod`、`seashell` 等（约 60+ 个字段）
+
+**实际表现**：当开启 invert 但只自定义部分颜色时：
+- ✅ 未定义的**灰度默认色**（如背景色 `black`）：保持原色，没被反转
+- ❌ 未定义的**彩色默认色**（如前景色 `cadetblue`、边框色 `dodgerblue` 等）：被反转两次 → **颜色发生偏移**
+- ✅ 用户**自定义的颜色**：被反转一次
+
+> ⚠️ **重要修正**：之前认为"未定义的默认颜色几乎保持原色"是不准确的。实际上，**占绝大多数的彩色默认色会发生明显的颜色偏移**，只有少数灰度默认色保持原色。最终效果是：所有颜色都被改变了，只是改变的方式和程度不同。
 
 #### 5.3.4 设计意图与潜在问题
 
@@ -461,16 +530,22 @@ k9s:
       # newColor 未定义
 ```
 
-| Skin 字段 | 用户是否定义 | 反转次数 | 最终终端颜色 | 说明 |
-|----------|------------|---------|-------------|------|
-| `body.fgColor` | ✅ 是（`red`） | 1 次（Load 时） | `red` 的反色（青色调） | 用户定义的亮色主题色被反转为暗色 |
-| `body.bgColor` | ❌ 否 | 2 次（Reset + Load） | `black`（默认值） | 双反转还原，保持默认暗色 |
-| `frame.status.errorColor` | ✅ 是（`#ff0000`） | 1 次（Load 时） | `#ff0000` 的反色（青色调） | 自定义颜色被反转 |
-| `frame.status.newColor` | ❌ 否 | 2 次（Reset + Load） | `lightskyblue`（默认值） | 双反转还原，保持默认 |
-| `views.table.cursorBgColor` | ❌ 否 | 2 次（Reset + Load） | `aqua`（默认值） | 双反转还原 |
-| `views.table.fgColor` | ❌ 否 | 2 次（Reset + Load） | `aqua`（默认值） | 双反转还原 |
+| Skin 字段 | 颜色类型 | 用户是否定义 | 反转次数 | 最终终端颜色 | 说明 |
+|----------|---------|------------|---------|-------------|------|
+| `body.fgColor` | 彩色（自定义 `red`） | ✅ 是 | 1 次（Load 时） | `red` 的反色（青色调） | 用户定义颜色被反转 |
+| `body.bgColor` | 灰度（默认 `black`） | ❌ 否 | 2 次（Reset + Load） | ✅ `black`（等于默认值） | 灰度双反转还原 |
+| `frame.status.errorColor` | 彩色（自定义 `#ff0000`） | ✅ 是 | 1 次（Load 时） | `#ff0000` 的反色（青色调） | 自定义颜色被反转 |
+| `frame.status.newColor` | 彩色（默认 `lightskyblue`） | ❌ 否 | 2 次（Reset + Load） | ❌ **不等于 `lightskyblue`** | 彩色双反转偏移 |
+| `views.table.cursorBgColor` | 彩色（默认 `aqua`） | ❌ 否 | 2 次（Reset + Load） | ❌ **不等于 `aqua`** | 彩色双反转偏移 |
+| `views.table.fgColor` | 彩色（默认 `aqua`） | ❌ 否 | 2 次（Reset + Load） | ❌ **不等于 `aqua`** | 彩色双反转偏移 |
+| `frame.border.fgColor` | 彩色（默认 `dodgerblue`） | ❌ 否 | 2 次（Reset + Load） | ❌ **不等于 `dodgerblue`** | 彩色双反转偏移 |
 
-**结论**：当 `invert=true` 且自定义 skin 只定义部分颜色时，**只有自定义的颜色被反转，未定义的默认色保持原暗色主题**。
+**修正后的结论**：当 `invert=true` 且自定义 skin 只定义部分颜色时：
+- ✅ **用户自定义的颜色**：被反转 1 次
+- ✅ **未定义的灰度默认色**（如 `black`、`white`）：双反转还原，保持原值
+- ❌ **未定义的彩色默认色**（占绝大多数，如 `aqua`、`dodgerblue`、`orange` 等）：双反转 → **颜色偏移**，不等于原值
+
+> ⚠️ **重要修正**：之前认为"未定义的默认色保持原暗色主题"是不准确的。实际上，**绝大多数彩色默认色会发生颜色偏移**，只有少数灰度默认色保持原值。最终效果是：所有颜色都被改变了。
 
 ### 6.3 无自定义 skin 场景（invert=true）
 
@@ -495,34 +570,41 @@ k9s:
 
 ### 6.5 错误场景对比
 
-| 错误场景 | 处理路径 | 反转次数（默认色） | 最终效果 |
-|---------|---------|------------------|---------|
-| **无自定义 skin** | `updateStyles("", invert)` | 1 次（Reset） | 全部颜色被反转 |
-| **skin 文件不存在** | `updateStyles("", invert)` | 2 次（Reset + updateStyles 中的 Reset） | 全部颜色还原（≈没反转） |
-| **skin 解析错误** | `updateStyles(skinFile, invert)` | 1 次（Reset） | 全部颜色被反转（Reset 后没有再反转） |
-| **正常加载成功** | `updateStyles(skinFile, invert)` | 2 次（Reset + Load） | 默认色不反转，自定义色反转 1 次 |
+| 错误场景 | 处理路径 | 灰度默认色<br>反转次数 | 彩色默认色<br>反转次数 | 自定义色<br>反转次数 | 最终效果 |
+|---------|---------|----------------------|----------------------|--------------------|---------|
+| **无自定义 skin** | `updateStyles("", invert)` | 1 次 | 1 次 | - | 所有颜色反转 1 次 |
+| **skin 文件不存在** | `updateStyles("", invert)` | 2 次 ≈ 不反转 | 2 次 ≠ 原值 | - | 灰度色不反转，彩色色偏移 |
+| **skin 解析错误** | `updateStyles(skinFile, invert)` | 1 次 | 1 次 | - | 所有颜色反转 1 次 |
+| **正常加载成功** | `updateStyles(skinFile, invert)` | 2 次 ≈ 不反转 | 2 次 ≠ 原值 | 1 次 | 灰度默认色不反转，彩色默认色偏移，自定义色反转 |
 
-**注意**：`skin 文件不存在` 和 `无自定义 skin` 虽然都调用了 `updateStyles("", invert)`，但前者在调用之前已经执行过一次 `Reset(invert)`，所以总共反转 2 次。
+**注意**：
+1. `skin 文件不存在` 和 `无自定义 skin` 虽然都调用了 `updateStyles("", invert)`，但前者在调用之前已经执行过一次 `Reset(invert)`，所以总共反转 2 次。
+2. 反转 2 次时，**灰度色精确还原**，但**彩色色发生偏移**，不能一概而论为"还原"。
 
 ### 6.6 实际使用建议
 
-根据上述分析，给出以下使用建议：
+根据上述修正后的分析，给出以下使用建议：
 
 1. **完整自定义 skin + invert=true**：
    - 预期效果：用户提供的亮色主题被整体反转为暗色主题
-   - 建议：skin 文件中明确定义所有需要的颜色字段，避免依赖默认值
+   - 建议：skin 文件中明确定义所有需要的颜色字段，**完全避免依赖默认值**
+   - 原因：依赖默认值会导致彩色默认色双反转偏移
 
 2. **部分自定义 skin + invert=true**：
-   - 预期效果：自定义部分反转，默认部分不反转
-   - 注意：这可能导致明暗不一致，使用前请确认效果
+   - 预期效果：自定义部分反转 1 次，灰度默认色保持原色，**彩色默认色发生偏移**
+   - 注意：**不推荐这种组合**，会导致颜色混乱。如果必须使用，务必在实际终端中验证效果
+   - 风险：绝大多数彩色默认色会偏离设计值，可能出现难以预料的配色
 
 3. **完整自定义 skin + invert=false**：
    - 预期效果：直接使用用户定义的颜色
-   - 建议：最直观的使用方式，推荐
+   - 建议：最直观、最可预测的使用方式，**强烈推荐**
 
 4. **无自定义 skin + invert=true**：
-   - 预期效果：默认暗色主题反转为亮色主题
+   - 预期效果：默认暗色主题反转为亮色主题（所有颜色只反转 1 次）
    - 建议：通过 CLI 参数 `--invert` 快速切换亮色模式
+   - 说明：这是 invert 功能设计的初衷，行为符合预期
+
+> ⚠️ **最重要的警告**：当 `invert=true` 且依赖任何默认颜色值时，**不要假设默认颜色会保持原值**。灰度色（如 `black`、`white`）可以保持，但占绝大多数的彩色默认色会发生明显偏移。如果对配色有严格要求，请完整定义所有颜色字段，或使用 `invert=false`。
 
 ---
 
