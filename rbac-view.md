@@ -162,11 +162,121 @@ verbs: ["get", "list"]
 
 4. **ResourceName 字段的冗余**：`PolicyRes.ResourceName` 字段始终为空字符串，资源名被编码进 Resource 字段路径中。这意味着无法通过结构化字段区分"通配规则"和"资源名规则"，只能靠字符串模式推断。
 
-### 2.3 权限合并策略 - Upsert + Merge
+### 2.3 权限合并的三个层级
 
-#### Upsert 方法
+代码中存在三个不同层级的"合并"操作，它们的范围、触发条件和信息保留行为完全不同。必须精确区分才能判断来源信息何时保留、何时丢失。
 
-位于 [policy.go#L158-L172](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/render/policy.go#L158-L172)
+#### 层级一：parseRules 内部合并——同一角色的规则之间
+
+位于 [parseRules](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac.go#L151-L174)
+
+`parseRules` 接收**单个角色的所有 Rules**，在一个 `Policies` 列表内通过 `Upsert` 合并。
+
+```go
+func parseRules(ns, binding string, rules []rbacv1.PolicyRule) render.Policies {
+    pp := make(render.Policies, 0, len(rules))
+    for _, rule := range rules {
+        for _, grp := range rule.APIGroups {
+            for _, res := range rule.Resources {
+                for _, na := range rule.ResourceNames {
+                    pp = pp.Upsert(render.NewPolicyRes(ns, binding, FQN(res, na), grp, rule.Verbs))
+                }
+                pp = pp.Upsert(render.NewPolicyRes(ns, binding, FQN(grp, res), grp, rule.Verbs))
+            }
+        }
+    }
+    return pp
+}
+```
+
+**关键特征**：同一角色内，ns 和 binding 参数完全相同。
+
+**合并行为**：因为所有 PolicyRes 的 Namespace 和 Binding 都相同，即使 GR 匹配触发 Merge，Namespace 和 Binding 的值也不会丢失——先插入的和后插入的值相同。
+
+**何时触发 GR 匹配**：同一角色中，不同 PolicyRule 可能覆盖相同的 Group/Resource。例如：
+
+```yaml
+# Rule 1
+apiGroups: [""]
+resources: ["pods"]
+verbs: ["get", "list"]
+# Rule 2
+apiGroups: [""]
+resources: ["pods"]
+verbs: ["create"]
+```
+
+这两条 Rule 展开后 GR 都是 `"core/core/pods"`，Upsert 触发 Merge，Verbs 合并为 [get, list, create]。Namespace 和 Binding 不受影响。
+
+**结论**：✅ **层级一不会丢失来源信息**——同一角色内的合并，Namespace 和 Binding 始终相同。
+
+#### 层级二：loadClusterRoleBinding / loadRoleBinding 内部追加——不同角色之间
+
+`loadClusterRoleBinding` 和 `loadRoleBinding` 都在函数内维护一个 `rows render.Policies`，通过 `rows = append(rows, parseRules(...)...)` 追加不同角色的解析结果。
+
+**append 本身是纯追加**，不会触发合并。但 parseRules 返回的 Policies 内部已经过层级一的合并。追加后 rows 中可能存在 GR 相同但来自不同角色的 PolicyRes——**此时没有跨角色的 Upsert/Merge 调用**。
+
+```go
+// loadClusterRoleBinding
+rows := make(render.Policies, 0, len(nn))
+for i := range crs {
+    rows = append(rows, parseRules(client.NotNamespaced, "CR:"+crs[i].Name, crs[i].Rules)...)
+}
+return rows, nil
+```
+
+```go
+// loadRoleBinding
+rows := make(render.Policies, 0, len(crs))
+for i := range crs {
+    rows = append(rows, parseRules(rbNs, "CR:"+crs[i].Name, crs[i].Rules)...)
+}
+for i := range ros {
+    rows = append(rows, parseRules(ros[i].Namespace, "RO:"+ros[i].Name, ros[i].Rules)...)
+}
+return rows, nil
+```
+
+**关键特征**：`append` 是纯列表拼接，不调用 Upsert/Merge。不同角色的解析结果作为独立条目共存于同一个 Policies 列表中。
+
+**GR 冲突但未合并**：如果 ClusterRole/A 对 pods 有 [get] 且 ClusterRole/B 对 pods 有 [delete]，rows 中会存在两条 GR 相同的 PolicyRes：
+
+```
+rows[0] = {Namespace:"*", Binding:"CR:A", Resource:"core/pods", Verbs:[get]}
+rows[1] = {Namespace:"*", Binding:"CR:B", Resource:"core/pods", Verbs:[delete]}
+```
+
+**结论**：✅ **层级二保留来源信息**——append 不触发合并，不同角色生成独立的 PolicyRes 条目，各自保留自己的 Namespace 和 Binding。
+
+#### 层级三：List 方法汇总——跨绑定类型追加
+
+位于 [List](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L32-L60)
+
+```go
+func (p *Policy) List(ctx context.Context, _ string) ([]runtime.Object, error) {
+    crps, _ := p.loadClusterRoleBinding(kind, name)
+    rps, _  := p.loadRoleBinding(kind, name)
+
+    oo := make([]runtime.Object, 0, len(crps)+len(rps))
+    for _, p := range crps {
+        oo = append(oo, p)
+    }
+    for _, p := range rps {
+        oo = append(oo, p)
+    }
+    return oo, nil
+}
+```
+
+**关键特征**：这里将 Policies 转为 `[]runtime.Object`，是最终返回给视图层的数据。`append` 仍然是纯列表拼接。
+
+**结论**：✅ **层级三保留来源信息**——将 crps 和 rps 简单追加为 runtime.Object 列表，不触发合并。
+
+### 2.4 来源信息何时保留、何时丢失
+
+#### 2.4.1 合并机制的唯一入口：Upsert
+
+位于 [Upsert](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/render/policy.go#L158-L172)
 
 ```go
 func (pp Policies) Upsert(p *PolicyRes) Policies {
@@ -174,7 +284,7 @@ func (pp Policies) Upsert(p *PolicyRes) Policies {
     if !ok {
         return append(pp, p)
     }
-    p, err := pp[idx].Merge(p)  // 注意：返回值 p 是合并后的 pp[idx]
+    p, err := pp[idx].Merge(p)
     if err != nil {
         slog.Error("Policy upsert failed", slogs.Error, err)
         return pp
@@ -184,180 +294,86 @@ func (pp Policies) Upsert(p *PolicyRes) Policies {
 }
 ```
 
-#### Merge 方法 - 信息丢失的重灾区
+Upsert 只在 `parseRules` 内部被调用。**跨角色追加（层级二、层级三）使用的是原生 `append`，不经过 Upsert**。
 
-位于 [policy.go#L120-L133](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/render/policy.go#L120-L133)
+因此：**来源信息丢失只发生在 parseRules 内部的 Upsert/Merge 中，且仅当 GR 碰撞时。**
 
-```go
-func (p *PolicyRes) Merge(p1 *PolicyRes) (*PolicyRes, error) {
-    if p.GR() != p1.GR() {
-        return nil, fmt.Errorf("policy mismatch %s vs %s", p.GR(), p1.GR())
-    }
-    // ⚠️ 仅合并 Verbs，其他字段一律不处理
-    for _, v := range p1.Verbs {
-        if !p.hasVerb(v) {
-            p.Verbs = append(p.Verbs, v)
-        }
-    }
-    return p, nil
-}
-```
+#### 2.4.2 保留来源的精确场景
 
-#### 合并后 Binding/来源信息的保留与丢失
+| 场景 | 合并层级 | 是否丢失来源 | 原因 |
+|------|----------|-------------|------|
+| 同一角色内不同 Rule 覆盖同一 GR | 层级一（parseRules 内 Upsert） | ❌ 不丢失 | Namespace 和 Binding 相同 |
+| 不同 ClusterRole 对同一 GR 有权限 | 层级二（append 追加） | ❌ 不丢失 | append 不合并，各自独立 |
+| ClusterRoleBinding + RoleBinding 各有同 GR 权限 | 层级三（append 追加） | ❌ 不丢失 | append 不合并，各自独立 |
+| 同一角色内不同 Rule 对同 GR 授予不同 Verbs | 层级一（parseRules 内 Upsert） | ❌ 不丢失 | Namespace 和 Binding 相同 |
+| 不同 Role 对同一 GR 有权限 | 层级二（append 追加） | ❌ 不丢失 | append 不合并，各自独立 |
 
-**合并时的字段处理情况：**
+#### 2.4.3 丢失来源的精确场景
 
-| 字段 | 是否合并 | 行为 |
-|------|----------|------|
-| Verbs | ✅ 合并去重 | 将 p1 中不在 p 中的动词追加 |
-| Namespace | ❌ 不合并 | 保留先插入的 p 的值 |
-| Binding | ❌ 不合并 | 保留先插入的 p 的值 |
-| Resource | ❌ 不合并 | GR 匹配隐含 Resource 相同 |
-| Group | ❌ 不合并 | GR 匹配隐含 Group 相同 |
-| ResourceName | ❌ 不合并 | 始终为空 |
-| NonResourceURL | ❌ 不合并 | 始终为空 |
+来源丢失需要两个条件**同时**满足：
+1. **GR 碰撞**：两条 PolicyRes 的 `Group + "/" + Resource` 相同
+2. **在同一 Policies 列表内经过 Upsert**
 
-**信息丢失示例场景：**
+当前代码中，**这两个条件只在 parseRules 内部同一角色的规则之间才同时满足**，而此时 Namespace 和 Binding 参数相同，不会丢失。
 
-场景：主体 User/alice 通过两个 RoleBinding 分别获得不同角色对同一资源的权限
+**但是，存在一个隐含的 GR 碰撞路径**：同一角色内，PolicyRule 中有 ResourceNames 时，资源名规则和通配规则会生成不同的 Resource 字段值，导致不同的 GR，不会碰撞。然而，如果同一角色的两条 PolicyRule 分别以不同方式引用同一资源（如一条用 `apiGroups:[""]` + `resources:["pods"]`，另一条用 `apiGroups:[""]` + `resources:["pods"]` + `resourceNames:["my-pod"]`），它们的 GR 不同（`core/core/pods` vs `core/pods/my-pod`），不会碰撞。
+
+**结论：在当前代码的实际路径下，来源信息不会因 Merge 而丢失。**
+
+#### 2.4.4 界面呈现中来源信息"看起来丢失"的原因
+
+虽然 Merge 本身没有丢失来源信息，但用户在 Policy 视图中仍然可能看不到完整的来源，原因是**不同角色的同 GR 条目作为独立行共存**：
 
 ```
-RoleBinding/rb-1 → Role/reader (ns: default) → pods [get, list]
-RoleBinding/rb-2 → Role/writer (ns: default) → pods [create, patch]
+rows[0] = {Namespace:"*", Binding:"CR:admin", Resource:"core/pods", Verbs:[get,list]}
+rows[1] = {Namespace:"default", Binding:"RO:writer", Resource:"core/pods", Verbs:[create,patch]}
 ```
 
-在 Policy 视图中的聚合过程：
+这两行在视图中渲染为：
 
-```
-1. 先加载 parseRules("default", "RO:reader", ...)
-   → 生成 PolicyRes{Namespace:"default", Binding:"RO:reader", Resource:"core/pods", Verbs:[get,list]}
-   GR = "core/core/pods"
+| NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | CREATE | PATCH |
+|-----------|------|-----------|---------|-----|------|--------|-------|
+| * | pods | core | CR:admin | ✓ | ✓ | × | × |
+| default | pods | core | RO:writer | × | × | ✓ | ✓ |
 
-2. 再加载 parseRules("default", "RO:writer", ...)
-   → 生成 PolicyRes{Namespace:"default", Binding:"RO:writer", Resource:"core/pods", Verbs:[create,patch]}
-   GR = "core/core/pods" ← 相同！
+**来源信息完整保留**，用户可以看到两个不同的来源。但 Verbs 被分散到不同行，需要用户自行在脑中合并才能理解"对 pods 的完整权限是什么"。
 
-3. Upsert 触发 Merge
-   → pp[idx].Merge(p1)
-   → Verbs 合并为 [get, list, create, patch] ✅
-   → Binding 仍然是 "RO:reader" ❌ ("RO:writer" 信息完全丢失)
-   → Namespace 仍然是 "default" (刚好相同)
-```
+**与之前分析结论的修正**：之前认为"跨角色 Merge 会丢失 Binding 信息"，这是不准确的。跨角色追加使用的是 append 而非 Upsert，不会触发 Merge。来源信息实际是保留的，只是分散在不同行中。
 
-**最终界面显示：**
+### 2.5 同名角色误纳入问题（独立类别）
 
-| NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | CREATE | PATCH | ... |
-|-----------|------|-----------|---------|-----|------|--------|-------|-----|
-| default   | pods | core      | RO:reader | ✓ | ✓   | ✓     | ✓    | ... |
+此问题与合并/丢失无关，是**角色选择阶段的匹配缺陷**，属于独立的 Bug 类别。
 
-用户只能看到权限来自 `RO:reader`，完全不知道 `RO:writer` 也授予了该资源权限。**这是严重的信息丢失，会干扰权限溯源调试。**
-
-#### 跨命名空间同名资源的合并
-
-更极端的情况：
-
-```
-RoleBinding/rb-1 (ns: ns-a) → Role/admin → pods [get]
-RoleBinding/rb-2 (ns: ns-b) → Role/admin → pods [delete]
-```
-
-GR 匹配后的结果：
-- Verbs 合并为 [get, delete] ✅
-- Namespace 字段保留先插入的（如 "ns-a"） ❌（ns-b 的命名空间信息丢失）
-- Binding 可能是 "RO:admin"（两者相同）
-
-最终显示的 NAMESPACE 列仅显示一个命名空间，用户无法知道另一个命名空间也有权限。
-
-### 2.4 同名角色绑定聚合的深度边界分析
-
-#### 2.4.1 匹配键的设计：只按类型和名称，不包含命名空间
-
-位于 [fetchRoleBindingNamespaces](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L167-L184)
-
-```go
-func (p *Policy) fetchRoleBindingNamespaces(kind, name string) (map[string]string, error) {
-    // ...
-    ss := make(map[string]string, len(rbs))
-    for i := range rbs {
-        for _, s := range rbs[i].Subjects {
-            if isSameSubject(kind, ns, rbs[i].Namespace, n, &s) {
-                // ⚠️ 关键：Key 只有 Kind + Name，不包含命名空间
-                ss[rbs[i].RoleRef.Kind+":"+rbs[i].RoleRef.Name] = rbs[i].Namespace
-            }
-        }
-    }
-    return ss, nil
-}
-```
-
-**匹配键设计**：
-- Map Key：`RoleRef.Kind + ":" + RoleRef.Name`（如 `"Role:admin"`、`"ClusterRole:cluster-admin"`）
-- Map Value：`RoleBinding.Namespace`（**单个 string，不是 slice**）
-- ⚠️ **完全没有考虑 Role 本身的命名空间**
-
-#### 2.4.2 fetchRoles：返回所有命名空间的 Role，没有过滤
-
-位于 [fetchRoles](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L222-L238)
-
-```go
-func (p *Policy) fetchRoles() ([]rbacv1.Role, error) {
-    // ⚠️ BlankNamespace 表示"跨所有命名空间"
-    oo, err := p.getFactory().List(client.RoGVR, client.BlankNamespace, false, labels.Everything())
-    // ...
-}
-```
-
-- `BlankNamespace = ""` 表示列出所有命名空间的 Role
-- 返回集群中所有命名空间的所有 Role 对象，没有任何过滤
-
-#### 2.4.3 loadRoleBinding 中的两种匹配逻辑差异
+#### 2.5.1 问题根因
 
 位于 [loadRoleBinding](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L93-L129)
 
-这是整个聚合逻辑中最关键的部分，ClusterRole 和 Role 使用了**完全不同的命名空间处理策略**：
-
 ```go
-func (p *Policy) loadRoleBinding(kind, name string) (render.Policies, error) {
-    rbsMap, err := p.fetchRoleBindingNamespaces(kind, name)
-    // rbsMap = map["Kind:Name"] = RoleBinding.Namespace
-
-    // ========== 处理 ClusterRole ==========
-    crs, _ := p.fetchClusterRoles()
-    for i := range crs {
-        // ⚠️ ClusterRole: 使用 map 中的 Value (RoleBinding 的命名空间)
-        if rbNs, ok := rbsMap["ClusterRole:"+crs[i].Name]; ok {
-            // rbNs 是某个 RoleBinding 所在的命名空间(可能被覆盖!)
-            rows = append(rows, parseRules(rbNs, "CR:"+crs[i].Name, crs[i].Rules)...)
-        }
+// Role 处理片段
+ros, _ := p.fetchRoles()  // 返回所有命名空间的所有 Role
+for i := range ros {
+    if _, ok := rbsMap["Role:"+ros[i].Name]; !ok {
+        continue
     }
-
-    // ========== 处理 Role ==========
-    ros, _ := p.fetchRoles()  // 返回所有命名空间的所有 Role
-    for i := range ros {
-        // ⚠️ Role: 只检查 Key 是否存在，**完全忽略 map 的 Value**
-        if _, ok := rbsMap["Role:"+ros[i].Name]; !ok {
-            continue
-        }
-        // ⚠️ 使用 Role 自己的命名空间 ros[i].Namespace，不是 map 的 Value
-        rows = append(rows, parseRules(ros[i].Namespace, "RO:"+ros[i].Name, ros[i].Rules)...)
-    }
-
-    return rows, nil
+    // ⚠️ 只要 rbsMap 中存在 "Role:<name>" 键，就纳入
+    // 不检查 Role 所在命名空间是否与 RoleBinding 的命名空间一致
+    rows = append(rows, parseRules(ros[i].Namespace, "RO:"+ros[i].Name, ros[i].Rules)...)
 }
 ```
 
-**两种角色类型的处理对比：**
+`rbsMap` 的 Key 是 `RoleRef.Kind + ":" + RoleRef.Name`（如 `"Role:admin"`），不包含命名空间。`fetchRoles` 返回所有命名空间的 Role。当遍历 Role 列表时，只要 `rbsMap` 中存在该名称的键，所有命名空间中同名的 Role 都会被纳入。
 
-| 维度 | ClusterRole 处理 | Role 处理 |
-|------|-----------------|-----------|
-| 匹配键 | `ClusterRole:Name` | `Role:Name` |
-| 命名空间来源 | map.Value（RoleBinding.Namespace，可能被覆盖） | Role 对象自己的 Namespace（总是正确） |
-| 是否使用 map.Value | ✅ 使用 | ❌ 完全不使用 |
-| 误纳入风险 | 低（ClusterRole 名称全局唯一） | **高（只按名称匹配）** |
+#### 2.5.2 误纳入的精确条件
 
----
+同时满足以下三个条件才会触发误纳入：
 
-#### 2.4.4 场景深度分析一：Role 的误纳入（严重 Bug）
+1. **主体在某个命名空间存在 RoleBinding**，引用了一个 Role（如 `Role/admin`）
+2. **另一个命名空间存在同名 Role**（如另一个命名空间也有 `Role/admin`）
+3. **该主体在另一个命名空间没有对应的 RoleBinding**
+
+条件 2 和 3 同时成立意味着：另一个命名空间的同名 Role 从未绑定给该主体，但因为名称匹配而被纳入。
+
+#### 2.5.3 误纳入场景详解
 
 **场景构造**：User/alice 只在 ns-a 被授予 Role/admin，但 ns-b 也有名为 admin 的 Role
 
@@ -370,250 +386,92 @@ ns-a/Role/admin → pods [get, list]
 ns-b/Role/admin → pods [delete, create]  # 这个 Role 从未绑定给 alice！
 ```
 
-**第一步：fetchRoleBindingNamespaces 构建 map**
+**执行流程**：
 
-遍历所有 RoleBinding，只有 ns-a/rb-a 匹配 alice：
+| 步骤 | 操作 | 结果 |
+|------|------|------|
+| 1 | fetchRoleBindingNamespaces | `rbsMap = {"Role:admin": "ns-a"}` |
+| 2 | fetchRoles | 返回 `[ns-a/admin, ns-b/admin]` |
+| 3 | 遍历 ns-a/admin | `rbsMap["Role:admin"]` 存在 → 纳入 ✅ |
+| 4 | 遍历 ns-b/admin | `rbsMap["Role:admin"]` 存在 → **误纳入** ❌ |
 
-| 循环 | rb[i] | RoleRef | isSameSubject | Map Key | Map Value |
-|------|-------|---------|---------------|---------|-----------|
-| i=0 | ns-a/rb-a | Role:admin | true | `"Role:admin"` | `"ns-a"` |
-
-结果：`rbsMap = {"Role:admin": "ns-a"}`
-
-**第二步：fetchRoles 返回所有命名空间的 Role**
-
-返回：
-- `ns-a/Role/admin` (Rules: pods [get, list])
-- `ns-b/Role/admin` (Rules: pods [delete, create])  ⚠️ 这个从未绑定给 alice！
-
-**第三步：loadRoleBinding 遍历 Role 列表**
-
-| 循环 | ros[i] | rbsMap["Role:admin"] 存在 | 处理 | parseRules 参数 |
-|------|--------|---------------------------|------|-----------------|
-| i=0 | ns-a/admin | ✅ 存在 | 纳入 | parseRules("ns-a", "RO:admin", [get,list]) ✅ |
-| i=1 | ns-b/admin | ✅ 存在（因为 Key 只有 "Role:admin"，不包含命名空间） | **误纳入！** | parseRules("ns-b", "RO:admin", [delete,create]) ❌ |
-
-**最终聚合结果**（Policy 视图显示）：
+**最终显示**：
 
 | NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | CREATE | DELETE |
 |-----------|------|-----------|---------|-----|------|--------|--------|
 | ns-a | pods | core | RO:admin | ✓ | ✓ | × | × |
 | ns-b | pods | core | RO:admin | × | × | ✓ | ✓ |
 
-**严重问题**：alice 实际上从未被授予 ns-b/Role/admin 的权限，但界面显示她在 ns-b 有 create/delete 权限！
+alice 实际上从未被授予 ns-b/Role/admin 的权限，但界面显示她在 ns-b 有 create/delete 权限。
 
-**根因**：`rbsMap["Role:"+ros[i].Name]` 只按名称匹配，不检查命名空间。只要任意一个命名空间中存在对该主体的绑定，所有命名空间中同名的 Role 都会被纳入。
+#### 2.5.4 不会误纳入的场景
 
----
+**ClusterRole 不受此问题影响**：
 
-#### 2.4.5 场景深度分析二：多命名空间同名 Role 的正确纳入（部分丢失）
-
-**场景构造**：User/alice 在两个命名空间都被授予同名 Role/admin
-
-```
-ns-a/RoleBinding/rb-a → Role:admin (ns-a) → Subject: User/alice
-ns-b/RoleBinding/rb-b → Role:admin (ns-b) → Subject: User/alice
-
-ns-a/Role/admin → pods [get, list]
-ns-b/Role/admin → pods [delete]
+```go
+// ClusterRole 处理片段
+for i := range crs {
+    if rbNs, ok := rbsMap["ClusterRole:"+crs[i].Name]; ok {
+        rows = append(rows, parseRules(rbNs, "CR:"+crs[i].Name, crs[i].Rules)...)
+    }
+}
 ```
 
-**第一步：fetchRoleBindingNamespaces 构建 map**
+ClusterRole 是集群范围的，名称全局唯一。不存在"另一个命名空间有同名 ClusterRole"的情况。
 
-| 循环 | rb[i] | RoleRef | Map Key | Map Value |
-|------|-------|---------|---------|-----------|
-| i=0 | ns-a/rb-a | Role:admin | `"Role:admin"` | `"ns-a"` |
-| i=1 | ns-b/rb-b | Role:admin | `"Role:admin"` | **"ns-b"（覆盖 ns-a！）** |
+**不同名称的 Role 不受此问题影响**：如果 ns-b 的 Role 叫 `writer` 而不是 `admin`，`rbsMap["Role:writer"]` 不存在，不会被纳入。
 
-结果：`rbsMap = {"Role:admin": "ns-b"}`（ns-a 的信息在 map 中被覆盖）
+#### 2.5.5 ClusterRole 命名空间偏移问题
 
-**第二步：fetchRoles 返回所有 Role**
-- `ns-a/Role/admin` (pods [get, list])
-- `ns-b/Role/admin` (pods [delete])
+**这是另一个独立问题**，不属于误纳入，也不属于合并丢失，而是**map.Value 覆盖导致命名空间显示偏移**。
 
-**第三步：loadRoleBinding 遍历 Role 列表**
+位于 [fetchRoleBindingNamespaces](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L167-L184)
 
-| 循环 | ros[i] | rbsMap["Role:admin"] | 处理 | parseRules 参数 |
-|------|--------|----------------------|------|-----------------|
-| i=0 | ns-a/admin | ✅ 存在 | 纳入 ✅ | parseRules("ns-a", "RO:admin", [get,list]) |
-| i=1 | ns-b/admin | ✅ 存在 | 纳入 ✅ | parseRules("ns-b", "RO:admin", [delete]) |
+```go
+ss[rbs[i].RoleRef.Kind+":"+rbs[i].RoleRef.Name] = rbs[i].Namespace
+// ⚠️ Value 是单个 string，多次写入同一 Key 会导致后者覆盖前者
+```
 
-**最终聚合结果**：
-
-| NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | DELETE |
-|-----------|------|-----------|---------|-----|------|--------|
-| ns-a | pods | core | RO:admin | ✓ | ✓ | × |
-| ns-b | pods | core | RO:admin | × | × | ✓ |
-
-**幸运的正确结果**：虽然 `rbsMap["Role:admin"]` 的值是 `"ns-b"`（覆盖了 `"ns-a"`），但 `loadRoleBinding` 处理 Role 时**完全没有使用 map 的 Value**，而是使用 `ros[i].Namespace`。因此两个 Role 都被正确纳入。
-
-但这里有一个潜在风险：如果 `fetchRoles` 的遍历顺序或返回列表有问题，或者 `fetchRoleBindingNamespaces` 的 map 覆盖逻辑被修改为使用 Value 做命名空间过滤，结果就会出错。
-
----
-
-#### 2.4.6 场景深度分析三：ClusterRole 的命名空间偏移
-
-**场景构造**：User/alice 通过两个命名空间的 RoleBinding 获得同一个 ClusterRole
+当多个命名空间的 RoleBinding 引用同一个 ClusterRole 时：
 
 ```
-ClusterRole/cluster-admin → pods [*]  # 集群范围，本应显示为 *
-
 ns-a/RoleBinding/crb-a → ClusterRole:cluster-admin → Subject: User/alice
 ns-b/RoleBinding/crb-b → ClusterRole:cluster-admin → Subject: User/alice
 ```
 
-**第一步：fetchRoleBindingNamespaces 构建 map**
+| 循环 | rb[i] | Map Key | Map Value |
+|------|-------|---------|-----------|
+| i=0 | ns-a/crb-a | `"ClusterRole:cluster-admin"` | `"ns-a"` |
+| i=1 | ns-b/crb-b | `"ClusterRole:cluster-admin"` | **"ns-b"（覆盖！）** |
 
-| 循环 | rb[i] | RoleRef | Map Key | Map Value |
-|------|-------|---------|---------|-----------|
-| i=0 | ns-a/crb-a | ClusterRole:cluster-admin | `"ClusterRole:cluster-admin"` | `"ns-a"` |
-| i=1 | ns-b/crb-b | ClusterRole:cluster-admin | `"ClusterRole:cluster-admin"` | **"ns-b"（覆盖！）** |
-
-结果：`rbsMap = {"ClusterRole:cluster-admin": "ns-b"}`
-
-**第二步：loadRoleBinding 处理 ClusterRole**
+后续 `loadRoleBinding` 处理时使用 `rbNs` 作为 parseRules 的 ns 参数：
 
 ```go
-if rbNs, ok := rbsMap["ClusterRole:"+crs[i].Name]; ok {
-    // rbNs = "ns-b"
-    rows = append(rows, parseRules(rbNs, "CR:"+crs[i].Name, crs[i].Rules)...)
-    // parseRules("ns-b", "CR:cluster-admin", pods [*])
-}
+rows = append(rows, parseRules(rbNs, "CR:"+crs[i].Name, crs[i].Rules)...)
+// rbNs = "ns-b"，ns-a 的信息丢失
 ```
 
-**最终聚合结果**：
+**结果**：ClusterRole 的权限行只显示一个命名空间（最后覆盖的），遗漏了其他命名空间。
 
-| NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | ... |
-|-----------|------|-----------|---------|-----|------|-----|
-| **ns-b** | pods | core | CR:cluster-admin | ✓ | ✓ | ... |
-
-**命名空间偏移问题**：
-
-1. **显示错误**：`NAMESPACE` 列显示为 `"ns-b"`，但实际上这个 ClusterRole 权限同时在 ns-a 和 ns-b 两个命名空间生效。
-
-2. **概念错误**：ClusterRole 本身是**集群范围**的，通过 RoleBinding 引用时，其权限仅在 RoleBinding 所在的命名空间生效。但这里只显示了一个命名空间，遗漏了另一个。
-
-3. **误导性**：如果用户在 ns-a 操作时怀疑有权限问题，查看 Policy 视图可能发现 NAMESPACE 是 ns-b，误以为自己在 ns-a 没有权限。
-
-**对比 loadClusterRoleBinding 的处理**：
-
-位于 [loadClusterRoleBinding](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L62-L91)：
+**与 loadClusterRoleBinding 的对比**：
 
 ```go
+// ClusterRoleBinding 路径
 rows = append(rows, parseRules(client.NotNamespaced, "CR:"+crs[i].Name, crs[i].Rules)...)
+// 使用 NotNamespaced = "*"，显示正确
 ```
 
-- ClusterRoleBinding 路径使用 `NotNamespaced = "*"`，显示正确
-- RoleBinding 引用 ClusterRole 的路径使用 `rbNs`（可能被覆盖的单个命名空间），显示错误
+#### 2.5.6 三个独立问题的关系
 
----
+| 问题 | 类别 | 触发条件 | 影响 |
+|------|------|----------|------|
+| 同名 Role 误纳入 | 角色选择缺陷 | 主体在某命名空间有 RoleBinding + 另一命名空间有同名 Role | 显示了主体实际没有的权限 |
+| ClusterRole 命名空间偏移 | map.Value 覆盖 | 多命名空间 RoleBinding 引用同一 ClusterRole | NAMESPACE 列只显示一个命名空间 |
+| fetchRoleBindingNamespaces 的 map 覆盖 | map 设计缺陷 | 多个 RoleBinding 引用同名 Role | Map 只保留最后一个绑定命名空间 |
 
-#### 2.4.7 场景深度分析四：同名不同命名空间 Role 的权限聚合与 Merge
+三个问题的根因不同，但都源自 `fetchRoleBindingNamespaces` 的 `map[string]string` 设计——Key 不包含命名空间，Value 是单值而非列表。
 
-**场景构造**：User/alice 在两个命名空间都被绑定了同名 Role，但权限不同
-
-```
-ns-a/Role/admin → pods [get], configmaps [*]
-ns-b/Role/admin → pods [delete], secrets [*]
-
-两个命名空间的 RoleBinding 都绑定 alice 到 Role/admin
-```
-
-**聚合流程**：
-
-```
-1. fetchRoleBindingNamespaces → {"Role:admin": "ns-b"}  # ns-a 被覆盖
-
-2. fetchRoles → [ns-a/admin, ns-b/admin]
-
-3. 遍历 Role 列表：
-   a. ns-a/admin: rbsMap["Role:admin"] 存在
-      → parseRules("ns-a", "RO:admin", [pods get, configmaps *])
-      → 生成 PolicyRes1: {Namespace:"ns-a", Resource:"core/pods", Verbs:[get]}
-      → 生成 PolicyRes2: {Namespace:"ns-a", Resource:"core/configmaps", Verbs:[*]}
-
-   b. ns-b/admin: rbsMap["Role:admin"] 存在
-      → parseRules("ns-b", "RO:admin", [pods delete, secrets *])
-      → 生成 PolicyRes3: {Namespace:"ns-b", Resource:"core/pods", Verbs:[delete]}
-      → 生成 PolicyRes4: {Namespace:"ns-b", Resource:"core/secrets", Verbs:[*]}
-
-4. 汇总到全局的 rows (Policies)，通过 Upsert 合并：
-   - PolicyRes1: GR="core/core/pods", Namespace="ns-a" → 新增
-   - PolicyRes2: GR="core/core/configmaps", Namespace="ns-a" → 新增
-   - PolicyRes3: GR="core/core/pods", Namespace="ns-b"
-     → 查找 GR，找到 PolicyRes1（GR 相同）
-     → pp[idx].Merge(PolicyRes3)
-       → Verbs 合并为 [get, delete] ✅
-       → Namespace 保留 "ns-a" ❌（ns-b 信息丢失！）
-   - PolicyRes4: GR="core/core/secrets", Namespace="ns-b" → 新增
-```
-
-**最终显示结果**：
-
-| NAMESPACE | NAME | API-GROUP | BINDING | GET | DELETE |
-|-----------|------|-----------|---------|-----|--------|
-| **ns-a** | pods | core | RO:admin | ✓ | ✓ |
-| ns-a | configmaps | core | RO:admin | ✓ | ✓ |
-| ns-b | secrets | core | RO:admin | ✓ | ✓ |
-
-**聚合边界的影响**：
-
-1. **pods 的合并**：ns-a 和 ns-b 对 pods 的权限被合并到同一行，但 NAMESPACE 只显示 `"ns-a"`。用户看到的信息是：**"在 ns-a 命名空间对 pods 有 get 和 delete 权限"**，但实际应该是：**"在 ns-a 有 get，在 ns-b 有 delete"**。
-
-2. **GR 相同即合并**：`GR()` 只包含 `Group/Resource`，不包含 `Namespace`。因此跨命名空间的同一资源权限会被合并，Namespace 信息丢失。
-
-3. **BINDING 列相同**：两者都是 `"RO:admin"`，所以即使没有 merge 丢失，也无法区分来源。
-
----
-
-#### 2.4.8 这个边界与权限聚合结果的关系总结
-
-| 匹配设计 | 对聚合结果的影响 |
-|---------|----------------|
-| **Map Key 只有 Kind+Name** | 跨命名空间同名角色无法区分 |
-| **Map Value 是单个 string** | ClusterRole 的命名空间信息被覆盖，只保留最后一个 |
-| **Role 处理不使用 Map Value** | ✅ 多命名空间同名 Role 都能被纳入（虽然有潜在的误纳入风险） |
-| **Role 处理不检查命名空间** | ❌ 存在严重的误纳入 Bug：未绑定的同名 Role 也会被显示 |
-| **GR 不包含 Namespace** | ❌ 跨命名空间同一资源的权限被合并，Namespace 信息丢失 |
-| **Merge 不处理 Namespace/Binding** | ❌ 合并后来源信息丢失，无法追溯 |
-
-**对用户的实际影响**：
-
-1. **过度授权显示（误纳入）**：用户可能看到自己实际上没有的权限（最严重）
-2. **命名空间显示不准确**：ClusterRole 通过 RoleBinding 授予时，只显示一个命名空间
-3. **权限溯源困难**：合并后无法判断权限具体来自哪个命名空间的哪个绑定
-4. **跨命名空间信息丢失**：多个命名空间对同一资源的权限被合并为一行，命名空间信息被截断
-
-#### 2.4.9 补充：loadClusterRoleBinding 中的重复 ClusterRole
-
-位于 [rbac_policy.go#L62-L91](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L62-L91)
-
-```go
-func (p *Policy) loadClusterRoleBinding(kind, name string) (render.Policies, error) {
-    // ...
-    var nn []string  // 普通 slice，允许重复
-    for i := range crbs {
-        for _, s := range crbs[i].Subjects {
-            if isSameSubject(kind, ns, crbs[i].Namespace, n, &s) {
-                nn = append(nn, crbs[i].RoleRef.Name)  // 不做去重
-            }
-        }
-    }
-    // ...
-    for i := range crs {
-        if !inList(nn, crs[i].Name) {
-            continue
-        }
-        // 每个 ClusterRole 只会被遍历一次，因为是遍历 crs (所有 ClusterRole)
-        rows = append(rows, parseRules(client.NotNamespaced, "CR:"+crs[i].Name, crs[i].Rules)...)
-    }
-    return rows, nil
-}
-```
-
-这里 `nn` 允许重复但外层是 `range crs`，所以每个 ClusterRole 只会被处理一次。问题不大，但 `nn` 中存在重复值是无意义的内存浪费。
-
-### 2.5 主体权限聚合完整流程
+### 2.6 主体权限聚合完整流程
 
 位于 [rbac_policy.go#L32-L60](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L32-L60)
 
@@ -650,7 +508,7 @@ func isSameSubject(kind, ns, bns, name string, subject *rbacv1.Subject) bool {
     if kind == rbacv1.ServiceAccountKind {
         cns := subject.Namespace
         if cns == "" {
-            cns = bns  // 当 Subject 未指定 Namespace 时使用 Binding 的命名空间
+            cns = bns
         }
         return client.IsAllNamespaces(ns) || cns == ns
     }
@@ -660,7 +518,7 @@ func isSameSubject(kind, ns, bns, name string, subject *rbacv1.Subject) bool {
 
 边界处理：ServiceAccount 未显式指定 Namespace 时，回退到 RoleBinding 所在命名空间。
 
-### 2.6 角色/绑定查看 (Rbac DAO)
+### 2.7 角色/绑定查看 (Rbac DAO)
 
 位于 [rbac.go#L30-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac.go#L30-L52)
 
@@ -1118,23 +976,39 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 
 ## 六、关键设计要点与边界问题总结
 
-### 6.1 权限聚合设计
+### 6.1 权限合并层级与来源保留
 
-| 设计点 | 说明 | 潜在问题 |
-|--------|------|----------|
-| GR (Group/Resource) 作为聚合键 | 相同 Group/Resource 的权限合并 | 资源名规则和通配规则 GR 不同，无法合并；跨 Namespace 同资源合并时 Namespace 信息丢失 |
-| Verbs 去重合并 | Merge 只合并动词列表 | Binding、Namespace 等来源信息完全丢失，无法追踪权限来源 |
-| parseRules 双重展开 | 有 ResourceNames 时同时生成资源名规则和通配规则 | 界面上显示两条独立行，但 Verb 相同，用户可能困惑 |
-| ResourceName/NonResourceURL 字段冗余 | PolicyRes 结构体定义了但从不赋值 | 无法通过结构化字段区分规则类型，只能靠字符串解析 |
+| 层级 | 范围 | 合并方式 | 来源信息 | 说明 |
+|------|------|----------|----------|------|
+| 层级一 | parseRules 内部（同一角色） | Upsert/Merge | ✅ 保留 | 同一角色内 Namespace 和 Binding 相同，即使 GR 碰撞也不会丢失 |
+| 层级二 | loadClusterRoleBinding/loadRoleBinding 内部（跨角色） | append | ✅ 保留 | append 是纯追加，不触发合并，不同角色生成独立 PolicyRes 条目 |
+| 层级三 | List 方法（跨绑定类型） | append | ✅ 保留 | append 不触发合并，ClusterRoleBinding 和 RoleBinding 的结果各自独立 |
 
-### 6.2 同名角色绑定的信息丢失
+**核心结论**：当前代码中，Merge 只在 parseRules 内部触发（层级一），且此时 Namespace 和 Binding 参数相同，不会丢失来源信息。跨角色和跨绑定类型的追加使用原生 append，不会合并。
 
-位于 [fetchRoleBindingNamespaces](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/dao/rbac_policy.go#L167-L184)
+**用户感知问题**：虽然来源信息保留，但同一 GR 的权限分散在不同行中，用户需要自行在脑中合并才能理解完整权限。这不属于"信息丢失"，而是"信息分散"。
 
-- **Map Value 是单 string 而非 slice**：不同命名空间的同名 Role/ClusterRole，后者覆盖前者
-- **影响**：Policy 视图中可能只显示一个命名空间的权限，其他命名空间的同名角色权限被静默丢弃
+### 6.2 同名角色误纳入（独立 Bug 类别）
 
-### 6.3 权限缓存的边界
+| 条件 | 说明 |
+|------|------|
+| 触发条件 1 | 主体在某命名空间存在 RoleBinding，引用了一个 Role |
+| 触发条件 2 | 另一个命名空间存在同名 Role |
+| 触发条件 3 | 该主体在另一个命名空间没有对应的 RoleBinding |
+| 根因 | `rbsMap["Role:"+name]` 只按名称匹配，不检查命名空间 |
+| 影响 | 显示了主体实际没有的权限 |
+| 不受影响 | ClusterRole（名称全局唯一）、不同名称的 Role |
+
+### 6.3 ClusterRole 命名空间偏移（独立问题）
+
+| 条件 | 说明 |
+|------|------|
+| 触发条件 | 多个命名空间的 RoleBinding 引用同一 ClusterRole |
+| 根因 | `map[string]string` 的 Value 被后写入的覆盖 |
+| 影响 | ClusterRole 的权限行只显示一个命名空间（最后覆盖的），遗漏其他命名空间 |
+| 对比 | ClusterRoleBinding 路径使用 NotNamespaced="*"，显示正确 |
+
+### 6.4 权限缓存的边界
 
 | 方面 | 设计 | 潜在问题 |
 |------|------|----------|
@@ -1144,7 +1018,7 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | 拒绝结果缓存 | 缓存 false | 被拒绝后管理员立刻授权，用户仍看到拒绝 |
 | 连接状态 | 断开不清缓存 | 连接恢复后旧缓存可能无效 |
 
-### 6.4 权限不足展示的异常路径
+### 6.5 权限不足展示的异常路径
 
 | 问题 | 位置 | 影响 |
 |------|------|------|
@@ -1155,7 +1029,7 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | editRes 覆盖原始错误 | editRes | API Server 返回的详细原因被替换为通用消息 |
 | Init 错误取决于调用方 | App.inject | 部分入口可能静默失败无 Flash |
 
-### 6.5 渐进式权限检查的设计权衡
+### 6.6 渐进式权限检查的设计权衡
 
 1. **视图初始化检查**：确保有 list 权限才能打开视图（粗粒度前置检查）
 2. **动作按钮不检查**：基于资源类型而非用户权限（避免大量 API 调用）
