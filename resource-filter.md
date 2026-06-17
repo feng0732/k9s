@@ -15,7 +15,7 @@ K9s 的资源筛选系统采用**两层筛选架构**，包含服务器端筛选
       │                  │
       ▼                  ▼
 ┌─────────────┐   ┌─────────────┐
-│ 标签选择器  │   │ 文本/正则   │
+│ 标签选择器  │   │ 正则匹配   │
 │ (服务器端)  │   │ (客户端)    │
 └──────┬──────┘   └──────┬──────┘
        │                  │
@@ -47,7 +47,7 @@ type Table struct {
 }
 ```
 
-### 1.2 客户端筛选：文本/正则/Fuzzy
+### 1.2 客户端筛选：正则/Fuzzy
 
 **位置**：`internal/model1/table_data.go:143-198`
 
@@ -106,7 +106,7 @@ func IsLabelSelector(s string) bool {
    - `app=nginx,env=prod`
 
 > **⚠️ 容易混淆的点**：
-> 输入 `app=nginx` 会被当作**标签选择器**处理，而不是文本过滤！
+> 输入 `app=nginx` 会被当作**标签选择器**处理，而不是正则匹配！
 > 它会触发服务器端数据刷新，而不是在客户端过滤。
 
 ### 2.3 各筛选类型一览
@@ -117,7 +117,7 @@ func IsLabelSelector(s string) bool {
 | Fuzzy 过滤 | `-f` 开头 | `-f nginx` | 客户端 |
 | 反向过滤 | `!` 开头 | `!nginx` | 客户端（正则） |
 | Toast 过滤 | 切换标志 | （快捷键触发） | 客户端 |
-| 文本/正则 | 默认 | `nginx`、`nginx.*` | 客户端 |
+| 正则匹配 | 默认 | `nginx`、`nginx.*` | 客户端 |
 
 ---
 
@@ -153,14 +153,14 @@ filtered() 调用 TableData.Filter()
     ├─► 判断是否为 Fuzzy 过滤？
     │    └─ 是：fuzzyFilter()
     │
-    └─► 默认：正则/文本过滤（rxFilter）
+    └─► 默认：正则匹配（rxFilter）
          ├─ 支持反向匹配（! 开头）
          └─ 大小写不敏感
 ```
 
 ### 3.3 标签选择器的特殊处理流程
 
-标签选择器的处理比文本过滤多了一步"模型刷新"：
+标签选择器的处理比正则匹配多了一步"模型刷新"：
 
 ```
 BufferCompleted 事件
@@ -214,7 +214,7 @@ func (t *TableData) Filter(f FilterOpts) *TableData {
         return td
     }
     
-    // 4. 正则/文本过滤（默认）
+    // 4. 正则匹配（默认）
     rr, err := t.rxFilter(f.Filter, internal.IsInverseSelector(f.Filter))
     if err == nil {
         td.rowEvents = rr
@@ -228,17 +228,17 @@ func (t *TableData) Filter(f FilterOpts) *TableData {
 1. Toast 过滤
 2. 标签选择器（跳过客户端过滤）
 3. Fuzzy 过滤
-4. 正则/文本过滤
+4. 正则匹配
 
 ---
 
 ## 四、容易混淆的关键点
 
-### 4.1 标签选择器 vs 文本过滤：互斥关系
+### 4.1 标签选择器 vs 正则匹配：互斥关系
 
-**重要：标签选择器和文本过滤不能同时生效，它们是互斥的！**
+**重要：标签选择器和正则匹配不能同时生效，它们是互斥的！**
 
-- 当输入被识别为标签选择器时 → 重置文本过滤，使用服务器端筛选
+- 当输入被识别为标签选择器时 → 重置正则匹配，使用服务器端筛选
 - 当输入不是标签选择器时 → 重置标签选择器为 `Everything()`，使用客户端筛选
 
 **原因**：它们共享同一个输入源 `cmdBuff`，输入内容只能是其中一种类型。
@@ -248,20 +248,20 @@ func (t *TableData) Filter(f FilterOpts) *TableData {
 | 输入内容 | 识别为 | 过滤层面 | 行为说明 |
 |----------|--------|----------|----------|
 | ``（空） | 无 | - | 不过滤 |
-| `nginx` | 文本/正则 | 客户端 | 在所有列中模糊匹配 nginx |
+| `nginx` | 正则匹配 | 客户端 | 在所有列中进行正则匹配 nginx |
 | `nginx pod` | 无（含空格，正则短路） | 客户端（实际不生效） | 含空格，rxFilter 短路，**无过滤效果** |
 | `app=nginx` | 标签选择器 | 服务器端 | 从 K8s API 获取带 app=nginx 标签的资源 |
 | `-l app=nginx` | 标签选择器 | 服务器端 | 同上，显式标记 |
-| `-f nginx` | Fuzzy 过滤 | 客户端 | 按名称（ID 列）进行模糊匹配 |
-| `-f nginx pod` | Fuzzy 过滤 | 客户端 | **只捕获 `nginx` 进入 Fuzzy，`pod` 被静默丢弃** |
-| `!nginx` | 反向正则 | 客户端 | 显示不包含 nginx 的行 |
+| `-f nginx` | Fuzzy 匹配 | 客户端 | 按名称（ID 列）进行 Fuzzy 匹配 |
+| `-f nginx pod` | Fuzzy 匹配 | 客户端 | **只捕获 `nginx` 进行 Fuzzy，`pod` 被静默丢弃** |
+| `!nginx` | 反向正则匹配 | 客户端 | 显示不包含 nginx 的行 |
 
-### 4.3 Fuzzy 过滤 vs 正则过滤的区别
+### 4.3 Fuzzy 匹配 vs 正则匹配的区别
 
-| 特性 | Fuzzy 过滤 (`-f`) | 正则/文本过滤 |
-|------|-------------------|---------------|
+| 特性 | Fuzzy 匹配 (`-f`) | 正则匹配 |
+|------|-------------------|---------|
 | 匹配范围 | 只匹配名称列 (ID) | 匹配所有可见列 |
-| 算法 | 模糊匹配 (fuzzy.Find) | 正则表达式匹配 |
+| 算法 | Fuzzy 匹配 (fuzzy.Find) | 正则表达式匹配 |
 | 性能 | 较快 | 稍慢（多列匹配） |
 | 大小写 | 取决于库 | 不敏感 `(?i)` |
 
@@ -356,7 +356,7 @@ func IsLabelSelector(s string) bool {
 | 输入 | 含空格？ | `IsLabelSelector` 结果 | 实际过滤类型 |
 |------|----------|------------------------|-------------|
 | `app=nginx` | 否 | `true` | 标签选择器（服务器端） |
-| `app=nginx, env=prod` | **是**（逗号后有空格） | `false` | 正则/文本 → 空格短路 → **无过滤** |
+| `app=nginx, env=prod` | **是**（逗号后有空格） | `false` | 正则匹配 → 空格短路 → **无过滤** |
 | `app=nginx,env=prod` | 否 | `true` | 标签选择器（服务器端） |
 | `-l app=nginx, env=prod` | 是 | `true`（匹配 `-l` 前缀优先，跳过空格检查） | 标签选择器（服务器端，**两个标签完整解析**） |
 | `-l  app=nginx` | 是（两空格） | `true`（匹配 `-l` 前缀优先） | 标签选择器（服务器端） |
@@ -391,7 +391,7 @@ func (t *TableData) rxFilter(q string, inverse bool) (*RowEvents, error) {
 | `-f nginx pod` | `false`（含空格，但 fuzzy 优先级更高） | `("nginx", true)`（`fuzzyRx` 捕获第一个词 `nginx`，空格后的 `pod` 不参与匹配） | 不进入 rxFilter 路径 | **Fuzzy 按 nginx 匹配名称列，pod 被丢弃** |
 | `-f nginx` | `false` | `("nginx", true)` | 不进入 rxFilter 路径 | Fuzzy 匹配名称列 |
 
-> **核心结论**：空格对不同类型的查询影响完全不同——普通文本查询因空格短路等于没过滤，Fuzzy 前缀查询虽然含空格但正则只捕获首词仍能进入 fuzzy 路径，只有带 `-l` 前缀的标签选择器能完整利用空格后的所有内容。
+> **核心结论**：空格对不同类型的查询影响完全不同——正则匹配查询因空格短路等于没过滤，Fuzzy 前缀查询虽然含空格但正则只捕获首词仍能进入 fuzzy 路径，只有带 `-l` 前缀的标签选择器能完整利用空格后的所有内容。
 
 ---
 
@@ -727,10 +727,10 @@ TableData.Filter() 被调用
 
 将三类筛选遇到空格时的行为放在一起对比：
 
-| 维度 | 普通带空格查询 | Fuzzy 前缀 + 空格 + 多词 | 标签选择器 + 空格 |
-|------|--------------|----------------------|-----------------|
+| 维度 | 普通带空格正则查询 | Fuzzy 前缀 + 空格 + 多词 | 标签选择器 + 空格 |
+|------|-----------------|----------------------|-----------------|
 | **示例** | `nginx pod` | `-f nginx pod` | `-l app=nginx, env=prod` |
-| **类型判断** | 非标签非 fuzzy | fuzzy 匹配（提取第一个词） | 标签选择器（`-l` 前缀优先） |
+| **类型判断** | 非标签非 fuzzy | Fuzzy 匹配（提取第一个词） | 标签选择器（`-l` 前缀优先） |
 | **空格处理位置** | `rxFilter` 开头短路 | `fuzzyRx` 正则中只捕获第一个词 | `ExtractLabelSelector` 去掉 `-l` 后交 K8s 解析 |
 | **代码位置** | `internal/model1/table_data.go:167-169` | `internal/helpers.go:14` | `internal/ui/table_helper.go:62-69` |
 | **过滤层面** | 客户端 | 客户端 | 服务器端 |
@@ -742,10 +742,10 @@ TableData.Filter() 被调用
 
 | 输入 | `IsLabelSelector` | `IsFuzzySelector` | 最终路径 | 实际效果 |
 |------|-------------------|-------------------|---------|---------|
-| `nginx` | `false` | `("", false)` | rxFilter（正则） | 所有列匹配 nginx |
+| `nginx` | `false` | `("", false)` | rxFilter（正则匹配） | 所有列正则匹配 nginx |
 | `nginx pod` | `false`（含空格） | `("", false)` | rxFilter → 空格短路 | **全量显示（无过滤）** |
-| `-f nginx` | `false` | `("nginx", true)` | fuzzyFilter | 名称列 fuzzy 匹配 nginx |
-| `-f nginx pod` | `false`（含空格） | `("nginx", true)` | fuzzyFilter("nginx") | **只匹配 nginx，pod 被丢弃** |
+| `-f nginx` | `false` | `("nginx", true)` | fuzzyFilter | 名称列 Fuzzy 匹配 nginx |
+| `-f nginx pod` | `false`（含空格） | `("nginx", true)` | fuzzyFilter("nginx") | **只按 nginx 做 Fuzzy 匹配，pod 被丢弃** |
 | `-f  nginx`（两空格） | `false` | `("", false)`（匹配失败） | rxFilter → 空格短路 | **全量显示（无过滤）** |
 | `app=nginx` | `true` | - | 服务器端标签过滤 | 按 app=nginx 拉取 |
 | `app=nginx, env=prod` | `false`（含空格） | - | rxFilter → 空格短路 | **全量显示（无过滤）** |
@@ -756,13 +756,13 @@ TableData.Filter() 被调用
 
 | 策略 | 实现方式 | 所在位置 | 适用场景 |
 |------|---------|---------|---------|
-| **空格即短路** | `strings.Contains(q, " ")` → 直接返回全量 | `rxFilter` in `internal/model1/table_data.go` | 文本/正则过滤 |
-| **空格分词取首词** | `[\w-]+\b` 正则只捕获第一个词 | `fuzzyRx` in `internal/helpers.go` | Fuzzy 过滤 |
+| **空格即短路** | `strings.Contains(q, " ")` → 直接返回全量 | `rxFilter` in `internal/model1/table_data.go` | 正则匹配 |
+| **空格分词取首词** | `[\w-]+\b` 正则只捕获第一个词 | `fuzzyRx` in `internal/helpers.go` | Fuzzy 匹配 |
 | **空格参与解析** | 去掉前缀后交给专业解析器（labels.Parse） | `ExtractLabelSelector` in `internal/ui/table_helper.go` | 标签选择器（仅 `-l` 前缀路径） |
 
 > **为什么三种策略不一样？**
-> - 正则过滤：多列匹配，空格会导致正则语义模糊，干脆短路
-> - Fuzzy 过滤：本来就只匹配名称列，设计上就假设是单个关键词
+> - 正则匹配：多列匹配，空格会导致正则语义模糊，干脆短路
+> - Fuzzy 匹配：本来就只匹配名称列，设计上就假设是单个关键词
 > - 标签选择器（-l）：利用 K8s 官方库的完整解析能力，支持复杂表达式
 
 ---
@@ -772,9 +772,9 @@ TableData.Filter() 被调用
 ### 8.1 为什么容易混淆？
 
 1. **同一入口，不同路径**：所有筛选都通过 `/` 命令输入，但背后是完全不同的两套机制
-2. **隐式类型推断**：`app=nginx` 看起来像文本过滤，实际是标签选择器
+2. **隐式类型推断**：`app=nginx` 看起来像正则匹配，实际是标签选择器
 3. **状态分散**：筛选状态分布在 cmdBuff、labelSelector、toast 三个地方
-4. **互斥性不直观**：标签选择器和文本过滤不能同时生效，但用户可能期望它们叠加
+4. **互斥性不直观**：标签选择器和正则匹配不能同时生效，但用户可能期望它们叠加
 5. **空格是隐形杀手**：含空格的输入在正则路径被静默忽略，在标签路径则改变类型判断
 6. **非法正则无反馈**：编译失败时静默回退到全量数据，用户无从得知输入有误
 7. **Fuzzy 多词静默丢弃**：`-f nginx pod` 中第二个词被悄悄忽略，用户可能以为多词更精确
@@ -789,7 +789,7 @@ TableData.Filter() 被调用
 ### 8.3 改进想象空间
 
 如果需要支持叠加筛选，可以考虑：
-- 标签选择器和文本过滤同时生效（服务器端 + 客户端双层过滤）
+- 标签选择器和正则匹配同时生效（服务器端 + 客户端双层过滤）
 - 更明确的筛选类型标记
 - 可视化的筛选状态展示
 - 空格和非法正则的 UI 反馈提示
