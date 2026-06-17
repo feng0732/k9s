@@ -1,14 +1,76 @@
 # K9s 容器文件 CP 传输路径代码分析
 
-依赖版本依据：[go.mod:41](go.mod#L41-L41) 声明 `k8s.io/kubectl v0.35.1`；本文 kubectl cp 的代码片段全部来自该版本。
+依赖版本依据：[go.mod:41](go.mod#L41-L41) 声明 `k8s.io/kubectl v0.35.1`；本文中 kubectl cp 的源代码分析片段来自该版本（用于说明 tar 流管道的内部原理）。**注意：K9s 实际运行时调用的外部 kubectl 二进制版本可能与此不同**，详见下文「零、两个 kubectl 版本的区分」。
+
+---
+
+## 零、两个 kubectl 版本的区分
+
+K9s 代码中同时存在两个完全独立的"kubectl"概念，二者版本可能不一致，需要明确区分：
+
+### 0.1 依赖声明的 kubectl（编译时链接）
+
+这是 [go.mod:41](go.mod#L41-L41) 中声明的 Go 模块依赖 `k8s.io/kubectl v0.35.1`。
+
+**性质**：编译期依赖，与 K9s 二进制静态链接。
+
+**使用场景**：全库共有 11 处 import `k8s.io/kubectl` 包，全部用于 CP 之外的功能：
+
+| 文件 | import 路径 | 用途 |
+|------|------------|------|
+| [internal/render/sc.go](internal/render/sc.go#L15-L15) | `k8s.io/kubectl/pkg/util/storage` | StorageClass 容量渲染 |
+| [internal/render/cust_col.go](internal/render/cust_col.go#L14-L14) | `k8s.io/kubectl/pkg/cmd/get` | 自定义列渲染 |
+| [internal/dao/rs.go](internal/dao/rs.go#L20-L21) | `k8s.io/kubectl/pkg/cmd/util` + `polymorphichelpers` | ReplicaSet 操作 |
+| [internal/dao/port_forwarder.go](internal/dao/port_forwarder.go#L25-L25) | `k8s.io/kubectl/pkg/cmd/util` | 端口转发 |
+| [internal/dao/node.go](internal/dao/node.go#L22-L23) | `k8s.io/kubectl/pkg/drain` + `scheme` | Node 排水操作 |
+| [internal/dao/dynamic.go](internal/dao/dynamic.go#L20-L20) | `k8s.io/kubectl/pkg/cmd/util` | 动态资源操作 |
+| [internal/dao/dp.go](internal/dao/dp.go#L23-L24) | `k8s.io/kubectl/pkg/polymorphichelpers` + `scheme` | Deployment 滚动更新 |
+| [internal/dao/describe.go](internal/dao/describe.go#L11-L11) | `k8s.io/kubectl/pkg/describe` | 资源描述 |
+
+**关键证据**：全库 grep `k8s.io/kubectl/pkg/cmd/cp` 零匹配——**依赖声明的 kubectl v0.35.1 从未被用于 CP 功能**。
+
+### 0.2 运行时的外部 kubectl（进程边界调用）
+
+这是通过 `exec.LookPath("kubectl")` 在用户系统 PATH 中找到的外部二进制。
+
+**性质**：运行期依赖，独立进程，与 K9s 通过 stdin/stdout 通信。
+
+**代码定位**：
+- [internal/view/exec.go:58](internal/view/exec.go#L58-L58)：`runK()` 中的 `bin, err := exec.LookPath("kubectl")`
+- [internal/view/exec.go:242](internal/view/exec.go#L242-L242)：`runKu()` 中的 `bin, err := exec.LookPath("kubectl")`
+
+**使用场景**：CP 功能、Shell、Attach 等需要调用 kubectl 子命令的场景。
+
+**版本**：完全由用户安装决定，可能是 v1.27、v1.28、v1.29、v1.30 等任意版本，**与 go.mod 中的 v0.35.1 没有绑定关系**。
+
+> **k8s 版本号说明**：kubectl 模块使用 `v0.x.y` 版本方案（如 v0.35.1），对应 Kubernetes 发行版的 `v1.x.y`（如 v1.35.1）。但这只是模块命名约定，不意味着运行时的外部 kubectl 也必须是这个版本。
+
+### 0.3 二者对比与版本不一致风险
+
+| 维度 | 依赖声明的 kubectl | 运行时的外部 kubectl |
+|------|-------------------|---------------------|
+| 位置 | go.mod 声明，编译进 K9s 二进制 | 用户 PATH 中的独立二进制 |
+| 版本 | 固定 v0.35.1 | 用户安装的任意版本 |
+| 绑定方式 | Go 模块静态链接 | `os/exec` 进程间调用 |
+| 用于 CP | ❌ 从未 | ✅ 是 CP 功能的实际执行者 |
+| 用于其他功能 | ✅ drain、describe、render 等 11 处 | ✅ Shell、Attach、PortForward 等 |
+| 升级方式 | 修改 go.mod 重新编译 K9s | 用户自行 `brew install kubectl` 等 |
+
+**版本不一致风险**：
+- 只要 `kubectl cp` 的 CLI 参数（`-c`、`--no-preserve`、`--retries`、`[[ns/]pod:]path` 格式）保持兼容，不同版本可正常工作
+- kubectl cp 的这些 flag 自 v1.12 引入以来基本稳定
+- 若未来 kubectl 更改 cp 子命令的 flag 语义或输出格式，就会出现 K9s 与外部 kubectl 的版本不兼容问题
+
+**进程边界再次确认**：
+CP 功能的执行路径是 `K9s Go 代码 → exec.CommandContext → kubectl 二进制进程`。K9s 的 CP 相关代码在 [internal/view/pod.go](internal/view/pod.go#L286-L353) 和 [internal/view/exec.go](internal/view/exec.go#L57-L97) 中构造完命令行参数、调用完 `cmd.Run()` 之后就结束了，后续的 tar 流管道、断点续传等逻辑完全在外部 kubectl 进程内执行，K9s 代码不可见。
 
 ---
 
 ## 一、K9s 与 kubectl cp 的调用边界
 
-**核心事实：K9s 不直接调用 kubectl cp 的 Go API，而是通过 `os/exec` 启动外部 `kubectl` 二进制进程。**
+**核心事实**（已在「零」章通过代码证明）：K9s 不直接调用 kubectl cp 的 Go API，而是通过 `os/exec` 启动外部 `kubectl` 二进制进程。
 
-代码证据：全库 grep `k8s.io/kubectl/pkg/cmd/cp` 零匹配（K9s 没有任何 Go 层 import 该包）。K9s 的 CP 实现完全走外部命令行调用链路：
+调用链路：
 
 ```
 用户按键 T
@@ -274,7 +336,7 @@ if opts.background {
 
 ## 四、kubectl cp (v0.35.1) 内部：tar 流管道机制
 
-K9s 通过进程边界调用 kubectl cp 后，真正的文件传输发生在 kubectl 内部。以下代码来自 `k8s.io/kubectl v0.35.1` 的 `pkg/cmd/cp/cp.go`。
+K9s 通过进程边界调用 kubectl cp 后，真正的文件传输发生在 kubectl 内部。以下代码逻辑分析基于 `k8s.io/kubectl v0.35.1` 的 `pkg/cmd/cp/cp.go` 源码（仅用于说明 tar 流管道原理，**实际运行的外部 kubectl 二进制版本可能不同**）。
 
 ### 4.1 CopyOptions 与命令定义
 
@@ -679,7 +741,8 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
   │
   │  ═══════════════════════════════ 进程边界 ═══════════════════════════════
   │
-  └─▶ 外部 kubectl cp 进程（k8s.io/kubectl v0.35.1）
+  └─▶ 外部 kubectl cp 进程（用户 PATH 中的任意版本）
+        │  （以下代码逻辑基于 k8s.io/kubectl v0.35.1 版本分析）
         ├─ extractFileSpec() 解析 [[ns/]pod:]path
         ├─ Run() 分派方向
         │
@@ -705,6 +768,11 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
 
 | 文件 | 行号 | 功能 |
 |------|------|------|
+| [go.mod](go.mod#L41-L41) | L41 | `k8s.io/kubectl v0.35.1` 依赖声明 |
+| [internal/view/exec.go](internal/view/exec.go#L58-L58) | L58 | `runK()` 中 `exec.LookPath("kubectl")` 查找外部二进制 |
+| [internal/view/exec.go](internal/view/exec.go#L242-L242) | L242 | `runKu()` 中 `exec.LookPath("kubectl")` 查找外部二进制 |
+| [internal/render/sc.go](internal/render/sc.go#L15-L15) | L15 | import `k8s.io/kubectl/pkg/util/storage`（依赖声明的用途之一） |
+| [internal/dao/node.go](internal/dao/node.go#L22-L23) | L22-L23 | import `k8s.io/kubectl/pkg/drain` + `scheme`（依赖声明的用途之一） |
 | [pod.go](internal/view/pod.go#L41-L42) | L41 | `defaultTxRetries = 999` |
 | [pod.go](internal/view/pod.go#L109-L115) | L109-L115 | T 键绑定 transferCmd |
 | [pod.go](internal/view/pod.go#L286-L353) | L286-L353 | transferCmd 主函数 |
@@ -716,7 +784,6 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
 | [exec.go](internal/view/exec.go#L99-L122) | L99-L122 | run：后台/前台调度 |
 | [exec.go](internal/view/exec.go#L172-L239) | L172-L239 | execute：构造 exec.Cmd |
 | [exec.go](internal/view/exec.go#L549-L615) | L549-L615 | pipe：执行命令 + 管道 |
-| [go.mod](go.mod#L41-L41) | L41 | k8s.io/kubectl v0.35.1 依赖声明 |
 
 ### kubectl cp (v0.35.1)
 
@@ -739,9 +806,10 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
 
 ## 八、传输路径难以理解的原因总结
 
-1. **进程边界不透明**：K9s 与 kubectl cp 之间是进程边界，用户按下 T 键后 K9s 代码就走完了，后面的 tar 管道全在外部进程里，K9s UI 层无任何中间状态可见
-2. **冒号分隔歧义**：`ns/pod:/path` 格式中，`:` 是 Pod 与路径的分隔符，与 Windows 盘符 `C:\path` 形态相似，容易混淆
-3. **From/To 语义方向依赖**：同一个 From 字段，下载时是远端路径，上传时是本地路径，由 Download bool 反转决定
-4. **tar 是隐式前置条件**：容器必须有 `tar` 二进制，这个前提既不在对话框提示，也不在错误信息中明确
-5. **参数重复 bug**：`--retries` 被追加两次，虽然 kubectl 通常取最后值，但增加了理解成本
-6. **无中间进度反馈**：传输过程是 UI 黑盒，只有成功/失败两端状态，长时间传输时用户无法判断是否卡死
+1. **两个 kubectl 版本混淆**：go.mod 声明的 `k8s.io/kubectl v0.35.1` 是编译期依赖（用于 drain、describe、render 等），而 CP 实际调用的是用户 PATH 中的外部 kubectl 二进制，二者版本可能不同且无绑定关系
+2. **进程边界不透明**：K9s 与 kubectl cp 之间是进程边界，用户按下 T 键后 K9s 代码就走完了，后面的 tar 管道全在外部进程里，K9s UI 层无任何中间状态可见
+3. **冒号分隔歧义**：`ns/pod:/path` 格式中，`:` 是 Pod 与路径的分隔符，与 Windows 盘符 `C:\path` 形态相似，容易混淆
+4. **From/To 语义方向依赖**：同一个 From 字段，下载时是远端路径，上传时是本地路径，由 Download bool 反转决定
+5. **tar 是隐式前置条件**：容器必须有 `tar` 二进制，这个前提既不在对话框提示，也不在错误信息中明确
+6. **参数重复 bug**：`--retries` 被追加两次（[pod.go:309](internal/view/pod.go#L309-L309) 和 [pod.go:314](internal/view/pod.go#L314-L314)），虽然 kubectl 通常取最后值，但增加了理解成本
+7. **无中间进度反馈**：传输过程是 UI 黑盒，只有成功/失败两端状态，长时间传输时用户无法判断是否卡死
