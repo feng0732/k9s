@@ -177,12 +177,21 @@ func (a *App) BailOut(exitCode int) {
 
 **注意顺序**：先清理 k8s 资源（pod/端口转发），再恢复终端退出。BailOut 自身的 `defer recover` 在函数返回时才执行，如果 `nukeK9sShell` panic，后面三行不会被执行。
 
-**重要副作用 —— os.Exit 导致上层 defer 全部不执行**：
-- `a.App.BailOut(exitCode)` 内部最终调用 `os.Exit(exitCode)`（见 `internal/ui/app.go:L155-L162`）
-- `os.Exit` 直接终止进程，**不会返回到 `run()` 函数**
-- 因此 `cmd/root.go:L88-L92` 中的 `defer logFile.Close()` 永远不会在正常退出路径上执行
-- `cmd/root.go:L93-L101` 中的 `defer recover()` 也不会执行
-- 日志文件 buffer 可能未 flush，日志可能不完整
+**运行时退出 vs 启动失败 —— defer 执行完全不同**：
+
+`a.App.BailOut(exitCode)` 内部最终调用 `os.Exit(exitCode)`（`internal/ui/app.go:L155-L162`），直接终止进程。但 `cmd/root.go` 中 `run()` 的 defer 是否执行，取决于退出发生在 `app.Run()` 之前还是之后：
+
+| 退出场景 | 退出方式 | run() 正常返回？ | defer logFile.Close() | defer recover() |
+|----------|---------|-----------------|----------------------|----------------|
+| 启动阶段 `config.InitLocs()` 失败 | `run()` 返回 err → `Execute()` 中 `os.Exit(1)` | ✅ 是 | ✅ 执行 | ✅ 执行 |
+| 启动阶段 `app.Init()` 失败 | `run()` 返回 err → `Execute()` 中 `os.Exit(1)` | ✅ 是 | ✅ 执行 | ✅ 执行 |
+| 运行时 Ctrl+C → `BailOut(0)` | `BailOut` 内部 `os.Exit(0)` | ❌ 否 | ❌ 不执行 | ❌ 不执行 |
+| 运行时连接丢失 → `BailOut(1)` | `BailOut` 内部 `os.Exit(1)` | ❌ 否 | ❌ 不执行 | ❌ 不执行 |
+| 运行时 SIGHUP | 信号 goroutine 中 `os.Exit(0)` | ❌ 否 | ❌ 不执行 | ❌ 不执行 |
+| 运行时 panic | `run()` 的 defer recover 捕获 → 返回 err → `os.Exit(1)` | ✅ 是 | ✅ 执行 | ✅ 执行并打印堆栈 |
+| `app.Run()` 正常返回 + ExitStatus | `run()` 返回 err → `Execute()` 中 `os.Exit(1)` | ✅ 是 | ✅ 执行 | ✅ 执行 |
+
+关键区别：启动阶段的错误通过 `return err` 从 `run()` 正常返回，defer 会执行；运行时退出通过 `os.Exit` 直接终止，defer 不会执行。两者虽然最终都到达 `os.Exit`，但 `run()` 的 defer 在 `Execute()` 的 `os.Exit` 之前已经执行完毕。
 
 ### 3.2 Halt / Resume 事件循环控制
 
@@ -645,15 +654,20 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 
 ### 6.1 不同退出路径对清理的影响
 
-| 清理动作 | Ctrl+C 正常退出 | 连接丢失 BailOut | SIGHUP os.Exit | 其他 os.Exit(1) | SIGKILL / panic |
-|----------|----------------|-----------------|----------------|-----------------|----------------|
-| `nukeK9sShell()` 删除 pod | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `stopImgScanner()` | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `factory.Terminate()` 关 informer stopChan | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `forwarders.DeleteAll()` 关端口转发 stopChan | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `Config.Save()` 保存配置 | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `tcell.Screen.Fini()` 恢复终端 | ✅ | ✅ | ❌ | ❌ | ❌ |
-| `cmd/root.go` 中 `defer logFile.Close()` | ❌（os.Exit 跳过） | ❌（os.Exit 跳过） | ❌ | ❌ | ❌ |
+| 清理动作 | 启动失败 (return err) | 运行时 Ctrl+C BailOut | 运行时连接丢失 BailOut | SIGHUP os.Exit | 其他 os.Exit(1) | SIGKILL |
+|----------|---------------------|----------------------|----------------------|----------------|-----------------|---------|
+| `nukeK9sShell()` 删除 pod | —（未到运行时） | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `stopImgScanner()` | —（未到运行时） | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `factory.Terminate()` 关 informer stopChan | —（未到运行时） | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `forwarders.DeleteAll()` 关端口转发 stopChan | —（未到运行时） | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `Config.Save()` 保存配置 | —（未到运行时） | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `tcell.Screen.Fini()` 恢复终端 | —（未进入 TUI） | ✅ | ✅ | ❌ | ❌ | ❌ |
+| `defer logFile.Close()` (cmd/root.go) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `defer recover()` (cmd/root.go) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+
+说明：
+- 启动失败指 `app.Run()` 之前的错误（`config.InitLocs`、`app.Init` 等），此时 `run()` 正常返回，defer 执行
+- 运行时退出指 `app.Run()` 已进入事件循环后的退出，`BailOut` 内部 `os.Exit` 直接终止，defer 不执行
 
 ### 6.2 资源残留的实际后果
 
@@ -678,12 +692,15 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 **配置更改丢失**：
 - 没走 `Config.Save()`，当前 session 对 context/namespace/view 的变更不会写盘
 
-**日志文件不完整（所有退出路径都有此问题）**：
+**日志文件可能不完整（运行时退出路径）**：
 - `cmd/root.go:L88-L92` 中的 `defer logFile.Close()` 是 `run()` 函数的 defer
-- 由于所有退出路径最终都走 `os.Exit`（包括 Ctrl+C 正常退出和连接丢失退出），进程不会返回到 `run()` 函数
-- 因此 `defer logFile.Close()` **永远不会执行**
-- slog buffer 中未 flush 的日志可能丢失，日志文件结尾可能不完整
-- 注意：`tint.NewHandler` 内部通常是行缓冲的，每行写完会自动 flush，所以大部分日志仍能落盘，但退出前最后几条可能丢失
+- 运行时退出（Ctrl+C、连接丢失等）通过 `BailOut` 内的 `os.Exit` 直接终止进程，`run()` 的 defer 不执行，`logFile.Close()` 不会被调用
+- 启动阶段失败则走 `return err`，`logFile.Close()` 正常执行
+- 运行时退出时日志是否真正丢失取决于写入链路的缓冲行为：
+  - `tint.NewHandler` 每条日志调用 `Write()` 写入 `*os.File`
+  - Go 的 `*os.File` 写操作直接走 `syscall.Write`，没有 Go 层面的用户态 buffer
+  - 已通过 `syscall.Write` 写入的数据在内核 page cache 中，进程退出后内核会负责落盘
+  - 因此已完成的日志行通常不会丢失；实际风险主要在 `logFile.Close()` 本身会做的收尾工作（如更新文件元数据）被跳过
 
 ### 6.3 关于 goroutine 的说明
 
@@ -725,8 +742,9 @@ func (p *PageStack) StackPopped(o, top model.Component) {
                         │      ├─ tcsetattr 恢复 termios
                         │      └─ Close(tty fd)
                         └─ os.Exit(exitCode) → 进程终止
-                           ⚠️  注意：os.Exit 直接终止进程，不会返回到 cmd/root.go 的 run() 函数
-                                因此 run() 中的 defer logFile.Close() 和 defer recover() 都不会执行
+                           ⚠️  运行时退出：os.Exit 直接终止进程，不返回到 cmd/root.go 的 run()
+                                因此 run() 中的 defer logFile.Close() 和 defer recover() 都不执行
+                                （注意：启动阶段的错误走 return err，defer 会正常执行，两者不同）
 ```
 
 ### 7.2 连接丢失退出链
@@ -768,7 +786,7 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 - ✅ 终端：tcell Screen.Fini() 恢复 termios 和正常屏幕
 - ✅ k9s-shell pod：尝试删除（500ms 超时，失败只打日志）
 - ✅ 配置：调用 Config.Save(true) 持久化 YAML
-- ❌ 日志文件：`defer logFile.Close()` 永远不执行（os.Exit 跳过上层 defer）
+- ⚠️ 日志文件：运行时退出时 `defer logFile.Close()` 不执行（`os.Exit` 跳过 `run()` 的 defer）；启动失败时正常执行。实际数据丢失风险较低（见 6.2 节分析）
 
 ### 8.2 缺失与不足
 
