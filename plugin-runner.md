@@ -736,6 +736,61 @@ return cmds[last].Wait()
 
 这是最容易产生误解的部分。我之前的分析有多处与代码事实不符，现在结合真实代码逐一澄清。
 
+#### 3.4.0 `run()` → `execute()` → `pipe()` 三层调用全景
+
+在深入细节之前，先搞清楚三个函数的分工和调用关系。这是理解「后台模式 + pipes 怎么配合」的关键。
+
+```
+run() [exec.go#L99-L122]
+  │
+  │  职责：UI 层调度（挂起/恢复）、错误通道封装
+  │
+  ├─ 前台模式：a.Halt() → a.Suspend(func() { execute(...) }) → a.Resume()
+  │     （Suspend 切换终端到原始模式，执行完切回 tview）
+  │
+  └─ 后台模式：同步调用 execute(...) → close(errChan) → 立即返回
+        （不挂起 UI，但 execute() 本身可能仍然阻塞！）
+
+            ↓ 调用
+
+execute() [exec.go#L172-L239]
+  │
+  │  职责：context 生命周期、信号监听、子进程创建、管道链构建
+  │
+  ├─ ctx, cancel := WithCancel()
+  ├─ defer: if !background { cancel(); clearScreen() }
+  ├─ signal.Notify + goroutine 监听 Ctrl+C / SIGTERM
+  ├─ cmds = [主命令, 管道命令1, 管道命令2, ...]  （全部 CommandContext 绑定 ctx）
+  │
+  └─ 调用 pipe(ctx, opts, statusChan, &o, &e, cmds...)
+
+            ↓ 调用
+
+pipe() [exec.go#L549-L615]
+  │
+  │  职责：I/O 连接、进程启动、进程等待
+  │
+  ├─ len(cmds) == 1 → 单命令路径
+  │     ├─ background=true  → goroutine 异步执行 + Buffer 捕获 + 写 statusChan + close
+  │     └─ background=false → 同步执行 + 直连终端 + 写 statusChan + close
+  │
+  └─ len(cmds) > 1 → 管道路径
+        ├─ io.Pipe() 串联 Stdout→Stdin
+        ├─ 所有 cmd.Stderr = os.Stderr
+        ├─ cmd[last].Stdout = os.Stdout
+        ├─ 全部 Start()
+        └─ 只 Wait() 最后一个 → 返回其退出状态
+        （⚠️ 不写 statusChan，也不 close；不检查 background，永远同步阻塞）
+```
+
+**核心结论（先记下来）**：
+- `run()` 的「后台模式」只决定**是否挂起 UI**，不决定子进程是否异步
+- 单命令后台模式：`pipe()` 内部会用 goroutine 异步执行，所以 `run()` 不阻塞
+- **管道模式（多命令）永远是同步阻塞的**，不管 `background` 是 true 还是 false
+- 管道模式下 `background: true` 的实际效果：**不挂起 UI，但阻塞 UI 线程**（相当于冻结 UI）
+
+---
+
 #### 3.4.1 关键代码事实核对（修正前的错误）
 
 先澄清几个核心错误：
@@ -747,7 +802,7 @@ return cmds[last].Wait()
 | 管道模式下 `statusChan` 会被 close | ❌ 只有单命令模式 close `statusChan`，管道模式**既不写也不 close** |
 | 管道模式下 `o, e Buffer` 捕获输出 | ❌ 管道模式下 I/O 直连终端，Buffer 完全没用 |
 | Go Cmd finalizer 自动 Wait 收尸 | ❌ finalizer 只调用 `Process.Release()`，**不调用 Wait()** |
-| 后台模式支持管道命令 | ❌ 管道模式代码路径不区分前后台，后台模式只有单命令生效 |
+| 后台模式 + pipes 下管道不生效 | ❌ 管道完全生效，只是**同步阻塞执行**，不会异步，UI 会冻结 |
 | 中间进程不会变成僵尸 | ❌ 只 Start 不 Wait 的子进程退出后**会变成僵尸进程**，直到 k9s 退出 |
 
 ---
@@ -946,29 +1001,151 @@ return nil   // 中断时不返回错误
 
 ---
 
-#### 3.4.7 后台模式的真实情况
+#### 3.4.7 后台模式 + pipes 的完整执行路径
 
-后台模式（`background: true`）**只在单命令模式下生效**。管道模式的代码路径（`len(cmds) > 1`）完全不检查 `opts.background`，所以：
+这是用户最困惑的部分，让我逐层追踪代码，讲清楚 `run()` 和 `pipe()` 到底怎么配合。
 
-- 管道命令永远是前台模式（挂起 UI，切换终端原始模式）
-- 后台模式下如果设置了 `pipes`，实际上管道不会生效，只会执行主命令
+##### 第 1 层：`run()` 的后台模式
 
-**前后台模式对比表（修正后）**：
+**位置**: [exec.go#L99-L110](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L99-L110)
 
-| 维度 | 单命令前台 | 单命令后台 | 管道命令（永远前台） |
-|---|---|---|---|
-| UI 挂起 | 是 | 否 | 是 |
-| context cancel 时机 | defer cancel() | 永不 | defer cancel() |
-| I/O 连接 | 直连终端 | Buffer 捕获 | 直连终端 |
-| statusChan | 同步 close | goroutine 内 close | 永不 close（泄漏） |
-| 进程回收 | Wait() 回收 | Wait() 回收 | 只回收末进程，中间进程变僵尸 |
-| 信号转发 | Ctrl+C → SIGKILL | 不转发 | Ctrl+C → SIGKILL |
+```go
+func run(a *App, opts *shellOpts) (ok bool, errC chan error, outC chan string) {
+    errChan := make(chan error, 1)
+    statusChan := make(chan string, 1)
 
-**后台模式风险**：后台模式下 `ctx` 永不 cancel，如果子进程挂死，会一直存在直到 k9s 退出，没有超时或手动终止机制。
+    if opts.background {
+        if err := execute(opts, statusChan); err != nil {  // ← 同步调用！
+            errChan <- err
+            a.Flash().Errf("Exec failed %q: %s", opts, err)
+        }
+        close(errChan)   // execute 返回后才 close
+        return true, errChan, statusChan
+    }
+    // ... 前台模式走 Suspend 路径
+}
+```
+
+**关键代码事实**：
+- `run()` 的后台模式是**同步调用** `execute()` 的，不是异步
+- `execute()` 返回后才 `close(errChan)`，然后 `run()` 才返回
+- 所以**如果 `execute()` 阻塞，`run()` 也会阻塞**
+
+##### 第 2 层：`execute()` 中管道命令的创建
+
+**位置**: [exec.go#L199-L229](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L199-L229)
+
+```go
+cmds := make([]*exec.Cmd, 0, 1)
+cmd := exec.CommandContext(ctx, opts.binary, opts.args...)  // 主命令
+cmds = append(cmds, cmd)
+
+for _, p := range opts.pipes {  // 管道命令
+    tokens := strings.Split(p, " ")
+    if len(tokens) < 2 { continue }
+    cmd := exec.CommandContext(ctx, tokens[0], tokens[1:]...)
+    cmds = append(cmds, cmd)
+}
+
+var o, e bytes.Buffer
+err := pipe(ctx, opts, statusChan, &o, &e, cmds...)  // 同步调用！
+```
+
+**关键代码事实**：
+- 不管 background 是 true 还是 false，管道命令都会被创建
+- 管道命令和主命令共享同一个 `ctx`
+- `pipe()` 是同步调用的
+
+##### 第 3 层：`pipe()` 的管道路径（完全不检查 background）
+
+**位置**: [exec.go#L597-L614](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L597-L614)
+
+```go
+if len(cmds) > 1 {
+    // 管道模式：完全没有检查 opts.background！
+    last := len(cmds) - 1
+    for i := range cmds {
+        cmds[i].Stderr = os.Stderr        // stderr 直连终端
+        if i+1 < len(cmds) {
+            r, w := io.Pipe()
+            cmds[i].Stdout, cmds[i+1].Stdin = w, r
+        }
+    }
+    cmds[last].Stdout = os.Stdout          // stdout 直连终端
+
+    for _, cmd := range cmds { cmd.Start() }
+    return cmds[last].Wait()               // 阻塞等待末进程！
+}
+```
+
+**关键代码事实**：
+- 管道模式代码**完全不检查** `opts.background`
+- I/O 全部直连终端（Stdout、Stderr）
+- `cmds[last].Wait()` 是**阻塞的**，直到末进程退出
+- **所以管道模式永远是同步阻塞的，和 background 无关**
+
+##### 完整调用链总结（后台 + pipes）
+
+```
+executePlugin()
+    │
+    └─ cb()
+         │
+         └─ run(app, opts)  opts.background=true
+              │
+              └─ execute(opts, statusChan)   ← 同步调用，阻塞！
+                   │
+                   ├─ ctx, cancel := WithCancel()
+                   ├─ defer: if !background { cancel() }  ← background=true，所以不 cancel！
+                   ├─ signal goroutine 启动
+                   ├─ cmds = [cmd0, cmd1, cmd2]  （管道命令都创建了）
+                   │
+                   └─ pipe(ctx, opts, statusChan, &o, &e, cmds...)
+                        │
+                        ├─ len(cmds) > 1 → 管道路径
+                        ├─ io.Pipe 串联
+                        ├─ 全部 Start()
+                        └─ cmd[last].Wait()   ← 阻塞，直到末进程退出
+                             │
+                             └─ 返回 → execute() 返回 → run() 返回 → cb() 返回
+                                   （整个过程中 UI 线程被阻塞，k9s 界面冻结）
+```
+
+##### 后台 + pipes 组合的实际表现
+
+| 维度 | 实际表现 |
+|---|---|
+| 是否挂起 UI | 否（不调用 Halt/Suspend，tview 仍在运行） |
+| UI 是否响应 | **否**（UI 线程被 `pipe().Wait()` 阻塞，界面冻结） |
+| 终端输出 | **会输出**（管道末进程 stdout/stderr 直连终端，覆盖 tview 界面） |
+| 管道是否生效 | **完全生效**（所有管道命令都执行，和前台模式一样） |
+| context cancel | 不会自动 cancel（defer 中有 `if !background` 保护） |
+| statusChan | 永不 close（管道模式不写也不 close）→ goroutine 泄漏 |
+| 中间进程回收 | 只 Wait 末进程，中间进程变僵尸 |
+
+**一句话总结**：后台模式 + pipes = **管道完全生效，但 UI 线程被阻塞冻结**，而且终端输出会直接打印到 tview 界面上造成混乱。这本质上是一个 bug——管道模式没有像单命令后台模式那样用 goroutine 异步执行。
 
 ---
 
-#### 3.4.8 管道子进程生命周期时序图（3 进程管道，修正后）
+#### 3.4.8 三种执行模式对比表
+
+| 维度 | 单命令前台 | 单命令后台 | 管道前台 | 管道后台（bug） |
+|---|---|---|---|---|
+| 是否挂起 UI | 是（Halt + Suspend） | 否 | 是（Halt + Suspend） | 否 |
+| UI 线程是否阻塞 | 是（Suspend 中阻塞） | 否（pipe 内 goroutine 异步） | 是（Suspend 中阻塞） | **是（直接阻塞 UI 线程）** |
+| 终端输出 | 直连终端 | Buffer 捕获 | 直连终端 | 直连终端（覆盖 tview） |
+| context cancel 时机 | defer cancel() | 永不 | defer cancel() | **永不（defer 有 background 保护）** |
+| statusChan | 同步写入 + close | goroutine 内写入 + close | **不写也不 close** | **不写也不 close** |
+| 进程回收 | Wait() 回收 | Wait() 回收 | 只回收末进程 | 只回收末进程 |
+| Ctrl+C 信号 | 转发（SIGKILL） | 不转发 | 转发（SIGKILL） | 转发（SIGKILL） |
+| overwriteOutput | 不支持（前台） | 支持（从 Buffer 取） | 不支持 | 不支持 |
+| 管道是否生效 | 无管道 | 无管道 | 完全生效 | 完全生效 |
+
+> **管道后台模式是 bug**：本该像单命令后台一样用 goroutine 异步执行，但管道模式代码完全没检查 `opts.background`，导致同步阻塞 UI 线程。
+
+---
+
+#### 3.4.9 管道子进程生命周期时序图（3 进程管道）
 
 ```
   时间轴 ─────────────────────────────────────────────────────────────►
@@ -1003,7 +1180,7 @@ return nil   // 中断时不返回错误
     │                     │
     │                     └── cmd2.Wait() 返回 nil  （只有 cmd2 被回收）
     │              │
-    │              ├─ defer cancel()（ctx.Done() 触发，cmd0/cmd1 已死，无影响）
+    │              ├─ defer cancel()（非后台模式触发，cmd0/cmd1 已死则无影响）
     │              ├─ cmds 切片出栈，Cmd 对象可 GC
     │              │     └─ finalizer 调用 Process.Release()，但不 Wait()
     │              │        → cmd0/cmd1 仍然是僵尸进程，直到 k9s 退出
@@ -1024,7 +1201,7 @@ return nil   // 中断时不返回错误
 
 ---
 
-#### 3.4.9 管道模式的已知缺陷总结
+#### 3.4.10 管道模式的已知缺陷总结
 
 基于代码事实，管道模式存在以下真实缺陷：
 
@@ -1033,7 +1210,7 @@ return nil   // 中断时不返回错误
 3. **Buffer 无意义**：`o, e bytes.Buffer` 在管道模式下完全没用，白白分配内存
 4. **无法捕获标准输出**：`overwriteOutput: true` 在管道模式下无效，因为 stdout 直连终端
 5. **首进程无法读终端**：管道模式下 `cmd[0].Stdin` 是 nil，无法从终端读取输入
-6. **后台管道不生效**：`background: true` 只对单命令有效，管道命令永远前台
+6. **后台 + pipes 阻塞 UI**：`background: true` + pipes 组合不会异步执行，UI 线程被 `Wait()` 阻塞冻结
 
 ### 3.5 完成后状态处理：`executePlugin()` 后半段
 
@@ -1124,4 +1301,4 @@ func (p *Plugin) ShouldConfirm() bool {
 
 ## 一句话总结（修正后）
 
-K9s 插件系统 = **多源 YAML 配置合并** → **`Env` 字典按视图类型（Table/Xray/Container/Pulse）承载不同的上下文变量，其中 Xray 有 `SetEnvFn` 空实现但 `EnvFn()` 正常返回，Pulse 因无 `envFn` 字段完全无法运行插件** → **`Substitute()` 正则替换占位符** → **`exec.CommandContext` 在 `execute()` 中绑定 ctx 到所有子进程（`pipe()` 的第一个 ctx 参数被完全忽略）** → **管道模式下「全部 Start、仅 Wait 末进程」的结束边界导致中间进程变成僵尸直到 k9s 退出，同时 `statusChan` 永不 close 造成 goroutine 泄漏** → **单命令模式的后台/前台两种 I/O 模式通过 statusChan 回传结果，但管道模式的 statusChan 和 Buffer 完全无用**。
+K9s 插件系统 = **多源 YAML 配置合并** → **`Env` 字典按视图类型（Table/Xray/Container/Pulse）承载不同的上下文变量，其中 Xray 有 `SetEnvFn` 空实现但 `EnvFn()` 正常返回，Pulse 因无 `envFn` 字段完全无法运行插件** → **`Substitute()` 正则替换占位符** → **`run()` 负责 UI 层调度（挂起/恢复），`execute()` 负责 context 生命周期与子进程创建，`pipe()` 负责 I/O 连接与进程等待，三层各司其职** → **单命令后台模式在 `pipe()` 内用 goroutine 异步执行并捕获输出，但管道模式永远同步阻塞（bug：后台 + pipes 会冻结 UI）** → **管道模式下「全部 Start、仅 Wait 末进程」的结束边界导致中间进程变成僵尸直到 k9s 退出，同时 `statusChan` 永不 close 造成 goroutine 泄漏**。
