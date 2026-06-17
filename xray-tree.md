@@ -164,24 +164,131 @@ Pod 是关系收集的核心节点，向下发散出多个维度的关联资源�
 
 位置：[pod.go#L24-L64](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go#L24-L64)
 
+#### 6.1 正确的资源关系树
+
 ```
 Pod 节点
-    ├─ containerRefs() → Container
-    │   ├─ InitContainers
-    │   ├─ Containers
-    │   └─ EphemeralContainers
-    │       └─ envRefs()
-    │           ├─ env.ValueFrom.SecretKeyRef → addRef(SecGVR)
-    │           ├─ env.ValueFrom.ConfigMapKeyRef → addRef(CmGVR)
-    │           ├─ envFrom.ConfigMapRef → addRef(CmGVR)
-    │           └─ envFrom.SecretRef → addRef(SecGVR)
-    ├─ podVolumeRefs()
+    ├─ containerRefs() [pod.go#L85-L105](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go#L85-L105)
+    │   ├─ InitContainers （逐个遍历）
+    │   │   └─ envRefs()
+    │   │       ├─ env.ValueFrom.SecretKeyRef → addRef(SecGVR)
+    │   │       ├─ env.ValueFrom.ConfigMapKeyRef → addRef(CmGVR)
+    │   │       ├─ envFrom.ConfigMapRef → addRef(CmGVR)
+    │   │       └─ envFrom.SecretRef → addRef(SecGVR)
+    │   ├─ Containers （逐个遍历）
+    │   │   └─ envRefs() 同上
+    │   └─ ⚠️ EphemeralContainers（存在代码 bug，见 6.2 详细说明）
+    │
+    ├─ podVolumeRefs() [pod.go#L128-L147](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go#L128-L147)
     │   ├─ Secret 卷 → addRef(SecGVR)
     │   ├─ ConfigMap 卷 → addRef(CmGVR)
     │   └─ PVC 卷 → addRef(PvcGVR)
-    └─ serviceAccountRef() → ServiceAccount
-        └─ Secrets / ImagePullSecrets → addRef(SecGVR)
+    │
+    └─ serviceAccountRef() [pod.go#L107-L126](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go#L107-L126)
+        └─ ServiceAccount
+            └─ Secrets / ImagePullSecrets → addRef(SecGVR)
 ```
+
+#### 6.2 ⚠️ 临时容器分支的代码 bug
+
+**核心 bug 位置**：[pod.go#L98-L102](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go#L98-L102)
+
+```go
+func (*Pod) containerRefs(ctx context.Context, parent *TreeNode, ns string, spec *v1.PodSpec) error {
+    ctx = context.WithValue(ctx, KeyParent, parent)
+    var cre Container
+    // ... InitContainers（正确）
+    // ... Containers（正确）
+    for i := range len(spec.EphemeralContainers) {
+        // bug1: 引用了 &spec.Containers[i]，而非 &spec.EphemeralContainers[i]
+        // bug2: EphemeralContainer 类型是 v1.EphemeralContainer，
+        //       但 ContainerRes.Container 字段是 *v1.Container，类型根本不匹配
+        if err := cre.Render(ctx, ns, render.ContainerRes{Container: &spec.Containers[i]}); err != nil {
+            return err
+        }
+    }
+    return nil
+}
+```
+
+**两个层面的 bug**：
+
+| 问题 | 说明 | 影响 |
+|------|------|------|
+| 切片引用错误 | `spec.Containers[i]` 应为 `spec.EphemeralContainers[i]` | 取到的是普通容器，不是临时容器 |
+| 类型不匹配 | `ContainerRes.Container` 字段是 `*v1.Container`，而 `EphemeralContainers` 的元素类型是 `v1.EphemeralContainer`（不同的 Go 类型） | 即便写成 `&spec.EphemeralContainers[i]` 也无法编译通过 |
+
+#### 6.3 实际会取到哪些容器（数量不一致的情况）
+
+由于循环次数是 `len(spec.EphemeralContainers)`，但索引的是 `spec.Containers`，实际行为取决于两者的长度关系：
+
+**场景 1：临时容器数 ≤ 普通容器数**
+
+```
+spec.Containers         = [C0, C1, C2]   // len=3
+spec.EphemeralContainers = [E0, E1]       // len=2
+
+循环 i=0: 取 &spec.Containers[0] → C0 【重复】
+循环 i=1: 取 &spec.Containers[1] → C1 【重复】
+
+结果：C0、C1 被渲染了两次（普通容器一次 + 临时容器循环再一次）
+```
+
+**场景 2：临时容器数 > 普通容器数（风险最大）**
+
+```
+spec.Containers         = [C0]           // len=1
+spec.EphemeralContainers = [E0, E1, E2]  // len=3
+
+循环 i=0: 取 &spec.Containers[0] → C0 【重复】
+循环 i=1: 取 &spec.Containers[1] → 越界！→ runtime panic（索引越界）
+```
+
+**运行时 panic 风险**：当 `len(EphemeralContainers) > len(Containers)` 时，循环访问 `spec.Containers[i]` 会触发数组越界 panic，导致整个 Xray 视图崩溃。
+
+#### 6.4 哪些容器会被重复
+
+在不会 panic 的情况下（临时容器 ≤ 普通容器）：
+- **前 N 个普通容器会出现 2 次**（N = 临时容器数量）
+- 重复的容器节点挂载在同一个 Pod 下，因为 `Find` 去重是在父节点（Container 节点）的子树内做的，而不是在 Pod 下
+- Container 节点本身没有去重机制，同一个容器名可以作为兄弟节点重复挂载
+
+**修正后的关系树（实际渲染结果与理想对比）**：
+
+```
+理想情况（应该渲染）：
+  Pod/foo
+    ├─ Container/init-1
+    ├─ Container/app
+    ├─ Container/sidecar
+    └─ Container/debugger-ephemeral   ← 临时容器
+
+实际情况（当前 bug 渲染）：
+  Pod/foo
+    ├─ Container/init-1
+    ├─ Container/app                  ← 正常渲染
+    ├─ Container/sidecar              ← 正常渲染
+    ├─ Container/app                  ← 重复（临时容器循环 i=0 取到 Containers[0]）
+    └─ Container/sidecar              ← 重复（临时容器循环 i=1 取到 Containers[1]）
+```
+
+#### 6.5 ContainerRes 的类型限制
+
+`render.ContainerRes` 的定义 [render/container.go#L261-L267](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/render/container.go#L261-L267)：
+
+```go
+type ContainerRes struct {
+    Container *v1.Container    // 只能接收 *v1.Container
+    Status    *v1.ContainerStatus
+    MX        *mv1beta1.ContainerMetrics
+    // ...
+}
+```
+
+要正确支持临时容器，需要：
+1. `ContainerRes` 增加 `EphemeralContainer *v1.EphemeralContainer` 字段（或使用接口）
+2. `container.go` 的渲染逻辑区分处理两种容器类型
+3. `pod.go` 修正切片引用
 
 ### 7. ServiceAccount 收集路径
 
@@ -662,7 +769,13 @@ if status != "OK" {
             └─ Pod.Render()
                ├─ 创建 Pod 节点
                ├─ containerRefs() → Container.Render() × N
-               │   └─ envRefs() → addRef(Secret / ConfigMap)
+               │   ├─ 遍历 InitContainers → 每个 Init 容器
+               │   │   └─ envRefs() → addRef(Secret / ConfigMap)
+               │   ├─ 遍历 Containers → 每个普通容器
+               │   │   └─ envRefs() → addRef(Secret / ConfigMap)
+               │   └─ 遍历 EphemeralContainers ⚠️
+               │       └─ ⚠️ 实际取的是 spec.Containers[i]（引用错误）
+               │           └─ 前 N 个普通容器重复，或 len(Eph) > len(Con) 时 panic
                ├─ podVolumeRefs() → addRef(Secret / ConfigMap / PVC)
                ├─ serviceAccountRef() → ServiceAccount.Render()
                │   └─ addRef(Secret) × M
@@ -712,3 +825,87 @@ if status != "OK" {
 | [internal/model/registry.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/registry.go) | 资源渲染器注册表 |
 | [internal/view/xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go) | Xray 视图 UI 逻辑、update/hydrate/选中状态 |
 | [internal/ui/tree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/ui/tree.go) | 树 UI 组件基类、expandNodes、toggleCollapse |
+
+---
+
+## 八、临时容器 Bug 总结与修复建议
+
+### 8.1 问题根因汇总
+
+| 维度 | 说明 | 代码位置 |
+|------|------|----------|
+| 切片引用错误 | 循环遍历 EphemeralContainers，但索引了 Containers 切片 | [pod.go#L98-L101](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go#L98-L101) |
+| 类型系统不兼容 | `ContainerRes.Container` 是 `*v1.Container`，`EphemeralContainers` 元素是 `v1.EphemeralContainer` | [render/container.go#L261-L267](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/render/container.go#L261-L267) |
+| 测试未覆盖 | 测试数据（po.json、init.json、cilium.json）均不含临时容器，bug 无法被测试发现 | [pod_test.go#L18-L58](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod_test.go#L18-L58) |
+| 无容器级去重 | Container 节点之间没有去重机制，同容器名可作为兄弟节点重复挂载 | - |
+
+### 8.2 风险等级评估
+
+| 场景 | 临时容器数 vs 普通容器数 | 结果 | 风险等级 |
+|------|--------------------------|------|----------|
+| 无临时容器 | Eph = 0 | 无影响（循环不执行） | 低 |
+| 临时容器较少 | Eph ≤ Con | 前 N 个普通容器重复显示 | 中 |
+| 临时容器较多 | Eph > Con | 数组越界 → runtime panic → Xray 崩溃 | **高** |
+
+### 8.3 修复思路
+
+**方案一：最小修改（类型扩展）**
+
+```go
+// 1. ContainerRes 增加 EphemeralContainer 字段
+type ContainerRes struct {
+    Container          *v1.Container
+    EphemeralContainer *v1.EphemeralContainer  // 新增
+    Status             *v1.ContainerStatus
+    // ...
+}
+
+// 2. container.go Render() 区分处理
+func (c *Container) Render(ctx context.Context, ns string, o any) error {
+    co := o.(render.ContainerRes)
+    var name, image string
+    if co.EphemeralContainer != nil {
+        // 处理临时容器
+        name, image = co.EphemeralContainer.Name, co.EphemeralContainer.Image
+        // ... 提取临时容器的 env
+    } else {
+        // 处理普通容器
+        name, image = co.Container.Name, co.Container.Image
+        // ... 提取普通容器的 env
+    }
+    // ...
+}
+
+// 3. pod.go 修正引用
+for i := range spec.EphemeralContainers {
+    ec := &spec.EphemeralContainers[i]
+    if err := cre.Render(ctx, ns, render.ContainerRes{EphemeralContainer: ec}); err != nil {
+        return err
+    }
+}
+```
+
+**方案二：接口抽象（更干净）**
+
+```go
+// 定义通用容器接口
+type ContainerLike interface {
+    GetName() string
+    GetImage() string
+    GetEnv() []v1.EnvVar
+    GetEnvFrom() []v1.EnvFromSource
+}
+
+// 为 *v1.Container 和 *v1.EphemeralContainer 分别实现适配器
+```
+
+### 8.4 建议补充的测试用例
+
+需在 [pod_test.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod_test.go) 中新增：
+
+1. **withEphemeral** - 有 1 个临时容器，1 个普通容器
+   - 验证：总容器数 = 1（普通）+ 1（临时），无重复
+2. **ephemeralMoreThanContainers** - 3 个临时容器，1 个普通容器
+   - 验证：不 panic，容器数 = 1 + 3 = 4
+3. **ephemeralOnly** - 只有临时容器（极端场景）
+   - 验证：容器正确渲染
