@@ -546,6 +546,285 @@ return asRuntimeObjects(parseRules(client.ClusterScope, "-", role.Rules)), nil
 
 ---
 
+## 2.8 策略视图展示层：行标识与同资源不同来源的覆盖
+
+### 2.8.1 渲染链路概览
+
+DAO 层输出 `[]runtime.Object`（每条 PolicyRes 包装为一个 runtime.Object），经过以下链路渲染为表格行：
+
+```
+DAO.List → []runtime.Object
+    ↓
+TableData.Render → Hydrate → Renderer.Render (Policy.Render)
+    ↓ 逐条将 PolicyRes 渲染为 Row（设置 r.ID）
+    ↓
+Rows []Row → TableData.Update
+    ↓ 通过 Row.ID 匹配，构建 RowEvents
+    ↓
+RowEvents.index (map[string]int)  ← ⚠️ 关键：以 ID 为键的 map
+    ↓
+Table 组件展示
+```
+
+### 2.8.2 Row.ID 的构造
+
+位于 [Policy.Render](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/render/policy.go#L60-L77)
+
+```go
+func (Policy) Render(o any, _ string, r *model1.Row) error {
+    p, ok := o.(*PolicyRes)
+    // ...
+    r.ID = client.FQN(p.Namespace, p.Resource)
+    // ...
+}
+```
+
+`client.FQN` 定义：当 ns 非空时返回 `ns + "/" + n`，否则返回 `n`。
+
+**Row.ID = `Namespace + "/" + Resource`**（Namespace 非空时）
+
+| PolicyRes 字段 | Row.ID 贡献 | 说明 |
+|---------------|-------------|------|
+| Namespace | ✅ 参与 | 命名空间前缀 |
+| Resource | ✅ 参与 | 资源路径（如 `"core/pods"`） |
+| Group | ❌ 不参与 | 不在 ID 中 |
+| Binding | ❌ 不参与 | **关键：来源标识不在 ID 中** |
+| Verbs | ❌ 不参与 | 不在 ID 中 |
+
+**Row.ID 示例**：
+
+| PolicyRes | Row.ID |
+|-----------|--------|
+| {Namespace:"*", Resource:"core/pods", Binding:"CR:admin"} | `"*/core/pods"` |
+| {Namespace:"default", Resource:"core/pods", Binding:"RO:writer"} | `"default/core/pods"` |
+| {Namespace:"default", Resource:"core/pods", Binding:"RO:reader"} | `"default/core/pods"` ⚠️ 与上一条相同！ |
+
+### 2.8.3 Hydrate：逐条渲染，无去重
+
+位于 [Hydrate](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/model1/helpers.go#L58-L62)
+
+```go
+func Hydrate(ns string, oo []k8sruntime.Object, rr Rows, re Renderer) error {
+    return parallelRender(len(oo), func(i int) error {
+        return re.Render(oo[i], ns, &rr[i])
+    })
+}
+```
+
+- 预分配 `rows = make(Rows, len(oo))`，每个对象对应一个 Row
+- 逐条调用 `Policy.Render`，将 PolicyRes 渲染为 Row
+- **无任何去重逻辑**：即使两条 PolicyRes 生成了相同的 Row.ID，它们仍然是 Rows 列表中的不同元素
+
+**Hydrate 后的 Rows 示例**：
+
+```
+rows[0] = {ID: "*/core/pods", Fields: ["*", "pods", "core", "CR:admin", ...]}
+rows[1] = {ID: "default/core/pods", Fields: ["default", "pods", "core", "RO:writer", ...]}
+rows[2] = {ID: "default/core/pods", Fields: ["default", "pods", "core", "RO:reader", ...]}
+                                                       ⚠️ ID 重复！
+```
+
+### 2.8.4 TableData.Update：Row.ID 碰撞时的覆盖
+
+位于 [TableData.Update](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/model1/table_data.go#L425-L457)
+
+```go
+func (t *TableData) Update(rows Rows) {
+    empty := t.Empty()
+    kk := sets.New[string]()
+    t.mx.Lock()
+    for _, row := range rows {
+        kk.Insert(row.ID)           // 收集所有 ID
+        if empty {
+            t.rowEvents.Add(NewRowEvent(EventAdd, row))  // 首次：直接 Add
+            continue
+        }
+        if index, ok := t.rowEvents.FindIndex(row.ID); ok {
+            // ⚠️ ID 已存在：用新行覆盖旧行
+            ev, ok := t.rowEvents.At(index)
+            // ...
+            t.rowEvents.Set(index, NewRowEventWithDeltas(row, delta))
+            continue
+        }
+        t.rowEvents.Add(NewRowEvent(EventAdd, row))
+    }
+    t.mx.Unlock()
+    // ...
+}
+```
+
+**关键路径**：`FindIndex` 基于 `reIndex`（即 `map[string]int`），以 Row.ID 为键。
+
+### 2.8.5 RowEvents.Add 的 index 覆盖机制
+
+位于 [RowEvents.Add](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/model1/row_event.go#L136-L139)
+
+```go
+func (r *RowEvents) Add(re RowEvent) {
+    r.events = append(r.events, re)        // 追加到 events 切片
+    r.index[re.Row.ID] = len(r.events) - 1 // ⚠️ 更新 index map
+}
+```
+
+**当多条记录的 Row.ID 相同时**：
+
+| 步骤 | 操作 | events 切片 | index map |
+|------|------|-------------|-----------|
+| Add(row1) | ID="default/core/pods" | [row1] | `{"default/core/pods": 0}` |
+| Add(row2) | ID="default/core/pods" | [row1, row2] | `{"default/core/pods": 1}` ⚠️ 覆盖！ |
+
+**结果**：
+- `events` 切片中同时存在 row1 和 row2（都展示在界面上）
+- `index` map 中 `"default/core/pods"` 指向 index=1（row2）
+- `FindIndex("default/core/pods")` 返回 `(1, true)`，只能找到 row2
+
+### 2.8.6 覆盖对后续操作的影响
+
+**场景一：Update 中的增量更新**
+
+如果表数据非空（`empty=false`），Update 循环中对 rows 逐条处理：
+
+```
+rows[1] = {ID: "default/core/pods", Fields: [...RO:writer...]}
+rows[2] = {ID: "default/core/pods", Fields: [...RO:reader...]}
+```
+
+- 处理 rows[1]：`FindIndex("default/core/pods")` 可能找到旧数据 → Set 更新
+- 处理 rows[2]：`FindIndex("default/core/pods")` 找到刚更新的 rows[1] → **覆盖为 rows[2]**
+
+**最终效果**：`events` 切片中行 index 被 Set 覆盖，后续相同 ID 的行会替换前面的行。但由于初始 Render 时 `empty=true`（首次加载），走的是 Add 路径——所有行都被追加，都存在于 events 切片中。
+
+**场景二：Delete 操作**
+
+位于 [TableData.Delete](file:///d:/fz/0601-2/solo-dogfeeding/code/18-k9s/internal/model1/table_data.go#L460-L482)
+
+```go
+func (t *TableData) Delete(newKeys sets.Set[string]) {
+    victims := sets.New[string]()
+    t.rowEvents.Range(func(_ int, e RowEvent) bool {
+        if newKeys.Has(e.Row.ID) {
+            delete(newKeys, e.Row.ID)
+        } else {
+            victims.Insert(e.Row.ID)
+        }
+        return true
+    })
+    for _, id := range victims.UnsortedList() {
+        t.rowEvents.Delete(id)  // Delete 只删除 index map 指向的那一条
+    }
+}
+```
+
+Update 后 `kk` 包含 `"default/core/pods"`（只一次，因为 sets 去重），Delete 遍历时第一个匹配的会从 newKeys 中删除，**第二个相同 ID 的行不会被当作 victim**（因为 ID 已从 newKeys 中删除）。这意味着两条相同 ID 的行都不会被删除——符合预期（都是新数据）。
+
+但如果有一次更新只移除了其中一个来源，Delete 的行为会出问题：因为无法通过 ID 区分两条记录，删除操作可能删掉错误的行。
+
+### 2.8.7 同资源不同来源被覆盖的精确场景
+
+**触发条件**：两条 PolicyRes 的 `Namespace` 和 `Resource` 都相同，但 `Binding` 不同
+
+| 条件 | 示例 |
+|------|------|
+| Namespace 相同 | `"default"` |
+| Resource 相同 | `"core/pods"` |
+| Binding 不同 | `"CR:admin"` vs `"RO:writer"` |
+| Row.ID 相同 | `"default/core/pods"` |
+
+**什么时候会出现**：
+
+1. **ClusterRoleBinding + RoleBinding 授予同一命名空间同一资源**
+   - ClusterRoleBinding → parseRules("*", "CR:admin", ...) → {Namespace:"*", Resource:"core/pods", Binding:"CR:admin"}
+   - RoleBinding → parseRules("default", "RO:writer", ...) → {Namespace:"default", Resource:"core/pods", Binding:"RO:writer"}
+   - Row.ID: `"*/core/pods"` vs `"default/core/pods"` → **不同，不会覆盖** ✅
+
+2. **同一命名空间两个 RoleBinding 授予不同 Role 对同一资源**
+   - RoleBinding/rb-1 → Role/reader → parseRules("default", "RO:reader", ...) → {Namespace:"default", Resource:"core/pods", Binding:"RO:reader"}
+   - RoleBinding/rb-2 → Role/writer → parseRules("default", "RO:writer", ...) → {Namespace:"default", Resource:"core/pods", Binding:"RO:writer"}
+   - Row.ID: `"default/core/pods"` vs `"default/core/pods"` → **相同，会覆盖** ❌
+
+3. **同名 Role 误纳入场景**
+   - ns-a/Role/admin → parseRules("ns-a", "RO:admin", ...) → {Namespace:"ns-a", Resource:"core/pods", Binding:"RO:admin"}
+   - ns-b/Role/admin → parseRules("ns-b", "RO:admin", ...) → {Namespace:"ns-b", Resource:"core/pods", Binding:"RO:admin"}
+   - Row.ID: `"ns-a/core/pods"` vs `"ns-b/core/pods"` → **不同，不会覆盖** ✅
+
+**结论**：只有同一命名空间内、不同 Binding 授予同一资源时，Row.ID 才会碰撞。
+
+### 2.8.8 首次加载 vs 增量更新的不同行为
+
+**首次加载（empty=true）**：
+
+```go
+if empty {
+    t.rowEvents.Add(NewRowEvent(EventAdd, row))
+    continue
+}
+```
+
+所有行都走 `Add` 路径，追加到 events 切片。即使 ID 重复，两条记录都存在于 events 中。
+
+- events: `[row_CR:admin, row_RO:writer]`  → 界面上两行都显示 ✅
+- index: `{"default/core/pods": 1}` → 指向最后一行 ⚠️
+
+**增量更新（empty=false）**：
+
+```go
+if index, ok := t.rowEvents.FindIndex(row.ID); ok {
+    t.rowEvents.Set(index, NewRowEventWithDeltas(row, delta))
+    continue
+}
+```
+
+遍历 rows 时，第二条相同 ID 的行通过 `FindIndex` 找到 index=1（或 0，取决于 map 的最后状态），然后 `Set` 覆盖。但由于两条相同 ID 的行在 rows 中紧邻，第一条行的 Set 覆盖了旧数据，第二条行的 FindIndex 仍然找到同一个 index（map 未区分），再次覆盖。
+
+**最终效果**：增量更新时，相同 ID 的后一条会覆盖前一条的更新事件，但 events 切片中两条数据仍然共存（因为 Set 只修改指定 index 的元素，不影响另一条）。
+
+### 2.8.9 展示边界与 DAO 层"追加不合并"结论的衔接
+
+**DAO 层的结论**：跨角色追加使用 `append`，不触发 `Upsert/Merge`，不同角色的 PolicyRes 作为独立条目共存，来源信息（Namespace、Binding）各自保留。✅ 正确。
+
+**展示层的事实**：DAO 层输出的多条独立 PolicyRes，经过渲染后生成了可能重复的 Row.ID。展示层通过 `RowEvents.index`（`map[string]int`）管理行，相同 ID 时 index map 只保留最后一个，但 events 切片中所有行都存在。
+
+**衔接关系**：
+
+| 层级 | 行为 | 来源信息 | 用户可见 |
+|------|------|----------|----------|
+| DAO 层 | append 追加，不合并 | ✅ 保留在 PolicyRes 中 | — |
+| 渲染层 | Hydrate 逐条渲染 | ✅ 保留在 Row.Fields 中 | — |
+| 展示层 | Add 追加到 events 切片 | ✅ 两行都存在 | ✅ 界面上两行都显示 |
+| 展示层 index | map 只保留最后一个 ID | ⚠️ index 指向最后一行 | — |
+| 增量更新 | FindIndex 找到 index 覆盖 | ⚠️ 相同 ID 的更新事件互相覆盖 | ⚠️ 可能丢失增量更新事件 |
+
+**核心发现**：
+
+1. **首次加载时，同资源不同来源不会被覆盖**：所有行都走 Add 路径，events 切片中保留所有行，界面上两行都显示。DAO 层"追加不合并"的结论在首次加载场景下成立。
+
+2. **增量更新时，同资源不同来源可能丢失更新事件**：因为 `FindIndex` 只能找到 index map 指向的那一条，相同 ID 的另一条的更新事件可能丢失。但由于 Policy 视图通常是完整重建（不是增量更新），这个场景在实际中不太可能触发。
+
+3. **index map 的覆盖不影响界面展示**：index map 主要用于 FindIndex/Delete 操作，不影响 events 切片的渲染。界面上两行都显示。
+
+4. **真正的风险在 Delete**：如果数据源变更导致某一行需要删除，Delete 只能删除 index map 指向的那条，无法精确定位同 ID 的另一条。
+
+### 2.8.10 Row.ID 设计与 DAO 层 GR 键的对比
+
+| 维度 | DAO 层 GR 键 | 展示层 Row.ID |
+|------|-------------|---------------|
+| 构造 | `Group + "/" + Resource` | `Namespace + "/" + Resource` |
+| 包含 Group | ✅ | ❌ |
+| 包含 Namespace | ❌ | ✅ |
+| 包含 Binding | ❌ | ❌ |
+| 去重范围 | parseRules 内部 | 展示层全局 |
+| 碰撞概率 | 较低（Group 区分） | 较高（不含 Group） |
+
+**一个微妙的不一致**：DAO 层用 GR（含 Group）做合并判断，展示层用 Row.ID（含 Namespace 但不含 Group）做行标识。这意味着：
+
+- DAO 层中 `core/pods` 和 `apps/deployments` 是不同 GR，不会合并
+- 展示层中 `*/core/pods` 和 `*/apps/deployments` 也是不同 ID，不会覆盖
+- 但如果两个不同 Group 有相同的 Resource 名称（如 `core/secrets` 和 `custom/secrets`），DAO 层不合并（GR 不同），展示层也不覆盖（Resource 路径不同：`core/secrets` vs `custom/secrets`）
+
+**Row.ID 中的 Resource 值来自 `p.Resource`**，其值是经过 FQN 拼接的（如 `"core/pods"`），已经包含了 Group 信息，所以不同 Group 的同名资源实际上 Row.ID 不同。
+
+---
+
 ## 三、权限预检机制
 
 ### 3.1 权限预检层次
@@ -983,12 +1262,25 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | 层级一 | parseRules 内部（同一角色） | Upsert/Merge | ✅ 保留 | 同一角色内 Namespace 和 Binding 相同，即使 GR 碰撞也不会丢失 |
 | 层级二 | loadClusterRoleBinding/loadRoleBinding 内部（跨角色） | append | ✅ 保留 | append 是纯追加，不触发合并，不同角色生成独立 PolicyRes 条目 |
 | 层级三 | List 方法（跨绑定类型） | append | ✅ 保留 | append 不触发合并，ClusterRoleBinding 和 RoleBinding 的结果各自独立 |
+| 层级四 | 展示层 TableData.Update | Row.ID 去重 | ⚠️ 部分保留 | 首次加载两行都显示；增量更新时相同 ID 行的更新事件互相覆盖 |
 
-**核心结论**：当前代码中，Merge 只在 parseRules 内部触发（层级一），且此时 Namespace 和 Binding 参数相同，不会丢失来源信息。跨角色和跨绑定类型的追加使用原生 append，不会合并。
+**核心结论**：当前代码中，Merge 只在 parseRules 内部触发（层级一），且此时 Namespace 和 Binding 参数相同，不会丢失来源信息。跨角色和跨绑定类型的追加使用原生 append，不会合并。展示层首次加载时也不丢失，但增量更新存在 Row.ID 碰撞风险。
 
 **用户感知问题**：虽然来源信息保留，但同一 GR 的权限分散在不同行中，用户需要自行在脑中合并才能理解完整权限。这不属于"信息丢失"，而是"信息分散"。
 
-### 6.2 同名角色误纳入（独立 Bug 类别）
+### 6.2 展示层 Row.ID 覆盖（独立问题）
+
+| 条件 | 说明 |
+|------|------|
+| 触发条件 | 同一命名空间内，不同 Binding 授予同一资源（Row.ID 相同） |
+| Row.ID 构造 | `Namespace + "/" + Resource`，不含 Binding |
+| 首次加载 | ✅ 两行都显示（Add 路径，events 切片共存） |
+| 增量更新 | ⚠️ 相同 ID 行的更新事件互相覆盖（FindIndex 只找最后一条） |
+| Delete 操作 | ⚠️ 无法通过 ID 区分同 ID 的两条记录 |
+| index map | 只保留最后写入的 index，FindIndex 无法找到另一条 |
+| 不受影响 | 不同 Namespace 的同资源（Row.ID 不同）；ClusterRoleBinding 的 `"*"` 前缀区分 |
+
+### 6.3 同名角色误纳入（独立 Bug 类别）
 
 | 条件 | 说明 |
 |------|------|
@@ -999,7 +1291,7 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | 影响 | 显示了主体实际没有的权限 |
 | 不受影响 | ClusterRole（名称全局唯一）、不同名称的 Role |
 
-### 6.3 ClusterRole 命名空间偏移（独立问题）
+### 6.4 ClusterRole 命名空间偏移（独立问题）
 
 | 条件 | 说明 |
 |------|------|
@@ -1008,7 +1300,7 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | 影响 | ClusterRole 的权限行只显示一个命名空间（最后覆盖的），遗漏其他命名空间 |
 | 对比 | ClusterRoleBinding 路径使用 NotNamespaced="*"，显示正确 |
 
-### 6.4 权限缓存的边界
+### 6.5 权限缓存的边界
 
 | 方面 | 设计 | 潜在问题 |
 |------|------|----------|
@@ -1018,7 +1310,7 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | 拒绝结果缓存 | 缓存 false | 被拒绝后管理员立刻授权，用户仍看到拒绝 |
 | 连接状态 | 断开不清缓存 | 连接恢复后旧缓存可能无效 |
 
-### 6.5 权限不足展示的异常路径
+### 6.6 权限不足展示的异常路径
 
 | 问题 | 位置 | 影响 |
 |------|------|------|
@@ -1029,7 +1321,7 @@ NAMESPACE | NAME | API-GROUP | BINDING | GET | LIST | WATCH | CREATE | PATCH | U
 | editRes 覆盖原始错误 | editRes | API Server 返回的详细原因被替换为通用消息 |
 | Init 错误取决于调用方 | App.inject | 部分入口可能静默失败无 Flash |
 
-### 6.6 渐进式权限检查的设计权衡
+### 6.7 渐进式权限检查的设计权衡
 
 1. **视图初始化检查**：确保有 list 权限才能打开视图（粗粒度前置检查）
 2. **动作按钮不检查**：基于资源类型而非用户权限（避免大量 API 调用）
