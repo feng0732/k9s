@@ -26,7 +26,7 @@ Screen Dump（屏幕快照）是 k9s 提供的一项功能，允许用户将当�
 
 保存操作主要有三个核心函数，分别处理不同格式的文件：
 
-#### 2.2.1 表格保存 (CSV) - `saveTable`
+##### 2.2.1 表格保存 (CSV) - `saveTable`
 
 位置：[table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go#L45-L84)
 
@@ -36,11 +36,25 @@ func saveTable(dir, title, path string, mdata *model1.TableData) (string, error)
 
 - 输入：目录路径、资源标题、资源路径、表格数据
 - 输出：保存的文件路径
-- 流程：
-  1. 通过 `computeFilename` 计算文件名
-  2. 以 `0600` 权限创建文件
-  3. 使用 `csv.Writer` 写入列名和所有行数据
-  4. 刷新缓冲区并返回文件路径
+
+**命名空间预处理（关键逻辑）**：
+
+```go
+ns := mdata.GetNamespace()
+if client.IsClusterWide(ns) {
+    ns = client.NamespaceAll  // 统一转换为 "all"
+}
+```
+
+这里是整个命名逻辑的关键转换点，详细说明见第三章。
+
+- 完整流程：
+  1. 获取表格的命名空间 `ns`
+  2. 如果 `ns` 是集群范围相关值，统一转换为 `"all"`
+  3. 通过 `computeFilename` 计算文件名
+  4. 以 `0600` 权限创建文件
+  5. 使用 `csv.Writer` 写入列名和所有行数据
+  6. 刷新缓冲区并返回文件路径
 
 #### 2.2.2 日志保存 (LOG) - `saveData`
 
@@ -70,40 +84,111 @@ func saveYAML(dir, name, raw string) (string, error)
 
 ## 三、文件命名规则
 
-### 3.1 命名计算函数 - `computeFilename`
+### 3.1 关键常量定义
+
+位置：[types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/types.go#L16-L55)
+
+| 常量名 | 值 | 含义 |
+|--------|----|------|
+| `NamespaceAll` | `"all"` | 表示"所有命名空间"视图 |
+| `ClusterScope` | `"-"` | 表示资源本身是集群范围的（无命名空间） |
+| `BlankNamespace` | `""` | 空命名空间 |
+
+### 3.2 `IsClusterWide` 判断函数
+
+位置：[helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/helpers.go#L20-L23)
+
+```go
+func IsClusterWide(ns string) bool {
+    return ns == NamespaceAll || ns == BlankNamespace || ns == ClusterScope
+}
+```
+
+该函数在 `ns` 为以下任意值时返回 `true`：
+- `"all"` - 用户切换到所有命名空间视图
+- `""` - 空命名空间
+- `"-"` - 资源本身是集群范围的（如 nodes、namespaces）
+
+### 3.3 从保存入口到文件名生成的完整路径
+
+**核心流程**：
+
+```
+saveTable()
+    ↓ 步骤1
+ns = mdata.GetNamespace()  // 获取当前命名空间
+    ↓ 步骤2
+if IsClusterWide(ns) {     // 判断是否为集群范围相关
+    ns = NamespaceAll      // 统一转换为 "all" ← 关键转换！
+}
+    ↓ 步骤3
+computeFilename(dir, ns, title, path)  // 传入转换后的 ns
+    ↓ 步骤4
+if ns == ClusterScope {    // 判断 ns == "-"
+    // 注意：此分支实际上永远不会执行！
+    // 因为步骤2已经把所有符合条件的 ns 都转换成了 "all"
+} else {
+    fName = fmt.Sprintf(FullFmat, name, ns, now)  // 始终走此分支
+}
+```
+
+**关键发现**：
+- `computeFilename` 中的 `if ns == client.ClusterScope` 判断实际上**永远不会成立**
+- 因为在 `saveTable` 中，所有 `IsClusterWide` 的值（包括 `"-"`）都已被提前替换为 `"all"`
+- 因此，**所有表格快照的文件名都会包含命名空间部分**，使用 `FullFmat` 格式
+
+### 3.4 命名计算函数 - `computeFilename`
 
 位置：[table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go#L22-L43)
 
 核心逻辑：
 
 ```go
-name := title + "-" + data.SanitizeFileName(path)
-if path == "" {
-    name = title
-}
+func computeFilename(dumpPath, ns, title, path string) (string, error) {
+    now := time.Now().UnixNano()
+    
+    // 构建名称主体
+    name := title + "-" + data.SanitizeFileName(path)
+    if path == "" {
+        name = title
+    }
 
-// 集群范围资源（无命名空间）
-if ns == client.ClusterScope {
-    fName = fmt.Sprintf(ui.NoNSFmat, name, now)  // "%s-%d.csv"
-} else {
-    fName = fmt.Sprintf(ui.FullFmat, name, ns, now)  // "%s-%s-%d.csv"
+    // 由于 saveTable 中的转换，ns 只能是具体命名空间或 "all"
+    // 所以这里始终使用 FullFmat 格式
+    if ns == client.ClusterScope {
+        fName = fmt.Sprintf(ui.NoNSFmat, name, now)  // 实际上永远不会执行
+    } else {
+        fName = fmt.Sprintf(ui.FullFmat, name, ns, now)  // "%s-%s-%d.csv"
+    }
+
+    return strings.ToLower(filepath.Join(dir, fName)), nil
 }
 ```
 
-### 3.2 文件名格式常量
+### 3.5 文件名格式常量
 
 位置：[table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/ui/table_helper.go#L35-L39)
 
-| 常量名 | 格式 | 适用场景 |
-|--------|------|---------|
-| `FullFmat` | `%s-%s-%d.csv` | 有命名空间的资源 |
-| `NoNSFmat` | `%s-%d.csv` | 集群范围资源 |
+| 常量名 | 格式 | 实际使用场景 |
+|--------|------|-------------|
+| `FullFmat` | `%s-%s-%d.csv` | **所有表格快照**（包括集群范围资源） |
+| `NoNSFmat` | `%s-%d.csv` | 定义但未使用（死代码） |
 
-### 3.3 时间戳
+### 3.6 三种场景的实际命名
+
+| 场景 | 原始 ns | saveTable 转换后 | 文件名格式 | 示例 |
+|-----|---------|----------------|-----------|------|
+| 具体命名空间（如 default） | `"default"` | `"default"` | `{title}-{path}-{ns}-{timestamp}.csv` | `pods-nginx-default-1620000000000000000.csv` |
+| 所有命名空间视图 | `"all"` | `"all"` | `{title}-{path}-all-{timestamp}.csv` | `pods--all-1620000000000000000.csv` |
+| 集群范围资源（如 nodes） | `"-"` | `"all"` | `{title}-all-{timestamp}.csv` | `nodes-all-1620000000000000000.csv` |
+
+**注意**：集群范围资源（如 nodes、namespaces）的快照文件名中也会包含 `-all-` 命名空间部分，这是代码转换的结果。
+
+### 3.7 时间戳
 
 使用 `time.Now().UnixNano()` 纳秒级时间戳，确保文件名唯一性。
 
-### 3.4 文件名清洗 - `SanitizeFileName`
+### 3.8 文件名清洗 - `SanitizeFileName`
 
 位置：[helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/data/helpers.go#L27-L29)
 
@@ -117,12 +202,13 @@ func SanitizeFileName(name string) string {
 
 将 `:` 和 `/` 替换为 `-`，确保文件名合法。
 
-### 3.5 不同类型的文件命名示例
+### 3.9 不同类型的文件命名总结
 
 | 视图类型 | 命名模式 | 示例 |
 |---------|---------|------|
-| 表格 (有命名空间) | `{title}-{path}-{ns}-{timestamp}.csv` | `pods-nginx-ns1-default-1620000000000000000.csv` |
-| 表格 (集群范围) | `{title}-{timestamp}.csv` | `nodes-1620000000000000000.csv` |
+| 表格（所有场景） | `{title}-{path}-{ns}-{timestamp}.csv` | `pods-nginx-default-1620000000000000000.csv` |
+| 表格（all 命名空间） | `{title}-{path}-all-{timestamp}.csv` | `pods--all-1620000000000000000.csv` |
+| 表格（集群范围资源） | `{title}-all-{timestamp}.csv` | `nodes-all-1620000000000000000.csv` |
 | 日志 | `{fqn}-{timestamp}.log` | `default-nginx-7f-1620000000000000000.log` |
 | YAML 详情 | `{name}--{timestamp}.yaml` | `pod-nginx--1620000000.yaml` |
 
@@ -301,8 +387,13 @@ func (*ScreenDump) List(ctx context.Context, _ string) ([]runtime.Object, error)
 table.go: saveCmd()
     ↓
 table_helper.go: saveTable(dir, title, path, mdata)
+    ├─ ns = mdata.GetNamespace()
+    ├─ if IsClusterWide(ns) { ns = "all" }   ← 关键转换
     ↓
 table_helper.go: computeFilename(dumpPath, ns, title, path)
+    ├─ 构建 name = title + "-" + SanitizeFileName(path)
+    ├─ ns 只能是具体命名空间或 "all"（永远不会是 "-"）
+    └─ 始终使用 FullFmat: name + "-" + ns + "-" + timestamp + ".csv"
     ↓
 创建 CSV 文件，写入数据
     ↓
@@ -334,13 +425,17 @@ render/screen_dump.go: Render() 渲染文件列表
 | 文件 | 作用 |
 |-----|------|
 | [internal/view/screen_dump.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/screen_dump.go) | Screen Dump 视图实现 |
-| [internal/view/table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go) | 表格保存和文件名计算 |
+| [internal/view/table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go) | 表格保存和文件名计算核心逻辑 |
 | [internal/view/yaml.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/yaml.go) | YAML 保存函数 |
+| [internal/view/log.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/log.go) | 日志保存函数 |
 | [internal/dao/screen_dump.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/dao/screen_dump.go) | Screen Dump DAO 层 |
 | [internal/render/screen_dump.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/render/screen_dump.go) | Screen Dump 渲染器 |
 | [internal/config/k9s.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/k9s.go) | 目录配置相关 |
 | [internal/config/files.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/files.go) | 目录初始化 |
 | [internal/config/data/helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/data/helpers.go) | 文件名清洗 |
+| [internal/client/types.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/types.go#L16-L55) | 命名空间相关常量定义 |
+| [internal/client/helpers.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/helpers.go#L20-L23) | IsClusterWide 函数 |
 | [internal/client/gvrs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/client/gvrs.go) | SdGVR 定义 |
 | [internal/view/registrar.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/registrar.go) | 视图注册 |
 | [internal/config/alias.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/config/alias.go) | 命令别名 |
+| [internal/ui/table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/ui/table_helper.go#L35-L39) | 文件名格式常量定义 |
