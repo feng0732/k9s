@@ -44,13 +44,19 @@ k9s 定义了一套完整的按键常量体系，将 rune（字符码）映射�
 - `NewSharedKeyAction(d, a, visible)`: 共享动作（Shared=true，菜单提示中不重复显示）
 - `NewKeyActionWithOpts(d, a, opts)`: 完整选项动作
 
-**关键方法**:
-- `Add(k, ka)`: 添加单个键动作
-- `Bulk(km)`: 批量添加键映射
-- `Merge(aa)`: 合并另一个 KeyActions（同名键会被覆盖）
+**关键方法**（`internal/ui/action.go`）:
+- `Add(k, ka)`: 添加单个键动作（直接赋值 `actions[k] = ka`，已存在则覆盖）
+- `Bulk(km)`: 批量添加键映射（遍历 `for k,v := range km { actions[k] = v }`）
+- `Merge(aa)`: **增量合并**另一个 KeyActions——只遍历 `aa` 中存在的键并覆盖同名键，**aa 中不存在的旧键会保留在原集合中，不会被清除**
 - `Get(k)`: 根据键查找动作
-- `ClearDanger()`: 清除所有标记为危险的动作
-- `Hints()`: 生成菜单提示（排除 Shared=true 的共享键）
+- `Delete(kk...)`: 删除指定键
+- `Clear()`: 清空所有动作
+- `ClearDanger()`: **选择性清除**——遍历全部动作，只删除 `Opts.Dangerous == true` 的动作
+- `Range(f)`: 遍历全部键动作（读锁保护下遍历快照）
+- `Reset(aa)`: 等价于 `Clear()` + `Merge(aa)`（先清空再合并，全量替换）
+- `Hints()`: 生成菜单提示（排除 `Opts.Shared=true` 的共享键）
+
+> **核心设计差异**: `Merge()` 是**增量覆盖**（保留旧键），`Reset()` 是**全量替换**（先清空再合并）。k9s 刷新时使用的是 `Merge()`，这带来了"静态层保留、动态层覆盖"的特性。
 
 ---
 
@@ -245,10 +251,12 @@ func (t *Table) keyboard(evt *tcell.EventKey) *tcell.EventKey {
    - `KeyW` → Warp To Namespace（跳转到选中资源所在命名空间）
    - `Key0~Key9` → 切换到收藏命名空间（根据用户配置动态生成数字快捷键）
 
-3. **非只读模式 + 权限检查**:
-   - 有 `edit` 权限: `KeyE` → Edit（编辑资源，危险操作）
-   - 有 `delete` 权限: `CtrlD` → Delete（删除资源，危险操作）
-   - 只读模式下: 调用 `ClearDanger()` 清除所有危险操作键
+3. **非只读模式 + 权限检查**（`!IsReadOnly()` 且 `ConOK()`）:
+   - 有 `edit` 权限: `KeyE` → Edit（编辑资源，危险操作）—— 添加到 **临时 aa**
+   - 有 `delete` 权限: `CtrlD` → Delete（删除资源，危险操作）—— 添加到 **临时 aa**
+   - **只读模式下**: 执行 `b.Actions().ClearDanger()` —— 直接作用于现有集合 `b.Actions()`，清除其中所有 `Dangerous=true` 的旧动作（注意：此时 Merge 还未执行，清除的是上一次刷新留下的危险动作）。同时只读模式下不会向 aa 中添加 Edit/Delete 等危险键。
+
+> **ClearDanger() 的精确执行位置**: 位于 `refreshActions()` 第 655 行，在 `Merge(aa)` 之前。先清除旧集合中的危险动作，再合并不含危险动作的新集合 aa。同时各具体资源的 `bindKeys()` 内部也会判断 `IsReadOnly()`（如 Pod.bindKeys 第 127 行），只读模式下不向 aa 注入危险动作，两层防护确保只读模式下绝对没有危险操作键。
 
 4. **非 K9s 内部资源** (`!IsK9sMeta`):
    - `KeyY` → YAML 查看
@@ -440,35 +448,348 @@ App.inject(component) → 触发 Component.Init()
 ```
 数据到达 → TableDataChanged / TableNoData 事件
   → Browser.refreshActions()
-    → 创建新的临时 KeyActions (aa)
-    → 添加动态基础键（Copy/Enter/Refresh）  // 第3层：浏览器动态键
-    → 连接正常时添加命名空间相关键
-    → 有权限时添加 Edit/Delete 等危险键
-    → 非内部资源添加 YAML/Describe 键
-    → for f in b.bindKeysFn { f(aa) }     // 第4+5层：Extender 和具体资源键重建
-    → b.Actions().Merge(aa)               // 合并到视图（覆盖同名键）
-    → pluginActions(b, b.Actions())       // 第6a层：插件（先删旧再加新）
-    → hotKeyActions(b, b.Actions())       // 第6b层：热键（先删旧再加新，可覆盖插件）
-    → 更新菜单提示 HydrateMenu(Hints())
+    ├─ [守卫] 非当前顶层视图则直接 return
+    ├─ 创建全新临时 KeyActions aa（仅含 Copy/Enter/Refresh 3 个基础键）
+    ├─ 连接正常时 → 向 aa 添加命名空间相关键
+    ├─ 非只读模式且有权限时 → 向 aa 添加 Edit/Delete 危险键
+    ├─ 只读模式时 → b.Actions().ClearDanger() 清除旧集合中的危险键（作用于现有集合）
+    ├─ 非内部资源时 → 向 aa 添加 YAML/Describe 键
+    ├─ 遍历 bindKeysFn 钩子链 → 各 Extender 和具体资源向 aa 注入键（作用于临时 aa）
+    ├─ b.Actions().Merge(aa) → 增量合并（同名键覆盖，aa 中无的旧键保留）
+    ├─ pluginActions(b, b.Actions()) → 作用于现有集合：
+    │   ├─ 先 Range 遍历，删除所有 Opts.Plugin=true 的旧插件动作
+    │   └─ 再从配置加载新插件，冲突时检查 Override 决定是否覆盖
+    ├─ hotKeyActions(b, b.Actions()) → 作用于现有集合：
+    │   ├─ 先 Range 遍历，删除所有 Opts.HotKey=true 的旧热键动作
+    │   └─ 再从配置加载新热键，冲突时检查 Override 决定是否覆盖（可覆盖插件键）
+    └─ 更新菜单提示 HydrateMenu(Hints())
 ```
+
+> **关键观察**: 整个刷新过程中，只有 `b.Actions().Merge(aa)` 这一步可能覆盖前 1-2 层（Table/Browser 基础层）的旧键；而 Table/Browser 基础层中不在 aa 里的键（如 Space 标记行、CtrlZ 切换故障、Escape 重置过滤等）会 **永久保留** 在集合中，除非被后续层同名覆盖。
 
 ### 4.3 键的生命周期对比
 
-| 层次 | 注册时机 | 更新频率 | 是否可能被覆盖 |
-|------|----------|----------|----------------|
-| 表格基础层 | Init 时一次 | 从不 | 是（被上层覆盖） |
-| 浏览器基础层 | Init 时一次 | 从不 | 是（被上层覆盖） |
-| 浏览器动态层 | 每次刷新 | 每次刷新重建 | 是（被上层覆盖） |
-| Extender 层 | Init + 每次刷新 | 每次刷新重建 | 是（被外层覆盖） |
-| 具体资源层 | Init + 每次刷新 | 每次刷新重建 | 是（被插件/热键覆盖） |
-| 插件层 | 每次刷新 | 每次刷新重建 | 是（被热键覆盖） |
-| 热键层 | 每次刷新 | 每次刷新重建 | 否（最顶层） |
+| 层次 | 注册时机 | 更新频率 | 刷新时是否重建 | 刷新时未重建是否保留 | 是否可能被覆盖 |
+|------|----------|----------|----------------|----------------------|----------------|
+| 表格基础层 | Init 时一次 | 从不 | **否（aa 中不含）** | **是（永久保留）** | 是（被上层覆盖） |
+| 浏览器基础层 | Init 时一次 | 从不 | 部分（Enter 被 aa 覆盖为 View） | Escape/Q/Help 永久保留，Enter 每次被覆盖 | 是（被上层覆盖） |
+| 浏览器动态层 | 每次刷新 | 每次刷新重建 | 是 | —（每次重建） | 是（被上层覆盖） |
+| Extender 层 | Init + 每次刷新 | 每次刷新重建 | 是（通过 bindKeysFn 注入到 aa） | —（每次重建） | 是（被外层覆盖） |
+| 具体资源层 | Init + 每次刷新 | 每次刷新重建 | 是（通过 bindKeysFn 注入到 aa） | —（每次重建） | 是（被插件/热键覆盖） |
+| 插件层 | 每次刷新 | 每次刷新重建 | 是（先删旧插件再加新） | —（每次重建） | 是（被热键覆盖） |
+| 热键层 | 每次刷新 | 每次刷新重建 | 是（先删旧热键再加新） | —（每次重建） | 否（最顶层） |
 
-> **注意**: Init 阶段 `bindKeysFn` 直接作用在 `b.Actions()` 上；Refresh 阶段 `bindKeysFn` 作用在临时 `aa` 上，然后 Merge。两种方式最终效果一致，但 Refresh 阶段的做法更利于实现"动态条件判断 + 原子更新"。
+> **注意**: Init 阶段 `bindKeysFn` 直接作用在 `b.Actions()` 上（此时集合为空，所有键都是新增）；Refresh 阶段 `bindKeysFn` 作用在临时 `aa` 上，然后通过 `Merge(aa)` 增量合并。`Merge` 是增量覆盖而非全量替换，这就是 Table/Browser 基础层能永久保留的原因。
+
+> **Enter 键的特殊覆盖**: Browser 基础层在 Init 时将 Enter 绑定为 `filterCmd`（过滤确认），但每次刷新时 aa 中都会重新绑定 Enter 为 `enterCmd`（查看/进入子视图）。`enterCmd` 内部会先判断是否处于过滤模式，过滤模式下仍然调用 `filterCmd`，所以 Enter 的实际行为始终正确。
 
 ---
 
-## 五、完整调用示例（Pod 视图中按 L 键查看日志）
+## 五、动作集合生命周期深度分析
+
+本章深入剖析 `b.Actions()` 这个 `KeyActions` 实例在视图生命周期中的完整变化过程，包括 Init 阶段如何建立初始集合、Refresh 阶段如何增量覆盖、各类清理机制（ClearDanger/插件清理/热键清理）的精确作用范围。
+
+---
+
+### 5.1 初始状态与 Init 阶段全量构建
+
+**起点**: `NewTable()` 创建时，`KeyActions.actions` 是一个空的 `map[tcell.Key]KeyAction`。
+
+**Init 阶段执行流程**（`Browser.Init()`）:
+
+```
+b.Actions() = {} （空 map）
+   ↓
+[Table.Init] t.bindKeys()          → 一次性注入 ~15 个表格基础键
+   │   Space / CtrlSpace / Ctrl\ (标记系列)
+   │   CtrlS (保存)
+   │   KeySlash (过滤模式)
+   │   CtrlZ / CtrlW (显示切换)
+   │   ShiftN/A/S/O (排序系列)
+   │   KeyHelp (帮助，共享键)
+   ↓
+[Browser.Init] b.bindKeys()        → 注入 4 个浏览器基础键
+   │   Escape / KeyQ (过滤重置)
+   │   KeyEnter (过滤确认 filterCmd)
+   │   KeyHelp (帮助，共享键 —— 与 Table 中同名，但都是 helpCmd 无实质冲突)
+   ↓
+[Browser.Init] bindKeysFn 钩子链   → 各 Extender 和具体资源依次注入
+   │   LogsExtender: KeyL/KeyP
+   │   ImageExtender: ...
+   │   VulnerabilityExtender: ...
+   │   OwnerExtender: ...
+   │   PortForwardExtender: KeyF/KeyShiftF
+   │   Pod: CtrlK/KeyS/KeyA/KeyT/KeyZ/KeyO （非只读模式下才添加危险键）
+   ↓
+此时 b.Actions() 包含约 30-40 个键，全部是一次性写入
+```
+
+> Init 阶段 **没有任何清理操作**，集合为空，所有绑定都是纯新增。此时如果出现同名键，后执行的绑定会覆盖先执行的（如 Pod 可以覆盖 LogsExtender 的键）。
+
+---
+
+### 5.2 Merge 的增量覆盖机制（核心）
+
+`Merge()` 是理解动作集合生命周期的关键。其实现（`internal/ui/action.go` 第 139-147 行）:
+
+```go
+func (a *KeyActions) Merge(aa *KeyActions) {
+    a.mx.Lock()
+    defer a.mx.Unlock()
+    for k, v := range aa.actions {
+        a.actions[k] = v   // 只遍历 aa 中的键，逐个覆盖
+    }
+}
+```
+
+**与 Reset 的对比**:
+
+| 方法 | 行为 | 旧键处理 |
+|------|------|----------|
+| `Merge(aa)` | 遍历 `aa`，逐个赋值覆盖 | **aa 中没有的旧键全部保留** |
+| `Reset(aa)` | `Clear()` + `Merge(aa)` | **所有旧键先被清空，再合并 aa** |
+
+k9s 刷新时使用的是 `Merge()`，这带来了 **"静态层保留、动态层覆盖"** 的设计特性。
+
+#### 保留 vs 覆盖的精确分类
+
+以 Pod 视图为例，Refresh 时 aa 中的内容约为：
+
+| aa 中的键（会覆盖/新增） | 来源 |
+|-------------------------|------|
+| KeyC / KeyEnter / CtrlR | 浏览器动态基础键 |
+| KeyN / KeyW / Key0~Key9 | 命名空间相关（连接正常时） |
+| KeyE / CtrlD | Edit/Delete（有权限时） |
+| KeyY / KeyD | YAML/Describe（非内部资源时） |
+| KeyL / KeyP | LogsExtender |
+| KeyF / KeyShiftF | PortForwardExtender |
+| ...（其他 Extender 键） | |
+| CtrlK / KeyS / KeyA / KeyT / KeyZ / KeyO | Pod 具体资源 |
+
+**aa 中没有、但 b.Actions() 中存在的键（会永久保留）**:
+
+| 保留的旧键 | 来源 | 为什么 aa 中不含 |
+|-----------|------|-----------------|
+| KeySpace / CtrlSpace / Ctrl\ | Table 基础层 | aa 从不重建这些键 |
+| CtrlS | Table 基础层 | aa 从不重建 |
+| KeySlash | Table 基础层 | aa 从不重建 |
+| CtrlZ / CtrlW | Table 基础层 | aa 从不重建 |
+| ShiftN / ShiftA / ShiftS / ShiftO | Table 基础层 | aa 从不重建 |
+| KeyEscape / KeyQ | Browser 基础层 | aa 从不重建 |
+| KeyHelp | Table + Browser 基础层 | aa 从不重建 |
+
+> **设计意图**: Init 时一次性写入的"静态基础键"永远不参与刷新重建，靠 Merge 的保留特性一直存在。而"动态条件键"每次刷新都重新注入，响应运行时状态变化。
+
+---
+
+### 5.3 ClearDanger() 的触发时机与作用域
+
+**触发条件**: 只读模式下（`IsReadOnly() == true`）且连接正常时执行。
+
+**执行位置**: `refreshActions()` 第 655 行，在 **`Merge(aa)` 之前**。
+
+**作用范围**: 直接作用于现有集合 `b.Actions()`（不是临时 aa），遍历所有键，只删除 `Opts.Dangerous == true` 的动作。
+
+#### 完整时序与效果
+
+假设运行时模式从"正常模式"切换为"只读模式"：
+
+```
+[切换前] b.Actions() 包含:
+    Table 基础键（非危险）
+    Browser 基础键（非危险）
+    KeyE / CtrlD（危险，Browser 动态层上次写入）
+    CtrlK / KeyS / KeyA / KeyT / KeyZ（危险，Pod 上次写入）
+    KeyL / KeyF 等 Extender 键（非危险）
+    插件键 / 热键
+          ↓
+[切换后，首次刷新]
+1. 创建 aa（不含 KeyE/CtrlD，因为只读模式）
+2. 只读模式分支: b.Actions().ClearDanger()
+   → 删除 b.Actions() 中所有 Dangerous=true 的键
+   → 结果: KeyE/CtrlD/CtrlK/KeyS/KeyA/KeyT/KeyZ 全部被清除
+3. bindKeysFn 钩子链执行，作用于 aa
+   → Pod.bindKeys 中 IsReadOnly() 判断为 true，不添加危险键到 aa
+   → aa 中也没有 CtrlK/KeyS 等
+4. b.Actions().Merge(aa)
+   → aa 中所有非危险键覆盖到 b.Actions()
+   → aa 中不含的 Table/Browser 基础键保留
+5. pluginActions: 只读模式下跳过 Dangerous=true 的插件
+6. hotKeyActions: 正常加载
+          ↓
+[最终] b.Actions() 中所有危险操作键已被彻底清除
+```
+
+**双重防护机制**:
+1. **Browser 层**: 只读模式下不向 aa 添加 Edit/Delete，并清除旧集合中的危险键
+2. **具体资源层**: 每个资源的 `bindKeys()` 内部自行判断 `IsReadOnly()`（如 Pod.bindKeys 第 127 行），只读模式下不注入危险键
+
+两层防护确保只读模式下绝对没有危险操作键残留。
+
+---
+
+### 5.4 插件与热键的选择性清理机制
+
+插件和热键使用 **基于标记的选择性清理**，两者互不干扰，也不触碰其他层的键。
+
+#### pluginActions() 的清理逻辑
+
+```go
+// internal/view/actions.go 第 121-125 行
+aa.Range(func(k tcell.Key, a ui.KeyAction) {
+    if a.Opts.Plugin {      // 只检查 Plugin 标记
+        aa.Delete(k)        // 只删除插件自己注册的动作
+    }
+})
+```
+
+**作用范围**: 只删除 `Opts.Plugin == true` 的键。
+- 不会删除 Table/Browser 基础键
+- 不会删除 Extender 和具体资源键
+- 不会删除热键（`HotKey=true` 但 `Plugin=false`）
+
+**执行时机**: 每次刷新时先删除所有旧插件键，再从配置文件重新加载并添加新插件键。
+
+#### hotKeyActions() 的清理逻辑
+
+```go
+// internal/view/actions.go 第 62-66 行
+aa.Range(func(k tcell.Key, a ui.KeyAction) {
+    if a.Opts.HotKey {      // 只检查 HotKey 标记
+        aa.Delete(k)        // 只删除热键自己注册的动作
+    }
+})
+```
+
+**作用范围**: 只删除 `Opts.HotKey == true` 的键。
+- 不会删除 Table/Browser 基础键
+- 不会删除 Extender 和具体资源键
+- 不会删除插件（`Plugin=true` 但 `HotKey=false`）
+
+**执行时机**: 每次刷新时先删除所有旧热键，再从配置文件重新加载并添加新热键。
+
+#### 插件与热键的清理交互
+
+| 操作 | 清理插件键 | 清理热键键 | 清理其他层键 |
+|------|-----------|-----------|-------------|
+| pluginActions() 清理阶段 | ✅ 是 | ❌ 否 | ❌ 否 |
+| hotKeyActions() 清理阶段 | ❌ 否 | ✅ 是 | ❌ 否 |
+| ClearDanger() | 仅当 Dangerous=true | 仅当 Dangerous=true | 仅当 Dangerous=true |
+
+> **隔离性设计**: 插件和热键通过各自的 Option 标记实现自管理，刷新时只会清理自己上一轮注入的动作，不会误删其他层的键。这也意味着用户删除某个插件/热键配置后，下一次刷新就能自动清理掉对应的按键绑定。
+
+---
+
+### 5.5 刷新前后动作集合的完整状态迁移
+
+以 Pod 视图的一次典型刷新为例，展示完整状态变化：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ [刷新前] b.Actions() 的完整内容                              │
+├─────────────────────────────────────────────────────────────┤
+│ ① Table 基础层（永久保留）                                    │
+│    Space / CtrlSpace / Ctrl\ / CtrlS / /                    │
+│    CtrlZ / CtrlW / ShiftN/A/S/O / ?(Help)                   │
+│ ② Browser 基础层（大部分永久保留）                              │
+│    Escape / Q / ?(Help)   ← 永久保留                        │
+│    Enter → filterCmd     ← 即将被 aa 覆盖为 enterCmd        │
+│ ③ 上一轮刷新的动态层键（即将被 aa 覆盖）                         │
+│    C / Enter(→enterCmd) / CtrlR / N / W / 0-9               │
+│    E / CtrlD / Y / D                                        │
+│ ④ 上一轮 Extender 和资源层键（即将被 aa 覆盖）                   │
+│    L / P / F / ShiftF / ... / CtrlK / S / A / T / Z / O     │
+│ ⑤ 上一轮插件键（即将被 pluginActions 清理重建）                 │
+│    [Plugin=true 标记的若干键]                                 │
+│ ⑥ 上一轮热键（即将被 hotKeyActions 清理重建）                   │
+│    [HotKey=true 标记的若干键]                                 │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+                    refreshActions() 执行
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [步骤 1] 创建临时 aa，仅含 3 个基础键                           │
+├─────────────────────────────────────────────────────────────┤
+│   aa = { C → Copy, Enter → View(enterCmd), CtrlR → Refresh }│
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [步骤 2] 条件填充 aa（连接正常、有权限、非内部资源）               │
+├─────────────────────────────────────────────────────────────┤
+│   aa += N / W / 0-9  (命名空间)                              │
+│   aa += E / CtrlD    (Edit/Delete，非只读+有权限时)            │
+│   aa += Y / D        (YAML/Describe，非内部资源)              │
+│   aa += bindKeysFn 钩子链输出                                 │
+│        (LogsExtender→L/P, PortForwardExtender→F/ShiftF, ...) │
+│        (Pod→CtrlK/S/A/T/Z/O，非只读时注入危险键)               │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [步骤 3] 只读模式下 ClearDanger()（作用于 b.Actions()）         │
+├─────────────────────────────────────────────────────────────┤
+│   非只读: 跳过                                               │
+│   只读: 从 b.Actions() 删除所有 Dangerous=true 的键           │
+│         （清除的是上一轮遗留的 E/CtrlD/CtrlK/S/A/T/Z 等）     │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [步骤 4] b.Actions().Merge(aa) —— 增量覆盖                    │
+├─────────────────────────────────────────────────────────────┤
+│   aa 中存在的键: 覆盖 b.Actions() 中同名键                    │
+│     → Enter 从 filterCmd 变为 enterCmd                       │
+│     → C / CtrlR / N / W / E / CtrlD / Y / D / L / F / ...   │
+│       全部被 aa 中的新版本覆盖                                 │
+│   aa 中不存在的键: 保留在 b.Actions() 中不变                   │
+│     → ① Space / CtrlSpace / ... 等 Table 基础键保留          │
+│     → ② Escape / Q 等 Browser 基础键保留                     │
+│     → ⑤⑥ 插件键和热键键暂时保留（下一步清理）                  │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [步骤 5] pluginActions(b, b.Actions())                        │
+├─────────────────────────────────────────────────────────────┤
+│   5a. Range 遍历，删除所有 Opts.Plugin=true 的旧插件键         │
+│       （不影响其他层的键）                                     │
+│   5b. 从 plugins.yaml 重新加载，逐一键入                       │
+│       冲突时检查 Override，可覆盖前 5 层的同名键                │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [步骤 6] hotKeyActions(b, b.Actions())                        │
+├─────────────────────────────────────────────────────────────┤
+│   6a. Range 遍历，删除所有 Opts.HotKey=true 的旧热键键         │
+│       （不影响其他层的键，包括插件键）                          │
+│   6b. 从 hotkeys.yaml 重新加载，逐一键入                       │
+│       冲突时检查 Override，可覆盖前 5 层及插件层的同名键         │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│ [刷新后] b.Actions() 最终状态                                  │
+├─────────────────────────────────────────────────────────────┤
+│ ① Table 基础键: 全部保留，从未被修改                            │
+│ ② Browser 基础键: Escape/Q 保留，Enter 被 aa 覆盖为 enterCmd   │
+│ ③④ 动态层 + Extender + 资源: 全部由 aa 最新重建                │
+│ ⑤ 插件: 全部由 pluginActions 最新重建                         │
+│ ⑥ 热键: 全部由 hotKeyActions 最新重建（优先级最高）             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 5.6 生命周期总结：四类键的不同命运
+
+| 类别 | 代表键 | 写入时机 | 刷新时是否重建 | 刷新时保留策略 |
+|------|--------|----------|----------------|----------------|
+| **永久静态键** | Space、Escape、CtrlZ、ShiftN | Init 阶段一次 | ❌ 从不 | Merge 保留，永久存在 |
+| **条件覆盖键** | Enter | Init（filterCmd）+ 每次刷新（enterCmd） | ✅ 每次 | Merge 时被 aa 覆盖 |
+| **动态条件键** | E、CtrlD、C、N、W、L、F、CtrlK 等 | Init + 每次刷新 | ✅ 每次 | Merge 时被 aa 覆盖 |
+| **自管理配置键** | 插件键、热键键 | 每次刷新 | ✅ 每次 | 先按 Option 标记选择性清理，再重新加载写入 |
+
+这个分层设计的核心智慧是：**不变的东西永远不重建（减少开销），变化的东西每次重建（保证最新），各自管理自己的生命周期（降低耦合）**。
+
+---
+
+## 六、完整调用示例（Pod 视图中按 L 键查看日志）
 
 ```
 1. 用户按下 'l' 键
@@ -500,9 +821,9 @@ App.inject(component) → 触发 Component.Init()
 
 ---
 
-## 六、关键协作机制总结
+## 七、关键协作机制总结
 
-### 6.1 BindKeysFn 钩子链
+### 7.1 BindKeysFn 钩子链
 
 `BindKeysFunc` 类型: `func(*ui.KeyActions)`
 
@@ -514,7 +835,7 @@ App.inject(component) → 触发 Component.Init()
 
 这种设计使得 **键绑定可以动态变化**（例如根据权限、只读模式、连接状态等条件决定是否注册某些键）。
 
-### 6.2 键冲突与覆盖优先级
+### 7.2 键冲突与覆盖优先级
 
 从低到高排列（后者覆盖前者）：
 
@@ -533,7 +854,7 @@ App.inject(component) → 触发 Component.Init()
 
 > **插件与热键的覆盖细节**: 两者都通过 `aa.Get(key)` 检测冲突。插件先写入时可能覆盖前 5 层的键（`Override=true` 时），热键后写入时可能覆盖包括插件在内的所有键（`Override=true` 时）。若 `Override=false`，冲突时不会覆盖而是报错跳过。
 
-### 6.3 危险操作保护
+### 7.3 危险操作保护
 
 `ActionOpts.Dangerous` 标记用于多层次安全防护：
 
@@ -542,7 +863,7 @@ App.inject(component) → 触发 Component.Init()
 3. **执行层防护**: 部分危险操作触发时弹出确认对话框（如 Delete 删除、Sanitize 清理）
 4. **权限层防护**: 根据 K8s RBAC 权限动态决定是否添加 Edit/Delete 等键
 
-### 6.4 共享键机制
+### 7.4 共享键机制
 
 `ActionOpts.Shared=true` 表示该动作是 **跨视图共享的全局功能键**（如 Help、Quit、Clear Filter 等）。
 
@@ -550,7 +871,7 @@ App.inject(component) → 触发 Component.Init()
 
 ---
 
-## 七、视图注册与 GVR 映射
+## 八、视图注册与 GVR 映射
 
 视图通过 `MetaViewers` 注册表关联 GVR（Group/Version/Resource）与视图构造函数。
 
@@ -578,7 +899,7 @@ type MetaViewer struct {
 
 ---
 
-## 八、架构设计亮点
+## 九、架构设计亮点
 
 1. **装饰器模式实现功能正交**: Extender 机制将日志、端口转发、镜像扫描等功能实现为可插拔装饰器，任意组合而不修改基础代码，符合开闭原则。
 
