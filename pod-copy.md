@@ -39,7 +39,20 @@ K9s 代码中同时存在两个完全独立的"kubectl"概念，二者版本可�
 - [internal/view/exec.go:58](internal/view/exec.go#L58-L58)：`runK()` 中的 `bin, err := exec.LookPath("kubectl")`
 - [internal/view/exec.go:242](internal/view/exec.go#L242-L242)：`runKu()` 中的 `bin, err := exec.LookPath("kubectl")`
 
-**使用场景**：CP 功能、Shell、Attach 等需要调用 kubectl 子命令的场景。
+**实际走外部 kubectl 的命令（代码证据）**：
+
+| 命令 | 入口函数 | 构造参数的函数 | 最终调用 runK |
+|------|---------|--------------|-------------|
+| CP | [pod.go:109-115](internal/view/pod.go#L109-L115) T 键 → transferCmd | 直接构造 `["cp", ...]` | [pod.go:293-332](internal/view/pod.go#L293-L332) ack 回调 |
+| Shell | [pod.go:222](internal/view/pod.go#L222-L238) shellCmd | [pod.go:461-468](internal/view/pod.go#L461-L468) computeShellArgs → `["exec", "-it", ..., "--", "sh", "-c", ...]` | [pod.go:412-416](internal/view/pod.go#L412-L416) shellIn() |
+| Attach | [pod.go:240-256](internal/view/pod.go#L240-L256) attachCmd | [pod.go:478-499](internal/view/pod.go#L478-L499) buildShellArgs → `["attach", "-it", ...]` | [pod.go:456](internal/view/pod.go#L456-L456) attachIn() |
+
+**不走外部 kubectl 的命令（代码证据）**：
+
+| 命令 | 入口函数 | 实现方式 |
+|------|---------|---------|
+| Dir | [app.go:679-696](internal/view/app.go#L679-L696) App.dirCmd | K9s 内置 `Dir` 视图组件，直接 `os.Stat(path)` 读取本地文件系统，完全不涉及 kubectl |
+| PortForward | [dao/port_forwarder.go:121-171](internal/dao/port_forwarder.go#L121-L171) PortForwarder.Start | 直接使用 `k8s.io/client-go/tools/portforward` 库 + SPDY 连接，**不调用外部 kubectl 二进制**。代码证据：[dao/port_forwarder.go:23](internal/dao/port_forwarder.go#L23-L23) import `k8s.io/client-go/tools/portforward`，[dao/port_forwarder.go:152-170](internal/dao/port_forwarder.go#L152-L170) 直接构造 `rest.RESTClientFor` 并调用 `forwardPorts()` |
 
 **版本**：完全由用户安装决定，可能是 v1.27、v1.28、v1.29、v1.30 等任意版本，**与 go.mod 中的 v0.35.1 没有绑定关系**。
 
@@ -53,7 +66,11 @@ K9s 代码中同时存在两个完全独立的"kubectl"概念，二者版本可�
 | 版本 | 固定 v0.35.1 | 用户安装的任意版本 |
 | 绑定方式 | Go 模块静态链接 | `os/exec` 进程间调用 |
 | 用于 CP | ❌ 从未 | ✅ 是 CP 功能的实际执行者 |
-| 用于其他功能 | ✅ drain、describe、render 等 11 处 | ✅ Shell、Attach、PortForward 等 |
+| 用于 Shell | ❌ | ✅ 走 `kubectl exec` |
+| 用于 Attach | ❌ | ✅ 走 `kubectl attach` |
+| 用于 PortForward | ✅ `kubectl/pkg/cmd/util` 仅用于 Factory，真正传输走 client-go SPDY | ❌ 完全不走外部二进制，直连 kube-apiserver |
+| 用于 Dir | N/A（纯本地文件系统） | ❌ 完全不涉及 kubectl |
+| 用于其他功能 | ✅ drain、describe、render 等 11 处 import | — |
 | 升级方式 | 修改 go.mod 重新编译 K9s | 用户自行 `brew install kubectl` 等 |
 
 **版本不一致风险**：
@@ -63,6 +80,39 @@ K9s 代码中同时存在两个完全独立的"kubectl"概念，二者版本可�
 
 **进程边界再次确认**：
 CP 功能的执行路径是 `K9s Go 代码 → exec.CommandContext → kubectl 二进制进程`。K9s 的 CP 相关代码在 [internal/view/pod.go](internal/view/pod.go#L286-L353) 和 [internal/view/exec.go](internal/view/exec.go#L57-L97) 中构造完命令行参数、调用完 `cmd.Run()` 之后就结束了，后续的 tar 流管道、断点续传等逻辑完全在外部 kubectl 进程内执行，K9s 代码不可见。
+
+### 0.4 命令边界总览（cp / shell / attach / dir / port-forward）
+
+将 K9s 中的 5 个常见命令按调用边界分类：
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  类别 A：通过外部 kubectl 二进制（进程边界，依赖用户 PATH 中的 kubectl）            │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│  cp     → kubectl cp        runK([pod.go:293-332]) → exec.CommandContext        │
+│  shell  → kubectl exec -it  shellIn([pod.go:412-416]) → runK                    │
+│  attach → kubectl attach -i attachIn([pod.go:456]) → runK                       │
+└──────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  类别 B：使用 client-go 库直接调用 kube-apiserver（库调用边界，无外部进程）         │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│  port-forward → SPDY 升级连接  PortForwarder.Start([dao/port_forwarder.go:121]) │
+│                 → rest.RESTClientFor → forwardPorts()                            │
+│                 → k8s.io/client-go/tools/portforward                              │
+└──────────────────────────────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│  类别 C：K9s 内置实现（纯本地，完全不涉及 Kubernetes 网络）                         │
+├──────────────────────────────────────────────────────────────────────────────────┤
+│  dir → os.Stat([app.go:681]) → NewDir 视图组件 → 本地文件系统遍历                 │
+└──────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**为什么容易混淆**：
+- PortForward 在 [dao/port_forwarder.go:25](internal/dao/port_forwarder.go#L25-L25) 有一行 `import cmdutil "k8s.io/kubectl/pkg/cmd/util"`，但这只是用 kubectl 的 Factory 创建客户端，**绝不意味着调用外部 kubectl port-forward**
+- `k8s.io/kubectl/pkg/cmd/util` 里的 Factory 是共享工具，既可用于构造内部 client，也可被 kubectl 自身的子命令使用
+- 判断是否走外部进程的唯一依据是：**代码中是否调用了 `exec.LookPath("kubectl")` + `exec.CommandContext` + `runK()` 这条链路**
 
 ---
 
@@ -771,8 +821,15 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
 | [go.mod](go.mod#L41-L41) | L41 | `k8s.io/kubectl v0.35.1` 依赖声明 |
 | [internal/view/exec.go](internal/view/exec.go#L58-L58) | L58 | `runK()` 中 `exec.LookPath("kubectl")` 查找外部二进制 |
 | [internal/view/exec.go](internal/view/exec.go#L242-L242) | L242 | `runKu()` 中 `exec.LookPath("kubectl")` 查找外部二进制 |
-| [internal/render/sc.go](internal/render/sc.go#L15-L15) | L15 | import `k8s.io/kubectl/pkg/util/storage`（依赖声明的用途之一） |
-| [internal/dao/node.go](internal/dao/node.go#L22-L23) | L22-L23 | import `k8s.io/kubectl/pkg/drain` + `scheme`（依赖声明的用途之一） |
+| [internal/render/sc.go](internal/render/sc.go#L15-L15) | L15 | import `k8s.io/kubectl/pkg/util/storage`（依赖声明用途） |
+| [internal/dao/node.go](internal/dao/node.go#L22-L23) | L22-L23 | import `k8s.io/kubectl/pkg/drain` + `scheme`（依赖声明用途） |
+| [internal/dao/port_forwarder.go](internal/dao/port_forwarder.go#L23-L24) | L23-L24 | PortForward 走 client-go（import 而非外部 kubectl） |
+| [internal/dao/port_forwarder.go](internal/dao/port_forwarder.go#L121-L171) | L121-L171 | PortForwarder.Start：直连 SPDY，不调外部进程 |
+| [internal/view/app.go](internal/view/app.go#L679-L696) | L679-L696 | dirCmd：纯本地 os.Stat()，不涉及 kubectl |
+| [internal/view/pod.go](internal/view/pod.go#L403-L417) | L403-L417 | shellIn：构造 kubectl exec 参数 → runK |
+| [internal/view/pod.go](internal/view/pod.go#L453-L459) | L453-L459 | attachIn：构造 kubectl attach 参数 → runK |
+| [internal/view/pod.go](internal/view/pod.go#L461-L468) | L461-L468 | computeShellArgs：`exec -it ... sh -c` |
+| [internal/view/pod.go](internal/view/pod.go#L478-L499) | L478-L499 | buildShellArgs：exec/attach 参数构造通用逻辑 |
 | [pod.go](internal/view/pod.go#L41-L42) | L41 | `defaultTxRetries = 999` |
 | [pod.go](internal/view/pod.go#L109-L115) | L109-L115 | T 键绑定 transferCmd |
 | [pod.go](internal/view/pod.go#L286-L353) | L286-L353 | transferCmd 主函数 |
@@ -807,9 +864,10 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
 ## 八、传输路径难以理解的原因总结
 
 1. **两个 kubectl 版本混淆**：go.mod 声明的 `k8s.io/kubectl v0.35.1` 是编译期依赖（用于 drain、describe、render 等），而 CP 实际调用的是用户 PATH 中的外部 kubectl 二进制，二者版本可能不同且无绑定关系
-2. **进程边界不透明**：K9s 与 kubectl cp 之间是进程边界，用户按下 T 键后 K9s 代码就走完了，后面的 tar 管道全在外部进程里，K9s UI 层无任何中间状态可见
-3. **冒号分隔歧义**：`ns/pod:/path` 格式中，`:` 是 Pod 与路径的分隔符，与 Windows 盘符 `C:\path` 形态相似，容易混淆
-4. **From/To 语义方向依赖**：同一个 From 字段，下载时是远端路径，上传时是本地路径，由 Download bool 反转决定
-5. **tar 是隐式前置条件**：容器必须有 `tar` 二进制，这个前提既不在对话框提示，也不在错误信息中明确
-6. **参数重复 bug**：`--retries` 被追加两次（[pod.go:309](internal/view/pod.go#L309-L309) 和 [pod.go:314](internal/view/pod.go#L314-L314)），虽然 kubectl 通常取最后值，但增加了理解成本
-7. **无中间进度反馈**：传输过程是 UI 黑盒，只有成功/失败两端状态，长时间传输时用户无法判断是否卡死
+2. **命令分类边界混淆**：cp/shell/attach 走外部 kubectl 二进制（进程边界），但 port-forward 走 client-go SPDY 直连（库调用边界），dir 更是纯本地实现，三类边界混在一起容易误判
+3. **进程边界不透明**：K9s 与 kubectl cp 之间是进程边界，用户按下 T 键后 K9s 代码就走完了，后面的 tar 管道全在外部进程里，K9s UI 层无任何中间状态可见
+4. **冒号分隔歧义**：`ns/pod:/path` 格式中，`:` 是 Pod 与路径的分隔符，与 Windows 盘符 `C:\path` 形态相似，容易混淆
+5. **From/To 语义方向依赖**：同一个 From 字段，下载时是远端路径，上传时是本地路径，由 Download bool 反转决定
+6. **tar 是隐式前置条件**：容器必须有 `tar` 二进制，这个前提既不在对话框提示，也不在错误信息中明确
+7. **参数重复 bug**：`--retries` 被追加两次（[pod.go:309](internal/view/pod.go#L309-L309) 和 [pod.go:314](internal/view/pod.go#L314-L314)），虽然 kubectl 通常取最后值，但增加了理解成本
+8. **无中间进度反馈**：传输过程是 UI 黑盒，只有成功/失败两端状态，长时间传输时用户无法判断是否卡死
