@@ -977,3 +977,245 @@ cols, err := t.specs.realize(obj, t.defaultHeader(), r)
           ├─ 成功 → 处理结果
           └─ 失败 → hydrate 返回 error ✗
 ```
+
+---
+
+## 十四、校准：默认列回补取字段值时的越界保护缺失
+
+### 14.1 代码事实
+
+[realize()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L134-L143) 阶段二（默认列回补）中取字段值的代码：
+
+```go
+for _, hc := range rh {
+    if vv.HasHeader(hc.Name) {
+        continue
+    }
+    if idx, ok := rh.IndexOf(hc.Name, true); ok {
+        rc := RenderedCol{Header: hc, Value: row.Fields[idx]}  // ← 直接取，无越界检查
+        rc.Header.Wide = true
+        vv = append(vv, rc)
+    }
+}
+```
+
+对比 [hydrate()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L165-L170) 中 `parser == nil` 分支取字段值的代码：
+
+```go
+var v string
+if ix >= len(row.Fields) {   // ← 有越界保护
+    v = NAValue
+} else {
+    v = row.Fields[ix]
+}
+```
+
+**校准结论**：hydrate 有越界保护，realize 阶段二**没有**。
+
+### 14.2 实际风险分析
+
+阶段二的 `idx` 来自 `rh.IndexOf(hc.Name, true)`，而 `hc` 本身就是 `rh` 的遍历元素，所以 `idx` 一定在 `[0, len(rh))` 范围内。
+
+理论上 `row.Fields` 的长度应等于 `len(rh)`（因为 `defaultRow()` 按 `rh` 顺序填充），但以下场景可能导致不等：
+
+| 场景 | rh 长度 vs row.Fields 长度 | 是否会越界 |
+|------|---------------------------|-----------|
+| 内置渲染器（Pod, Service 等） | 严格一致 | 否 |
+| Table/Generic 渲染器 | `defaultHeader()` 来自 ServerSideTable 列定义，`defaultRow()` 来自 `row.Cells`，Cells 可能少于 ColumnDefinitions | **可能** |
+| CRD 资源 | 同上，动态列定义 | **可能** |
+
+在 [Table.defaultRow()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/table.go#L112-L163) 中：
+
+```go
+r.Fields = make(model1.Fields, 0, len(th))
+for i, c := range row.Cells {
+    // ...逐个 append，长度 = len(row.Cells)
+}
+```
+
+当 `row.Cells` 少于 `t.table.ColumnDefinitions`（即 `th` 的来源）时，`r.Fields` 长度 < `len(th)`。此时阶段二的 `row.Fields[idx]` 可能越界，触发 **panic: runtime error: index out of range**。
+
+### 14.3 修正建议（未实施，仅供理解）
+
+若要修复此问题，阶段二应增加与 hydrate 相同的越界检查：
+
+```go
+var v string
+if idx >= len(row.Fields) {
+    v = NAValue
+} else {
+    v = row.Fields[idx]
+}
+rc := RenderedCol{Header: hc, Value: v}
+```
+
+---
+
+## 十五、校准：单管道列定义的正则分组归属
+
+### 15.1 正则重新审视
+
+[fullRX](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_col.go#L17)：
+
+```regex
+^([\w\s%/-]+):?([\w\W]*?)\|?([NTWSLRH]{0,3})$
+```
+
+关键点：`([\w\W]*?)` 是**非贪婪**匹配（`*?`），`\|?` 是可选匹配。这意味着正则引擎会**尽量少匹配表达式段**，尽早将 `|` 让给第三分组。
+
+### 15.2 单管道列定义的分组判定
+
+**情况 A：`"fred|W"`**（无冒号，单管道，后跟合法 FLAGS）
+
+```
+正则匹配过程:
+  mm[1] = "fred"          ← 组1: 名称
+  mm[2] = ""              ← 组2: 表达式（非贪婪，尽量短，:不存在所以为空）
+  mm[3] = "W"             ← 组3: 标志
+
+结论: |W 落入标志段 ✓
+```
+
+测试用例 `"plain-wide"` 证实：`s: "fred|W"` → `spec: ""`，`wide: true`。
+
+**情况 B：`"fred:.metadata.name|W"`**（有冒号，单管道，后跟合法 FLAGS）
+
+```
+正则匹配过程:
+  mm[1] = "fred"          ← 组1: 名称
+  mm[2] = ".metadata.name" ← 组2: 表达式（非贪婪到第一个 | 停）
+  mm[3] = "W"             ← 组3: 标志
+
+结论: |W 落入标志段 ✓
+```
+
+测试用例 `"partial-no-type-wide"` 证实。
+
+**情况 C：`"fred|T"`**（无冒号，单管道，后跟合法 FLAGS）
+
+```
+正则匹配过程:
+  mm[1] = "fred"
+  mm[2] = ""
+  mm[3] = "T"
+
+结论: |T 落入标志段 ✓
+```
+
+测试用例 `"partial-no-spec-no-wide"` 证实。
+
+**情况 D：`"fred:.spec.foo|bar"`**（有冒号，单管道，后跟非法 FLAGS）
+
+```
+正则匹配过程:
+  mm[1] = "fred"
+  mm[2] = ".spec.foo"     ← 非贪婪到 | 停
+  mm[3] = "bar"           ← 不匹配 [NTWSLRH]，但正则仍捕获
+
+结论: |bar 落入标志段，newColFlags("bar") 对每个字节打 Warn 日志但不报错
+```
+
+**情况 E：`"fred||.metadata.name|W"`**（双管道，有冒号）
+
+```
+正则匹配过程:
+  mm[1] = "fred"
+  mm[2] = "|.metadata.name"  ← 非贪婪但需要 | 才能匹配组3的 W
+  mm[3] = "W"
+
+结论: 第一个 | 留在表达式段，最后一个 |W 为标志段
+```
+
+测试用例 `"toast"` 证实：`spec: "{.||.metadata.name}"`，`wide: true`。
+
+### 15.3 核心规则总结
+
+| 模式 | 管道归属 | spec 内容 | FLAGS 内容 |
+|------|---------|----------|-----------|
+| 无冒号 + 单管道 + 合法FLAGS `"fred\|W"` | 全部归标志段 | `""` | `"W"` |
+| 有冒号 + 单管道 + 合法FLAGS `"fred:.xx\|W"` | 分割：`\|` 前归表达式 | `".xx"` | `"W"` |
+| 无冒号 + 单管道 + 非法FLAGS `"fred\|bar"` | 全部归标志段 | `""` | `"bar"`(Warn) |
+| 有冒号 + 多管道 `"fred:\|a\|b\|W"` | 最后一个 `\|合法FLAGS` 归标志段，其余归表达式 | `"\|a\|b"` | `"W"` |
+| 无冒号 + 无管道 `"fred"` | 无 | `""` | `""` |
+
+**单管道的判定原则**：正则的 `([\w\W]*?)` 非贪婪特性使得引擎**优先将管道符让给第三分组（FLAGS）**，前提是管道后跟 `[NTWSLRH]{0,3}` 能匹配成功。如果管道后跟的不是合法 FLAGS 字符，则引擎回溯，将管道符纳入第二分组。
+
+---
+
+## 十六、校准：边界条件对 JQ/JSONPath 判断的实际影响
+
+### 16.1 正则分组 → Spec → isJQSpec 的完整链路
+
+JQ 判定不在正则阶段，而在 [isJQSpec()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L267-L269) 阶段，操作对象是**经过 `RelaxedJSONPathExpression` 包装后的 spec 字符串**：
+
+```
+用户输入 → parse() 正则分组 → RelaxedJSONPathExpression(mm[2]) → cc[idx].Spec
+                                                                      │
+                                                                      ▼
+                                                              isJQSpec(cc[idx].Spec)
+```
+
+`RelaxedJSONPathExpression` 的包装规则（来自 `kubectl` 包）：
+- `.metadata.name` → `{.metadata.name}`（加花括号）
+- `{.metadata.name}` → `{.metadata.name}`（已有花括号不变）
+- `:.metadata.name` → 报错（以冒号开头的非合法表达式）
+
+### 16.2 各种输入的完整推演
+
+| 用户输入 | mm[2] | Spec (包装后) | isJQSpec? | 实际路径 |
+|---------|-------|-------------|-----------|---------|
+| `"NAME"` | `""` | `""` | N/A (Spec="", parser=nil) | 默认列引用 |
+| `"NAME\|W"` | `""` | `""` | N/A (Spec="", parser=nil) | 默认列引用 |
+| `"IP:.status.hostIP"` | `".status.hostIP"` | `"{.status.hostIP}"` | Split=1段 → false | JSONPath |
+| `"IP:.status.hostIP\|W"` | `".status.hostIP"` | `"{.status.hostIP}"` | Split=1段 → false | JSONPath |
+| `"X:\|\|.foo\|W"` | `"\|\|.foo"` | `"{\|\|.foo}"` | Split=3段 → true | JQ 优先 |
+| `"X:.items[]\|select(.x)\|name\|W"` | `".items[]\|select(.x)\|name"` | `"{.items[]\|select(.x)\|name}"` | Split=3段 → true | JQ 优先 |
+
+### 16.3 单管道永远无法触发 JQ
+
+关键校准：**单管道列定义不可能产生 JQ 路径**，原因：
+
+1. 合法 FLAGS 字符（`N/T/W/S/L/R/H`）的单管道，正则将 `|` 后内容归入 FLAGS 段，spec 内无管道
+2. 非法 FLAGS 字符的单管道（如 `"fred:.spec\|bar"`），正则仍尝试将 `|bar` 归入 FLAGS 段（因为 `[\w\W]*?` 非贪婪 + `\|?` + `[NTWSLRH]{0,3}$` 组合），spec 内同样无管道
+3. `isJQSpec` 基于 `Split(spec, "\|") > 2`，spec 内无管道时 Split 只得 1 段，判定为 false
+
+**推论**：JQ 路径只在用户输入中 spec 部分**显式包含至少 2 个管道符**时触发（如 JQ 的 `|select()`+`|name` 组合），这与正则如何处理管道归属无关——因为只要最终 spec 含 `|` 就可能判定为 JQ。
+
+### 16.4 测试用例 "toast" 的 JQ 判定校准
+
+测试用例 `"fred||.metadata.name|W"` 的完整链路：
+
+```
+正则: mm[1]="fred", mm[2]="||.metadata.name", mm[3]="W"
+RelaxedJSONPathExpression("||.metadata.name")
+  → spec = "{.||.metadata.name}"
+isJQSpec("{.||.metadata.name}")
+  → Split by "|" → ["{.", "", ".metadata.name}"] → 3段 > 2 → true
+```
+
+**校准结论**：此 spec 会被判定为 JQ，但 `{.||.metadata.name}` 作为 JQ 表达式（去掉首尾花括号后为 `.||.metadata.name`）语法是无效的。`gojq.Parse` 会失败，`jqParse` 返回 false，降级到 JSONPath，而 JSONPath parser 在 realize() 预处理时已 Parse 此 spec（`{.||.metadata.name}`），大概率也失败。由于 `isJQSpec=true`，Parse 失败不告警。最终运行时 JQ 失败 + JSONPath FindResults 也失败 → hydrate 返回 error。
+
+### 16.5 "toast-no-name" 匹配失败的根因
+
+测试用例 `":.metadata.name.fred|TW"` → 正则匹配**失败**（`len(mm) != 4`）。
+
+原因：组1 `([\w\s%/-]+)` 要求至少一个字符，而冒号前为空字符串，`+` 量词不满足，整个正则不匹配。**这无关管道归属，而是名称段为空导致的整体匹配失败**。
+
+### 16.6 正则分组对 FLAGS 非法字符的处理
+
+当管道后跟非 `[NTWSLRH]` 字符时（如 `"fred:.spec.foo|bar"`）：
+
+正则尝试匹配 `[NTWSLRH]{0,3}$`，`"bar"` 不匹配，引擎回溯：
+- 尝试将 `|bar` 纳入组2（表达式段）
+- 组3 匹配空字符串 `{0,3}` 允许 0 次
+- 最终：mm[2] = `.spec.foo|bar`，mm[3] = `""`
+
+但 `RelaxedJSONPathExpression(".spec.foo|bar")` 的行为取决于 kubectl 的实现：
+- 如果 `|` 在 spec 内被保留 → spec 含管道 → isJQSpec 可能判定为 true
+- 如果被拒绝 → parse() 返回错误，整个列定义无效
+
+**实测边界**：从测试用例来看，没有 `|非法字符` 的测试场景，这属于未覆盖的边界。代码中 `newColFlags` 的 `default` 分支只打 Warn 不报错，暗示正则匹配成功后 FLAGS 段可以包含任意字符（只是非法字符被忽略）。
+
+但更关键的是：正则的 `$` 锚定要求组3 必须匹配到字符串末尾。`[NTWSLRH]{0,3}$` 能匹配空字符串，所以即使管道后跟 `bar`，引擎会回溯将 `|bar` 纳入组2，组3 匹配空。这样 spec 就变成了 `{.spec.foo|bar}`，其中含管道符 → isJQSpec 可能为 true → 触发 JQ 路径。
+
+**这是之前分析中的一个重要校准**：单管道 + 非法 FLAGS 字符时，管道可能留在 spec 内部，从而使 isJQSpec 判定为 true。
