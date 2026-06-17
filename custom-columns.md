@@ -1061,30 +1061,42 @@ rc := RenderedCol{Header: hc, Value: v}
 ^([\w\s%/-]+):?([\w\W]*?)\|?([NTWSLRH]{0,3})$
 ```
 
-关键点：`([\w\W]*?)` 是**非贪婪**匹配（`*?`），`\|?` 是可选匹配。这意味着正则引擎会**尽量少匹配表达式段**，尽早将 `|` 让给第三分组。
+关键点：
+- 组2 `([\w\W]*?)` 是**非贪婪**匹配（`*?`），消费越少越优先
+- 组3 `([NTWSLRH]{0,3})$` 必须**恰好匹配到行尾**（`$` 锚定 + 字符集严格限定）
+- `\|?` 是可选的管道分隔符
 
-### 15.2 单管道列定义的分组判定
+**分组成败判定的核心约束**：组3 `[NTWSLRH]{0,3}$` 的**尾锚定不可违反**。即：第三组捕获的内容必须正好是字符串的最后 0~3 个字符，且每个字符都 ∈ `{N,T,W,S,L,R,H}`。只要管道后出现任何非合法标志字符（或合法标志超过 3 个），引擎就必须让组2回溯扩展，把多余部分纳入表达式段。
 
-**情况 A：`"fred|W"`**（无冒号，单管道，后跟合法 FLAGS）
+### 15.2 逐场景推演
+
+**情况 A：`"fred|W"`**（无冒号，单管道，后跟合法 FLAGS 且 ≤3 字符）
 
 ```
 正则匹配过程:
-  mm[1] = "fred"          ← 组1: 名称
-  mm[2] = ""              ← 组2: 表达式（非贪婪，尽量短，:不存在所以为空）
-  mm[3] = "W"             ← 组3: 标志
+  尝试最小消费: mm[1]="fred", mm[2]="", \|?="|", mm[3]="W"
+    → mm[3]="W" ∈ [NTWSLRH], 长度 1 ≤ 3, 后面正好是 $ → 匹配成功
+  mm[1] = "fred"
+  mm[2] = ""
+  mm[3] = "W"
 
 结论: |W 落入标志段 ✓
 ```
 
-测试用例 `"plain-wide"` 证实：`s: "fred|W"` → `spec: ""`，`wide: true`。
+测试用例 `"plain-wide"` 证实。
 
-**情况 B：`"fred:.metadata.name|W"`**（有冒号，单管道，后跟合法 FLAGS）
+**情况 B：`"fred:.metadata.name|W"`**（有冒号，单管道，后跟合法 FLAGS 且 ≤3 字符）
 
 ```
 正则匹配过程:
-  mm[1] = "fred"          ← 组1: 名称
-  mm[2] = ".metadata.name" ← 组2: 表达式（非贪婪到第一个 | 停）
-  mm[3] = "W"             ← 组3: 标志
+  冒号消费后剩余 ".metadata.name|W"
+  组2非贪婪开始尝试空值 → 尾部剩余 ".metadata.name|W"
+  mm[3] 至少需要消费到字符串末尾且全为合法字符 → 无法满足，回溯
+  组2逐步扩展直到剩余 "|W"
+  此时 \|?="|", mm[3]="W" → 尾锚定满足
+  mm[1] = "fred"
+  mm[2] = ".metadata.name"
+  mm[3] = "W"
 
 结论: |W 落入标志段 ✓
 ```
@@ -1094,51 +1106,97 @@ rc := RenderedCol{Header: hc, Value: v}
 **情况 C：`"fred|T"`**（无冒号，单管道，后跟合法 FLAGS）
 
 ```
-正则匹配过程:
-  mm[1] = "fred"
-  mm[2] = ""
-  mm[3] = "T"
+mm[1] = "fred"
+mm[2] = ""
+mm[3] = "T"
 
 结论: |T 落入标志段 ✓
 ```
 
 测试用例 `"partial-no-spec-no-wide"` 证实。
 
-**情况 D：`"fred:.spec.foo|bar"`**（有冒号，单管道，后跟非法 FLAGS）
+**情况 D：`"fred:.spec.foo|bar"`**（有冒号，单管道，后跟非法 FLAGS 尾段）
+
+```
+正则匹配过程 —— 关键在于尾锚定:
+  冒号消费后剩余 ".spec.foo|bar"
+  尝试组2=".spec.foo", \|?="|", mm[3]="bar"
+    → 'b' ∉ [NTWSLRH] → 第三组无法匹配（{0,3} 必须匹配到末尾，
+                        mm[3] 只能接受全合法字符，否则只能匹配 0 次，
+                        但 "bar" 还没到末尾，0次匹配也不行）
+    → 尾锚定 + 字符集双重约束失败，必须回溯
+  组2扩展为 ".spec.foo|b" → 尾部剩 "ar" → 'a' 非合法字符 → 回溯
+  组2扩展为 ".spec.foo|ba" → 尾部剩 "r" → 'r' 非合法字符 → 回溯
+  组2扩展为 ".spec.foo|bar" → 尾部剩 ""（空）
+    \|? 消费 ""（无管道），mm[3] = ""（匹配 0 次）
+    空字符串正好到 $ → 尾锚定满足 ✓
+  mm[1] = "fred"
+  mm[2] = ".spec.foo|bar"     ← 关键：管道和 bar 全部回溯进入表达式段
+  mm[3] = ""                  ← 标志段为空
+
+结论: |bar 回退进入表达式段，mm[3]="", newColFlags("") 不做任何处理
+```
+
+> **之前的错误结论校准**：不能认为 `mm[3]="bar"`，因为 `'b'` 不在 `[NTWSLRH]` 中，组3的字符集约束不允许。真正行为是 **mm[3] 只能取 0 次匹配（空串），整段 `|bar` 回溯进组2**。
+
+**情况 E：`"fred||.metadata.name|W"`**（双管道，有冒号，末尾合法 FLAGS）
 
 ```
 正则匹配过程:
+  冒号消费后剩余 "||.metadata.name|W"
+  尝试组2="", \|?="|", mm[3] 需消费 "|.metadata.name|W" 到末尾 → 首字符 | 非合法 → 回溯
+  ...
+  组2扩展为 "||.metadata.name" → 剩余 "|W"
+    \|?="|", mm[3]="W" → 尾锚定 + 字符集满足 ✓
   mm[1] = "fred"
-  mm[2] = ".spec.foo"     ← 非贪婪到 | 停
-  mm[3] = "bar"           ← 不匹配 [NTWSLRH]，但正则仍捕获
-
-结论: |bar 落入标志段，newColFlags("bar") 对每个字节打 Warn 日志但不报错
-```
-
-**情况 E：`"fred||.metadata.name|W"`**（双管道，有冒号）
-
-```
-正则匹配过程:
-  mm[1] = "fred"
-  mm[2] = "|.metadata.name"  ← 非贪婪但需要 | 才能匹配组3的 W
+  mm[2] = "||.metadata.name"
   mm[3] = "W"
 
-结论: 第一个 | 留在表达式段，最后一个 |W 为标志段
+结论: 前两个 | 留在表达式段，最后一个 |W 为标志段 ✓
 ```
 
 测试用例 `"toast"` 证实：`spec: "{.||.metadata.name}"`，`wide: true`。
 
+**情况 F：`"fred:.xx|NWLR"`**（有冒号，单管道，合法 FLAGS 超过 3 字符）
+
+```
+正则匹配过程:
+  冒号消费后剩余 ".xx|NWLR"
+  尝试组2=".xx", \|?="|", mm[3]="NWLR"
+    N/W/L/R 全合法，但长度 4 > {0,3}上限 → 回溯
+  组2扩展为 ".xx|N" → 剩余 "WLR"
+    \|? 消费 ""（因为剩余首字符是 W 不是 |），mm[3]="WLR" → 3 字符全合法，正好到末尾 ✓
+  mm[1] = "fred"
+  mm[2] = ".xx|N"     ← 第一个 | 和多余的 N 被切进表达式段
+  mm[3] = "WLR"       ← 标志段取最后 3 个合法字符
+
+结论: 合法 FLAGS 超过 3 个时，多余部分被回溯进表达式段
+```
+
 ### 15.3 核心规则总结
 
-| 模式 | 管道归属 | spec 内容 | FLAGS 内容 |
-|------|---------|----------|-----------|
-| 无冒号 + 单管道 + 合法FLAGS `"fred\|W"` | 全部归标志段 | `""` | `"W"` |
-| 有冒号 + 单管道 + 合法FLAGS `"fred:.xx\|W"` | 分割：`\|` 前归表达式 | `".xx"` | `"W"` |
-| 无冒号 + 单管道 + 非法FLAGS `"fred\|bar"` | 全部归标志段 | `""` | `"bar"`(Warn) |
-| 有冒号 + 多管道 `"fred:\|a\|b\|W"` | 最后一个 `\|合法FLAGS` 归标志段，其余归表达式 | `"\|a\|b"` | `"W"` |
-| 无冒号 + 无管道 `"fred"` | 无 | `""` | `""` |
+| 模式 | 管道归属 | mm[2] 表达式段 | mm[3] FLAGS 段 | 判定依据 |
+|------|---------|--------------|----------------|---------|
+| 无冒号 + 单管道 + 合法FLAGS(≤3) `"fred\|W"` | 管道归分隔符 | `""` | `"W"` | 末尾 "W" 正好匹配组3 |
+| 有冒号 + 单管道 + 合法FLAGS(≤3) `"fred:.xx\|W"` | 管道归分隔符 | `".xx"` | `"W"` | 末尾 "W" 正好匹配组3 |
+| 无冒号 + 单管道 + 非法尾段 `"fred\|bar"` | **管道+bar 全归表达式段** | `"\|bar"` | `""` | `'b'` 不合法，组3只能 0 次，整体回溯 |
+| 有冒号 + 单管道 + 非法尾段 `"fred:.xx\|bar"` | **管道+bar 全归表达式段** | `".xx\|bar"` | `""` | 同上 |
+| 有冒号 + 合法FLAGS>3 `"fred:.xx\|NWLR"` | **第一个\|+多余字符归表达式** | `".xx\|N"` | `"WLR"` | 组3最多 3 字符，长度 4 触发回溯 |
+| 有冒号 + 多管道 + 末尾合法 `"fred:\|a\|b\|W"` | 最后一个\|为分隔符 | `"\|a\|b"` | `"W"` | 末尾 "W" 匹配组3 |
+| 无冒号 + 无管道 `"fred"` | 无 | `""` | `""` | 无管道分隔 |
 
-**单管道的判定原则**：正则的 `([\w\W]*?)` 非贪婪特性使得引擎**优先将管道符让给第三分组（FLAGS）**，前提是管道后跟 `[NTWSLRH]{0,3}` 能匹配成功。如果管道后跟的不是合法 FLAGS 字符，则引擎回溯，将管道符纳入第二分组。
+**通用判定规则（精确版）**：
+
+从字符串末尾向前看，设末尾连续合法标志字符数为 `k`（即 `N/T/W/S/L/R/H` 连续个数，从右往左数，遇到非法字符停止）：
+
+1. **若 `0 < k ≤ 3`，且倒数第 `k+1` 个字符是 `|`**：
+   - 该 `|` 是分隔符
+   - mm[3] = 末尾 `k` 个字符
+   - mm[2] = 剩下的前缀（不含最后那个 `|`）
+
+2. **若 `k = 0`（末尾字符非合法标志）或 倒数第 `k+1` 个字符不是 `|`**：
+   - mm[3] = `""`（0 次匹配）
+   - 所有管道全部留在 mm[2]（表达式段）
 
 ---
 
@@ -1168,18 +1226,26 @@ JQ 判定不在正则阶段，而在 [isJQSpec()](file:///d:/fz/0601-2/solo-dogf
 | `"NAME\|W"` | `""` | `""` | N/A (Spec="", parser=nil) | 默认列引用 |
 | `"IP:.status.hostIP"` | `".status.hostIP"` | `"{.status.hostIP}"` | Split=1段 → false | JSONPath |
 | `"IP:.status.hostIP\|W"` | `".status.hostIP"` | `"{.status.hostIP}"` | Split=1段 → false | JSONPath |
+| `"X:.spec\|bar"` | `".spec\|bar"` | `"{.spec\|bar}"` | Split=2段 → false | JSONPath (但 RelaxedJSONPath 可能拒绝\|bar) |
 | `"X:\|\|.foo\|W"` | `"\|\|.foo"` | `"{\|\|.foo}"` | Split=3段 → true | JQ 优先 |
 | `"X:.items[]\|select(.x)\|name\|W"` | `".items[]\|select(.x)\|name"` | `"{.items[]\|select(.x)\|name}"` | Split=3段 → true | JQ 优先 |
+| `"X:.xx\|NWLR"` (合法FLAGS>3) | `".xx\|N"` | `"{.xx\|N}"` | Split=2段 → false | JSONPath (但 RelaxedJSONPath 可能拒绝\|N) |
 
-### 16.3 单管道永远无法触发 JQ
+### 16.3 单管道列定义的 JQ 判定分情况讨论
 
-关键校准：**单管道列定义不可能产生 JQ 路径**，原因：
+**校准（推翻之前"永远不能"的绝对结论）**：单管道是否触发 JQ，取决于那个管道最终落入哪个分组，以及落入表达式段后 spec 内总管道数是否 >2。
 
-1. 合法 FLAGS 字符（`N/T/W/S/L/R/H`）的单管道，正则将 `|` 后内容归入 FLAGS 段，spec 内无管道
-2. 非法 FLAGS 字符的单管道（如 `"fred:.spec\|bar"`），正则仍尝试将 `|bar` 归入 FLAGS 段（因为 `[\w\W]*?` 非贪婪 + `\|?` + `[NTWSLRH]{0,3}$` 组合），spec 内同样无管道
-3. `isJQSpec` 基于 `Split(spec, "\|") > 2`，spec 内无管道时 Split 只得 1 段，判定为 false
+| 单管道场景 | mm[2] 内容 | 包装后 spec | 管道数判断 | isJQSpec 结果 |
+|-----------|-----------|------------|-----------|--------------|
+| 单管道 + 后跟合法FLAGS(≤3) `"fred:.xx\|W"` | `".xx"` | `"{.xx}"` | 0 个管道 → 1段 | false → JSONPath |
+| 单管道 + 后跟非法尾段 `"fred:.spec\|bar"` | `".spec\|bar"` | `"{.spec\|bar}"` | 1 个管道 → 2段 | false（>2才是 true）→ JSONPath |
+| 单管道 + 后跟合法FLAGS>3 `"fred:.xx\|NWLR"` | `".xx\|N"` | `"{.xx\|N}"` | 1 个管道 → 2段 | false → JSONPath |
+| 多管道 + 末尾合法 `"fred:\|a\|b\|W"` | `"\|a\|b"` | `"{.\|a\|b}"` | 2 个管道 → 3段 | true → JQ 优先 |
 
-**推论**：JQ 路径只在用户输入中 spec 部分**显式包含至少 2 个管道符**时触发（如 JQ 的 `|select()`+`|name` 组合），这与正则如何处理管道归属无关——因为只要最终 spec 含 `|` 就可能判定为 JQ。
+**关键结论**：
+1. **单管道无论什么情况都不会触发 JQ**——因为即使管道回退入表达式段，spec 内也只有 1 个管道，`Split(spec, "|")` 得到 2 段，不满足 `>2` 的 JQ 判定阈值。
+2. JQ 触发的必要条件：**包装后的 spec 内至少包含 2 个管道符**（即表达式段 mm[2] 含 ≥2 个 `|`），使得 `Split` 结果 ≥ 3 段。
+3. 用户输入中想要启用 JQ，表达式部分必须显式写 ≥2 个管道，例如 JQ 管道链 `|filter|transform`。
 
 ### 16.4 测试用例 "toast" 的 JQ 判定校准
 
@@ -1193,7 +1259,7 @@ isJQSpec("{.||.metadata.name}")
   → Split by "|" → ["{.", "", ".metadata.name}"] → 3段 > 2 → true
 ```
 
-**校准结论**：此 spec 会被判定为 JQ，但 `{.||.metadata.name}` 作为 JQ 表达式（去掉首尾花括号后为 `.||.metadata.name`）语法是无效的。`gojq.Parse` 会失败，`jqParse` 返回 false，降级到 JSONPath，而 JSONPath parser 在 realize() 预处理时已 Parse 此 spec（`{.||.metadata.name}`），大概率也失败。由于 `isJQSpec=true`，Parse 失败不告警。最终运行时 JQ 失败 + JSONPath FindResults 也失败 → hydrate 返回 error。
+**校准结论**：此 spec 会被判定为 JQ（因为 2 个管道 → 3段），但 `{.||.metadata.name}` 作为 JQ 表达式（去掉首尾花括号后为 `.||.metadata.name`）语法是无效的。`gojq.Parse` 会失败，`jqParse` 返回 false，降级到 JSONPath，而 JSONPath parser 在 realize() 预处理时已 Parse 此 spec（`{.||.metadata.name}`），大概率也失败。由于 `isJQSpec=true`，Parse 失败不告警。最终运行时 JQ 失败 + JSONPath FindResults 也失败 → hydrate 返回 error。
 
 ### 16.5 "toast-no-name" 匹配失败的根因
 
@@ -1201,21 +1267,34 @@ isJQSpec("{.||.metadata.name}")
 
 原因：组1 `([\w\s%/-]+)` 要求至少一个字符，而冒号前为空字符串，`+` 量词不满足，整个正则不匹配。**这无关管道归属，而是名称段为空导致的整体匹配失败**。
 
-### 16.6 正则分组对 FLAGS 非法字符的处理
+### 16.6 单管道 + 非法尾段场景的完整路径推演
 
-当管道后跟非 `[NTWSLRH]` 字符时（如 `"fred:.spec.foo|bar"`）：
+用户输入 `"X:.spec.foo|bar"`（单管道 + 非法尾段 `bar`）的全链路：
 
-正则尝试匹配 `[NTWSLRH]{0,3}$`，`"bar"` 不匹配，引擎回溯：
-- 尝试将 `|bar` 纳入组2（表达式段）
-- 组3 匹配空字符串 `{0,3}` 允许 0 次
-- 最终：mm[2] = `.spec.foo|bar`，mm[3] = `""`
+```
+① 正则分组（尾锚定约束导致回退）:
+   mm[1] = "X"
+   mm[2] = ".spec.foo|bar"   ← |bar 回退进入表达式段
+   mm[3] = ""                ← 标志段空
 
-但 `RelaxedJSONPathExpression(".spec.foo|bar")` 的行为取决于 kubectl 的实现：
-- 如果 `|` 在 spec 内被保留 → spec 含管道 → isJQSpec 可能判定为 true
-- 如果被拒绝 → parse() 返回错误，整个列定义无效
+② newColFlags(""): 无标志字符，不做任何处理（default 分支也触发不了）
 
-**实测边界**：从测试用例来看，没有 `|非法字符` 的测试场景，这属于未覆盖的边界。代码中 `newColFlags` 的 `default` 分支只打 Warn 不报错，暗示正则匹配成功后 FLAGS 段可以包含任意字符（只是非法字符被忽略）。
+③ RelaxedJSONPathExpression(".spec.foo|bar"):
+   kubectl 函数的行为是把形如 ".xxx" 的字符串包装成 "{.xxx}"，
+   不会检查内部是否含非法字符（| 对 JSONPath 语法是非法的）
+   → spec = "{.spec.foo|bar}"
 
-但更关键的是：正则的 `$` 锚定要求组3 必须匹配到字符串末尾。`[NTWSLRH]{0,3}$` 能匹配空字符串，所以即使管道后跟 `bar`，引擎会回溯将 `|bar` 纳入组2，组3 匹配空。这样 spec 就变成了 `{.spec.foo|bar}`，其中含管道符 → isJQSpec 可能为 true → 触发 JQ 路径。
+④ isJQSpec("{.spec.foo|bar}"):
+   Split("{.spec.foo|bar}", "|") = ["{.spec.foo", "bar}"] → 长度2
+   → 2 > 2? false → isJQSpec = false
+   结论: 单管道 + 非法尾段 → 仍然走 JSONPath 路径，不触发 JQ
 
-**这是之前分析中的一个重要校准**：单管道 + 非法 FLAGS 字符时，管道可能留在 spec 内部，从而使 isJQSpec 判定为 true。
+⑤ realize() 预处理 parser.Parse("{.spec.foo|bar}"):
+   isJQSpec=false，Parse 若失败会打 slog.Warn，但 parser 仍非 nil
+
+⑥ hydrate() 运行时：
+   parser.FindResults(o) → JSONPath 语法不支持 "|bar" → 报错返回
+   → hydrate 返回 error，整行渲染失败
+```
+
+**核心校准**：单管道 + 非法尾段虽然让管道进入 spec，但因为只贡献 1 个管道，isJQSpec 判定为 false，**不会触发 JQ**。最终走向是 JSONPath 语法报错而非 JQ 求值。
