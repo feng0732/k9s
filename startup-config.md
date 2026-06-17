@@ -220,13 +220,13 @@ Browser.Init(ctx) 被调用
                         → ShellPod 为 nil 时，即使非只读也看不到 S 键
 ```
 
-**三个入口保护条件的 AND 关系**：
+**三个入口保护条件的 AND 关系**（仅针对 NodeShell 的 S 键）：
 
 ```
 用户能看到 S 键 = !IsReadOnly() AND FeatureGates.NodeShell AND ShellPod != nil
 ```
 
-三个条件缺一不可，层层递进。只读模式是最外层的闸门。
+三个条件缺一不可，层层递进。只读模式是最外层的闸门——但注意，只读模式的这个"通用闸门"**只适用于 A 类和 B 类（内置危险操作及其子集）**，不适用于 C 类（端口转发）、D 类（未标记 dangerous 的插件）、E 类（HotKey）。详见本章末尾 3.3 节的各类入口对比。
 
 ##### 阶段三：用户按键触发执行
 
@@ -316,9 +316,11 @@ Node.sshCmd() [node.go#L179-L191]
 
 **只读模式对风险的额外消除**：
 只读模式是一个非常强的安全闸门。在企业生产环境中，K9s 通常以 `--readonly` 模式部署，此时：
-- 所有危险操作（cordon、drain、shell、edit、delete 等）的快捷键都不注册
+- 所有内置危险操作（cordon、drain、shell、edit、delete 等）的快捷键都不注册
 - NodeShell 作为"危险操作"之一，在只读模式下从入口处就被完全屏蔽
 - 用户界面上根本看不到 S 键选项，无法触发
+
+> **但需要注意**：只读模式并不屏蔽所有修改操作。例如端口转发（`Shift+F`）和未标记 `dangerous: true` 的插件在只读模式下依然可用。详见第 8 节"只读模式的闸门模式并非统一适用"。
 
 #### 3.2.5 配置自动生成的特殊情况
 
@@ -333,6 +335,47 @@ if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
 **关键点**：Save() 之前不做 YAML 解析、不做 Merge。此时内存中的配置是 `NewConfig()` 构造出来的完整默认值（包含 `ShellPod = &ShellPod{Image: "busybox:1.37.0", ...}`）。所以自动生成的配置文件包含完整的 shellPod，不会有缺省问题。
 
 只有当用户**手动编辑**全局配置文件、或从其他渠道获得一个**手写且缺省字段**的 config.yaml 时，才会触发 Merge 的破坏性赋值。
+
+### 3.3 五类操作入口的只读闸门规则对比
+
+NodeShell 只是其中一类入口。K9s 的操作快捷键注册根据其"危险程度"和"来源"分为五类，只读模式的判断规则完全不同，不能混为一谈：
+
+| 类别 | 代表功能 | 注册方式 | 只读模式判断 | 额外注册条件 | 涉及视图/位置 |
+|------|---------|---------|-------------|-------------|--------------|
+| **A. 内置危险操作** | Pod Shell(`S`)、Kill(`Ctrl-K`)、Attach(`A`)、Edit(`E`)、Delete(`Ctrl-D`)、Cordon(`C`)、Uncordon(`U`)、Drain(`R`)、Restart(`R`)、Scale、SetImage(`I`)、Transfer(`T`)、Sanitize(`Z`) 等 | 视图级 `bindKeys` → `if !IsReadOnly() { bindDangerousKeys(aa) }` | ✅ 只读时完全不注册 | 无 | Pod、Node、Xray、Workload、Container、Helm、Dir、Deploy、DS、STS 等 |
+| **B. NodeShell** | Node Shell(`S`) | 在 A 类的 `bindDangerousKeys` 内部再加二级判断 | ✅ 继承 A 类只读闸门 | `FeatureGates.NodeShell=true` AND `ShellPod!=nil` | 仅 Node 视图 [node.go#L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L75) |
+| **C. 端口转发** | 创建 Port-Forward(`Shift-F`)、查看转发(`F`) | 独立 `PortForwardExtender.bindKeys`，无条件注册两个快捷键 | ❌ **完全无只读判断** | 无（运行时检查 Pod 必须 Running） | Pod、Deploy、StatefulSet、DaemonSet、Service 视图 [pf_extender.go#L40-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/pf_extender.go#L40-L45) |
+| **D. 插件动作** | 用户自定义插件快捷键 | `pluginActions()` 在视图绑定之后统一注册 | ✅ 只读时跳过 `plugin.Dangerous=true` 的插件；`Dangerous=false`（默认）的插件照常注册 | 插件 `Scopes` 必须匹配当前视图别名 | 所有 Browser/Xray 视图 [actions.go#L139-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/actions.go#L139-L144) |
+| **E. HotKey 热键** | 用户自定义跳转快捷键 | `hotKeyActions()` 在插件之后统一注册 | ❌ **完全无只读判断** | 无 | 所有 Browser/Xray 视图 [actions.go#L60-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/actions.go#L60-L106) |
+
+#### 执行时序总览（Browser.Init 内）
+
+```
+Browser.Init()
+  ├─ b.bindKeys(b.Actions())              ← 浏览器基础快捷键（YAML、Describe 等安全操作）
+  ├─ for f in bindKeysFn: f(aa)           ← 视图级绑定函数依次执行
+  │    ├─ Pod.bindKeys
+  │    │    ├─ !IsReadOnly() → bindDangerousKeys  ← A 类：Pod Shell/Kill/Attach
+  │    │    └─ 安全键: ShowNode(O)
+  │    ├─ Node.bindKeys
+  │    │    ├─ !IsReadOnly() → bindDangerousKeys  ← A 类：Cordon/Uncordon/Drain
+  │    │    │   └─ NodeShell 二级判断:              ← B 类：FeatureGate + ShellPod!=nil
+  │    │    │       ct.FeatureGates.NodeShell && ShellPod!=nil → 注册 S 键
+  │    │    └─ 安全键: YAML(Y)
+  │    └─ PortForwardExtender.bindKeys    ← C 类：无条件注册 F / Shift-F
+  ├─ b.Actions().Merge(aa)
+  ├─ pluginActions(b, b.Actions())        ← D 类：只读时跳过 Dangerous=true 的插件
+  └─ hotKeyActions(b, b.Actions())        ← E 类：无条件注册所有热键
+```
+
+#### 各类别的只读边界总结
+
+| 只读模式下 | A 类内置危险 | B 类 NodeShell | C 类端口转发 | D 类插件(Dangerous=true) | D 类插件(Dangerous=false) | E 类 HotKey |
+|-----------|:---:|:---:|:---:|:---:|:---:|:---:|
+| 快捷键可见 | ❌ 不可见 | ❌ 不可见 | ✅ 可见 | ❌ 不可见 | ✅ 可见 | ✅ 可见 |
+| 可触发执行 | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ |
+
+**关键结论**：只读模式只对 A 类（内置危险操作）和 B 类（NodeShell，作为 A 类的子集）以及 D 类中显式标记 `dangerous: true` 的插件有效。端口转发和未标记 dangerous 的插件在只读模式下完全可操作。HotKey 虽然本身只是跳转命令，但用户可通过 HotKey 跳转到可执行危险操作的页面，是只读模式的一个间接绕过路径。
 
 ---
 
@@ -589,7 +632,37 @@ run()
 
 1. **ShellPod 代码层面的 nil 防护缺失**：[launchShellPod()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L407-L454) 和 [k9sShellPod()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L460-L538) 内部共 8 处字段访问完全没有 nil 防御性检查。虽然入口处有四层保护（只读闸门、FeatureGate、ShellPod!=nil、执行前二次检查）阻止了几乎所有实际触发路径，但如果未来新增其他调用点（如命令、脚本绑定、热更新）、或配置在 S 键注册后被动态置空，会出现 nil panic。当前风险等级极低是靠调用方纪律，不是代码自身的健壮性。
 
-2. **只读模式的"闸门"模式一致性**：所有危险操作（Shell、Edit、Delete、Cordon、Drain、Restart、Scale、SetImage 等）都遵循同一模式——`bindKeys` 中先判断 `!IsReadOnly()` 再调用 `bindDangerousKeys`。这种模式统一且可靠，是 K9s 权限控制的核心设计模式。但要注意：**只读模式只影响快捷键注册，不影响 API 层面的权限检查**——如果通过其他路径（如命令栏、插件）触发操作，只读模式可能不生效。
+2. **只读模式的"闸门"模式并非统一适用**：并非所有"危险操作"都遵循同一模式，不同类别的入口有不同的注册规则，必须区分四类：
+
+   | 类别 | 代表功能 | 注册方式 | 只读模式判断 | 额外条件 | 代码位置 |
+   |------|---------|---------|-------------|---------|---------|
+   | **A. 内置危险操作** | Pod Shell、Kill、Attach、Edit、Delete、Cordon、Drain、Restart、Scale、SetImage、Transfer 等 | 视图级 `bindKeys` → `!IsReadOnly()` → `bindDangerousKeys()` | ✅ 明确判断 `!IsReadOnly()`，只读时完全不注册 | 无 | [pod.go#L127](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/pod.go#L127)、[node.go#L81](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L81)、[xray.go#L188](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/xray.go#L188) |
+   | **B. NodeShell 节点 Shell** | 按 `S` 键在节点上部署特权 Pod | 视图级 `bindDangerousKeys` 内部额外二级判断 | ✅ 继承 A 类的只读闸门（在 A 类内部执行） | `FeatureGates.NodeShell=true` **且** `ShellPod!=nil` | [node.go#L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L75) |
+   | **C. 端口转发** | 按 `Shift+F` 创建 Port-Forward、按 `F` 查看已有转发 | 独立的 `PortForwardExtender.bindKeys`，通过装饰器模式添加到 Pod/Deployment/StatefulSet/DaemonSet/Service 视图 | ❌ **完全没有只读判断**，只读模式下快捷键依然存在且可触发 | Pod 必须处于 Running 状态（运行时检查，非注册时检查） | [pf_extender.go#L40-L45](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/pf_extender.go#L40-L45) |
+   | **D. 插件动作** | 用户自定义的插件快捷键 | `pluginActions()` 在 Browser/Xray `bindKeys` 之后统一注册 | ✅ 只跳过 `Dangerous=true` 的插件，`Dangerous=false`（默认值为 false）的插件在只读模式下**照样注册** | 插件的 `Scopes` 必须匹配当前视图 | [actions.go#L139-L144](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/actions.go#L139-L144) |
+   | **E. HotKey 热键** | 用户自定义的热键快捷键 | `hotKeyActions()` 在 pluginActions 之后统一注册 | ❌ **完全没有只读判断**，所有热键在只读模式下照样注册 | 无 | [actions.go#L60-L106](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/actions.go#L60-L106) |
+
+   **关键差异说明**：
+   - **A 类（内置危险操作）** 是最严格的——只读模式时从入口完全屏蔽，快捷键根本不存在。
+   - **B 类（NodeShell）** 是 A 类中的特例——在 A 类闸门内再加 FeatureGate 和 ShellPod 两层判断，总共四层保护。
+   - **C 类（端口转发）** 是一个明显的不一致——作为"修改集群状态"的操作，却**没有任何只读闸门**。只读模式下用户依然可以创建端口转发。这可能是设计疏忽，也可能是有意为之（端口转发被视为调试操作而非破坏性操作）。
+   - **D 类（插件）** 是按插件自身的 `Dangerous` 标志精细判断——`dangerous: true` 的插件在只读时被跳过，但未声明（默认 false）或显式 `dangerous: false` 的插件只读模式下正常可用。这意味着插件作者必须主动声明危险属性，否则只读模式无法保护。
+   - **E 类（HotKey）** 完全没有只读判断，因为 HotKey 的用途是"跳转到某个视图/命令"，设计上不认为是破坏性操作（跳转命令本身不改变集群状态）。但用户可以通过 HotKey 的 `Command` 字段跳到可执行危险操作的页面，从而绕过只读模式的快捷键限制。
+
+   **注册时序的执行顺序**（Browser.Init() 中）：
+   ```
+   Browser.Init()
+     ├─ b.bindKeys(b.Actions())              ← 浏览器基础键
+     ├─ for f in bindKeysFn: f(aa)          ← 执行视图级绑定（包含 A/B/C 类）
+     │    ├─ Pod.bindKeys: !ReadOnly → bindDangerousKeys  [A 类]
+     │    ├─ Node.bindKeys: !ReadOnly → bindDangerousKeys → NodeShell 二级判断  [A+B 类]
+     │    └─ PortForwardExtender.bindKeys: 无条件注册 F/ShiftF  [C 类]
+     ├─ b.Actions().Merge(aa)
+     ├─ pluginActions(b, b.Actions())       ← D 类：按 Dangerous 标志判断
+     └─ hotKeyActions(b, b.Actions())       ← E 类：无条件注册
+   ```
+
+   **只读模式的真正边界**：只读模式只控制 A 类和 D 类（`Dangerous=true` 的插件）的快捷键注册。端口转发（C 类）和普通插件（D 类，`Dangerous=false`）以及所有 HotKey（E 类）在只读模式下依然可用。不能简单地认为"只读模式下所有危险操作都被禁用"。
 
 3. **初始化时序的确定性**：配置加载（Load + Merge + Override + Refine + Validate）**全部完成后**，才会创建和初始化视图。`Browser.Init()` 中调用 `bindKeys` 时，`IsReadOnly()`、`ShellPod`、`FeatureGates` 等配置已经是最终状态，不会出现"先注册快捷键、后加载配置"的竞态问题。这是一个设计良好的时序保障。
 
