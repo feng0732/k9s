@@ -385,7 +385,7 @@ func run(a *App, opts *shellOpts) (ok bool, errC chan error, outC chan string) {
 
 #### 6.1.5 execute：进程执行 + K9S_EDITOR 传递（★ 关键细节）
 
-`execute`（`internal/view/exec.go#L172-L239`）是**所有外部命令**的通用执行入口，包含**K9S_EDITOR 传递给 kubectl** 的关键逻辑：
+`execute`（`internal/view/exec.go#L172-L239`）是**走 `run()` 路径的外部命令**的通用执行入口（注意：`runKu()` → `oneShoot()` 路径会绕开 `execute()`，直接创建 `exec.Command`）。`execute()` 中包含**K9S_EDITOR 传递给 kubectl** 的关键逻辑：
 
 ```go
 func execute(opts *shellOpts, statusChan chan<- string) error {
@@ -398,9 +398,9 @@ func execute(opts *shellOpts, statusChan chan<- string) error {
     signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     // ...
 
-    // ========== ★ K9S_EDITOR 注入逻辑（无条件执行！） ★ ==========
+    // ========== ★ K9S_EDITOR 注入逻辑（对所有经过 execute() 的命令无条件执行！） ★ ==========
     cmd := exec.CommandContext(ctx, opts.binary, opts.args...)
-    // opts.binary = kubectl，opts.args = [edit, resource/name, --context, ...]
+    // 资源编辑路径下：opts.binary = kubectl，opts.args = [edit, resource/name, --context, ...]
 
     if env := os.Getenv("K9S_EDITOR"); env != "" {
         // 用户设置了 K9S_EDITOR → 转成 KUBE_EDITOR 传给子进程
@@ -415,8 +415,10 @@ func execute(opts *shellOpts, statusChan chan<- string) error {
         }
     }
     // 注意：这段逻辑没有 if opts.binary == "kubectl" 判断，
-    // 意味着所有经过 execute() 的命令（包括 vim/code/其他）都会被注入 KUBE_EDITOR！
-    // ==============================================================
+    // 意味着只要经过 execute() 的命令（包括 vim/code/其他），子进程都会被注入 KUBE_EDITOR 环境变量。
+    // 但对于非 kubectl 命令（如本地文件编辑时的 vim），注入 KUBE_EDITOR 无实际影响（它们不读这个变量）。
+    // 对于绕开 execute() 的路径（如 runKu/oneShoot），完全不会执行这段注入逻辑。
+    // ========================================================================================
 
     // 单命令分支：stdin/stdout/stderr 直通终端
     // （多命令管道分支走另一个逻辑，kubectl edit 走单命令分支）
@@ -939,7 +941,7 @@ K9s UI 恢复
 | K8s 资源编辑 | kubectl edit 子进程 | **kubectl**（k9s 只挂起终端） | `internal/view/browser.go#L533` → `internal/view/exec.go#L57` |
 | 本地文件编辑 | exec 拉起编辑器 | **k9s** 自己查环境变量 | `internal/view/exec.go#L124` |
 | K9S_EDITOR → kubectl | 子进程 Env 设置 KUBE_EDITOR | k9s 中转 | `internal/view/exec.go#L203-L214` |
-| K9S_EDITOR 注入范围 | **所有经过 execute() 的命令**（包括非 kubectl） | k9s（无条件） | `internal/view/exec.go#L203-L214` |
+| K9S_EDITOR 注入范围 | 所有**经过 `execute()`** 的命令（包括非 kubectl）；`runKu()`/`oneShoot()` 路径绕开 execute，不会被注入 | k9s（在 execute() 内无条件执行） | `internal/view/exec.go#L203-L214` |
 | KUBE_EDITOR/EDITOR 查找（资源编辑时） | kubectl 内部实现 | **kubectl** | kubectl 源码（不在 k9s 中） |
 | KUBE_EDITOR/EDITOR 查找（本地文件时） | k9s 遍历 env vars | **k9s** | `internal/view/exec.go#L129-L152` |
 | 版本冲突处理（kubectl edit 时） | resourceVersion 比对 + 提示 | **kubectl**（k9s 零参与） | kubectl 源码（不在 k9s 中） |
