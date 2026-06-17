@@ -157,8 +157,9 @@ func (t *Table) keyboard(evt *tcell.EventKey) *tcell.EventKey {
 
 ```
 ┌───────────────────────────────────────────────────────────┐
-│  第 6 层: 动态加载层（热键 + 插件）                         │  ← 优先级最高
-│    hotKeyActions() / pluginActions() —— 运行时从配置加载   │
+│  第 6 层: 动态加载层（插件 + 热键）                         │  ← 优先级最高
+│    pluginActions() / hotKeyActions() —— 运行时从配置加载   │
+│    插件先加载，热键后加载（热键可覆盖插件）                  │
 ├───────────────────────────────────────────────────────────┤
 │  第 5 层: 具体资源层（Pod/Deploy/...）                     │
 │    例如 Pod.bindKeys() —— 通过 AddBindKeysFn 注入           │
@@ -262,8 +263,8 @@ func (t *Table) keyboard(evt *tcell.EventKey) *tcell.EventKey {
    ```
 
 6. **最后加载动态扩展**:
-   - `hotKeyActions()`: 从热键配置文件加载
-   - `pluginActions()`: 从插件配置文件加载
+   - `pluginActions()`: 从插件配置文件加载（先执行）
+   - `hotKeyActions()`: 从热键配置文件加载（后执行，可覆盖插件）
 
 ---
 
@@ -363,9 +364,30 @@ func (p *PortForwardExtender) bindKeys(aa *ui.KeyActions) {
 
 ---
 
-### 3.6 第 6 层：动态加载层（热键 + 插件）
+### 3.6 第 6 层：动态加载层（插件 + 热键）
 
 这两层都在 `refreshActions()` 的最后直接操作 `b.Actions()`（不是临时 `aa`），所以优先级最高。
+
+**实际调用顺序**（见 `internal/view/browser.go` 第 667-674 行）：
+
+```go
+b.Actions().Merge(aa)                      // 先合并前 5 层的键
+if err := pluginActions(b, b.Actions()); err != nil { ... }  // 第 6a 层：插件先加载
+if err := hotKeyActions(b, b.Actions()); err != nil { ... }  // 第 6b 层：热键后加载
+```
+
+> **关键**: 插件先写入，热键后写入。按 map 赋值覆盖规则，**热键优先级高于插件**——当热键与插件使用相同按键且热键配置了 `Override: true` 时，热键会覆盖插件的动作。
+
+#### 插件系统 —— `pluginActions()` in `internal/view/actions.go`
+
+- **加载来源**: 从 `plugins.yaml` 配置文件加载
+- **加载时机**: 每次数据刷新时重新加载
+- **清理机制**: 加载前先 `Range` 遍历并删除所有 `Plugin=true` 的旧动作，确保插件变化能即时生效
+- **范围匹配**: 插件的 `Scopes` 必须包含视图别名（通过 `inScope()` 检查），`"all"` 表示适用于所有视图
+- **权限检查**: 只读模式下跳过 `Dangerous=true` 的插件
+- **冲突处理**: 写入前调用 `aa.Get(key)` 检查键是否已被占用——已被占用且 `Override=false` 则报错跳过，`Override=true` 则覆盖
+- **标记**: `Plugin=true`
+- **输入支持**: 插件可定义 `Inputs`，执行时弹出输入对话框收集参数
 
 #### 热键系统 —— `hotKeyActions()` in `internal/view/actions.go`
 
@@ -373,18 +395,17 @@ func (p *PortForwardExtender) bindKeys(aa *ui.KeyActions) {
 - **加载时机**: 每次数据刷新时重新加载
 - **清理机制**: 加载前先 `Range` 遍历并删除所有 `HotKey=true` 的旧动作，确保热键变化能即时生效
 - **功能实质**: 快速跳转的快捷方式，内部调用 `gotoResource(cmd, path, clearStack)`
+- **冲突处理**: 写入前调用 `aa.Get(key)` 检查键是否已被占用（包括刚写入的插件键）——已被占用且 `Override=false` 则报错跳过，`Override=true` 则覆盖
 - **标记**: `HotKey=true`、`Shared=true`
-- **冲突处理**: 键冲突时根据 `Override` 配置决定是报错还是覆盖原有绑定
 
-#### 插件系统 —— `pluginActions()` in `internal/view/actions.go`
+#### 插件与热键的交互覆盖
 
-- **加载来源**: 从 `plugins.yaml` 配置文件加载
-- **加载时机**: 每次数据刷新时重新加载
-- **清理机制**: 加载前先删除所有 `Plugin=true` 的旧动作
-- **范围匹配**: 插件的 `Scopes` 必须包含视图别名（通过 `inScope()` 检查），`"all"` 表示适用于所有视图
-- **权限检查**: 只读模式下跳过 `Dangerous=true` 的插件
-- **冲突处理**: 键冲突时根据 `Override` 配置决定是报错还是覆盖
-- **输入支持**: 插件可定义 `Inputs`，执行时弹出输入对话框收集参数
+| 场景 | 结果 |
+|------|------|
+| 插件键与热键冲突，热键 `Override=true` | 热键覆盖插件（热键后写入） |
+| 插件键与热键冲突，热键 `Override=false` | 热键报错跳过，保留插件键 |
+| 插件键与热键冲突，插件 `Override=true` | 插件先写入成功；热键根据自身 `Override` 决定是否再覆盖 |
+| 同一键在插件和热键中都有定义 | 热键后执行，在 `Override=true` 时最终胜出 |
 
 ---
 
@@ -426,8 +447,8 @@ App.inject(component) → 触发 Component.Init()
     → 非内部资源添加 YAML/Describe 键
     → for f in b.bindKeysFn { f(aa) }     // 第4+5层：Extender 和具体资源键重建
     → b.Actions().Merge(aa)               // 合并到视图（覆盖同名键）
-    → hotKeyActions(b, b.Actions())       // 第6层a：热键（先删旧再加新）
-    → pluginActions(b, b.Actions())       // 第6层b：插件（先删旧再加新）
+    → pluginActions(b, b.Actions())       // 第6a层：插件（先删旧再加新）
+    → hotKeyActions(b, b.Actions())       // 第6b层：热键（先删旧再加新，可覆盖插件）
     → 更新菜单提示 HydrateMenu(Hints())
 ```
 
@@ -440,8 +461,8 @@ App.inject(component) → 触发 Component.Init()
 | 浏览器动态层 | 每次刷新 | 每次刷新重建 | 是（被上层覆盖） |
 | Extender 层 | Init + 每次刷新 | 每次刷新重建 | 是（被外层覆盖） |
 | 具体资源层 | Init + 每次刷新 | 每次刷新重建 | 是（被插件/热键覆盖） |
-| 热键层 | 每次刷新 | 每次刷新重建 | 是（被插件覆盖） |
-| 插件层 | 每次刷新 | 每次刷新重建 | 否（最顶层） |
+| 插件层 | 每次刷新 | 每次刷新重建 | 是（被热键覆盖） |
+| 热键层 | 每次刷新 | 每次刷新重建 | 否（最顶层） |
 
 > **注意**: Init 阶段 `bindKeysFn` 直接作用在 `b.Actions()` 上；Refresh 阶段 `bindKeysFn` 作用在临时 `aa` 上，然后 Merge。两种方式最终效果一致，但 Refresh 阶段的做法更利于实现"动态条件判断 + 原子更新"。
 
@@ -505,10 +526,12 @@ App.inject(component) → 触发 Component.Init()
 | ↑ | 内层 Extender | map 赋值覆盖 |
 | ↑ | 外层 Extender | map 赋值覆盖 |
 | ↑ | 具体资源（Pod 等） | map 赋值覆盖 |
-| ↑ | 热键 | 先删旧再加新 |
-| 最高 | 插件 | 先删旧再加新 |
+| ↑ | 插件 | 先删旧再加新；冲突时检查 Override |
+| 最高 | 热键 | 先删旧再加新；冲突时检查 Override；后于插件写入，可覆盖插件 |
 
 实际合并使用 `Merge()` / `Bulk()` / `Add()`，本质都是 `map[k] = v` 赋值，后写入的值会覆盖先写入的。
+
+> **插件与热键的覆盖细节**: 两者都通过 `aa.Get(key)` 检测冲突。插件先写入时可能覆盖前 5 层的键（`Override=true` 时），热键后写入时可能覆盖包括插件在内的所有键（`Override=true` 时）。若 `Override=false`，冲突时不会覆盖而是报错跳过。
 
 ### 6.3 危险操作保护
 
