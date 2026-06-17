@@ -289,13 +289,36 @@ INPUT_MYFIELD=userinput    （如有 Inputs）
 
 ### 2.5 不同视图的 EnvFn 变量来源差异
 
-`EnvFunc` 是通过 `Runner` 接口定义的方法，每个视图都必须实现。`ResourceViewer` 接口要求 `SetEnvFn(EnvFunc)` 可以替换默认实现。K9s 代码中共存在 **4 种视图实现方式，按使用的视图层级如下：
+`EnvFunc` 是通过 `Runner` 接口定义的方法，每个视图都必须实现 `EnvFn() EnvFunc`。`ResourceViewer` 接口额外要求 `SetEnvFn(EnvFunc)` 允许替换默认实现。K9s 代码中共存在 **4 种视图实现方式**，按绑定机制如下：
+
+#### 核心接口回顾
+
+```go
+// Runner 接口 [actions.go#L25-L37]，插件系统使用的接口
+type Runner interface {
+    App() *App
+    GetSelectedItem() string   // 选中资源路径
+    Aliases() sets.Set[string]
+    EnvFn() EnvFunc            // ← 插件系统从此取环境变量函数
+}
+
+// ResourceViewer 接口 [types.go#L82-L102]，资源视图通用接口
+type ResourceViewer interface {
+    SetEnvFn(EnvFunc)          // ← 允许外部覆盖 envFn
+    GVR() *client.GVR
+    ...
+}
+```
+
+注意：`pluginAction()` 中调用 `r.EnvFn()` 的 `r` 是 `Runner`，**不是** `ResourceViewer`。所以即使 `SetEnvFn` 是空实现，只要 `EnvFn()` 返回有效的函数，插件就能拿到环境变量。
+
+---
 
 #### （1）`Table.defaultEnv()` —— 表格视图默认实现
 
 **位置**: [table.go#L145-L158](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/table.go#L145-L158)
 
-覆盖范围：所有继承 `NewTable 构建的视图，以及通过 `Browser`（`Browser` 内嵌了 `*Table`，并未覆盖默认使用。
+**绑定时机**：`NewTable()` 时设置 `t.envFn = t.defaultEnv`，后续可通过 `SetEnvFn` 覆盖。
 
 ```go
 func (t *Table) defaultEnv() Env {
@@ -313,13 +336,26 @@ func (t *Table) defaultEnv() Env {
 }
 ```
 
-**独有变量**：`FILTER`（命令缓冲文本或资源名）、`RESOURCE_GROUP/VERSION/NAME`（当前视图对应 GVR 拆分的三段值）、完整的 `COL-<列名>` 列值变量。
+**变量来源链**：
+- `defaultEnv(cfg, path, header, row)` → 调用 `k8sEnv(cfg)` + 从 `path` 解析 `NAMESPACE/NAME` + 从 `row` 生成 `COL-<列名>`
+- `t.GVR()` → 当前视图对应的 Group-Version-Resource，拆分为三段变量
 
-适用视图：绝大多数资源列表视图（Pod、Service、Deployment 等），都通过 `Browser`（内嵌 `*Table`）直接或间接经过 Extender 装饰链生效。
+**独有变量**：`FILTER`、`RESOURCE_GROUP/VERSION/NAME`、完整的 `COL-<列名>` 列值变量。
+
+适用视图：绝大多数资源列表视图（Pod、Service、Deployment 等），都通过 `Browser`（内嵌 `*Table`）生效。
+
+---
 
 #### （2）`Xray.k9sEnv()` —— Xray 资源关系树视图
 
 **位置**: [xray.go#L269-L295](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/xray.go#L269-L295)
+
+**绑定时机**：`Xray.Init(ctx)` 时设置 `x.envFn = x.k9sEnv` [xray.go#L65](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/xray.go#L65)。
+
+**关键代码事实**：
+- `Xray.SetEnvFn(EnvFunc)` 是空实现 [xray.go#L622](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/xray.go#L622)，**不允许外部覆盖**
+- 但 `Xray.EnvFn()` 返回 `x.envFn` [xray.go#L265](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/xray.go#L265)，**插件系统能正常取到环境变量**
+- 我之前说 "Xray 不支持插件变量" 是错误的——Xray 完全支持，只是不允许外部覆盖默认实现
 
 ```go
 func (x *Xray) k9sEnv() Env {
@@ -334,12 +370,15 @@ func (x *Xray) k9sEnv() Env {
         env["NAMESPACE"], env["FILTER"] = ns, n
     }
     switch spec.GVR() {
-    case client.CoGVR:
+    case client.CoGVR:  // CoGVR = "containers" 虚拟资源
+        // Container 节点的 Path() 就是容器名本身（如 "nginx"），不含 namespace
         _, co := client.Namespaced(spec.Path())
         env["CONTAINER"] = co
+        // ParentPath() 是所属 Pod 的路径（如 "default/nginx-pod"）
         ns, n := client.Namespaced(*spec.ParentPath())
         env["NAMESPACE"], env["POD"], env["NAME"] = ns, n, co
     default:
+        // 普通 K8s 资源节点：Path() 是 "namespace/name" 格式
         ns, n := client.Namespaced(spec.Path())
         env["NAMESPACE"], env["NAME"] = ns, n
     }
@@ -347,82 +386,122 @@ func (x *Xray) k9sEnv() Env {
 }
 ```
 
-**关键差异**：
-- **不调用通用 `defaultEnv()`**，而是直接从 `xray.NodeSpec` 取路径，数据源是树节点而非表格行
+**关键差异（修正后）**：
+- **不调用通用 `defaultEnv()`**，直接从 `xray.NodeSpec` 取路径，数据源是树节点而非表格行
 - **没有 `COL-<列名>`**（Xray 是树视图，不存在列概念）
 - **没有 `RESOURCE_*` 变量**（不暴露当前 GVR 信息）
-- **当选中节点是 Container 时**，额外注入 `CONTAINER`（容器名）、`POD`（所属 Pod 名），并把 `NAME` 覆盖为容器名
+- **当选中节点是 Container 时**：
+  - `CONTAINER` = 容器名（来自 `spec.Path()`）
+  - `POD` = 所属 Pod 名（来自 `spec.ParentPath()`）
+  - `NAME` = 容器名（覆盖，不再是 Pod 名）
+  - `NAMESPACE` = Pod 的 namespace（来自 `spec.ParentPath()`）
 - 数据来源：`x.selectedSpec()` → `NodeSpec.Path()`，而非表格选中行
 
 适用视图：Xray 关系拓扑视图。
+
+---
 
 #### （3）`Container.k9sEnv()` —— 容器列表子视图
 
 **位置**: [container.go#L96-L103](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/container.go#L96-L103)
 
+**绑定时机**：`NewContainer()` 中调用 `c.SetEnvFn(c.k9sEnv)` [container.go#L33](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/container.go#L33)。
+
+**关键调用链（修正后）**：
+```
+c.SetEnvFn(c.k9sEnv)
+    │
+    └─► Container 嵌入 ResourceViewer 接口，所以调用嵌入对象的 SetEnvFn
+         │
+         └─► LogsExtender.SetEnvFn（委托给内嵌的 ResourceViewer）
+              │
+              └─► Browser.SetEnvFn（委托给内嵌的 *Table）
+                   │
+                   └─► Table.SetEnvFn → t.envFn = c.k9sEnv
+```
+最终替换掉了 `Table.defaultEnv`。
+
 ```go
 func (c *Container) k9sEnv() Env {
+    // path = 选中容器的行 path → 就是容器名（如 "nginx"，不含 namespace）
     path := c.GetTable().GetSelectedItem()
     row := c.GetTable().GetSelectedRow(path)
+    // defaultEnv 用容器名解析：NAMESPACE=""，NAME="nginx"，同时生成 COL-*
     env := defaultEnv(c.App().Conn().Config(), path, c.GetTable().GetModel().Peek().Header(), row)
+    // c.GetTable().Path = 父 Pod 的路径（如 "default/nginx-pod"）
+    // 覆盖 NAMESPACE 为 Pod 的 ns，注入 POD = Pod 名
     env["NAMESPACE"], env["POD"] = client.Namespaced(c.GetTable().Path)
     return env
 }
 ```
 
-**关键差异**：
-- 在复用通用 `defaultEnv()` 的基础上，**覆盖了 `NAMESPACE`**（从父 Pod 的路径 `c.GetTable().Path` 解析，而非当前容器行的 path）
-- **额外注入 `POD`**：父 Pod 名
-- `NAME` 仍然保持默认值（即当前容器名），`COL-<列名>` 列值变量保留
-- 通过 `c.SetEnvFn(c.k9sEnv)` 在 `NewContainer()` 中覆盖 Table 的默认实现
+**关键差异（修正后）**：
+- 复用通用 `defaultEnv()`，获得 `NAME`（容器名）、`COL-*`、`RESOURCE_*`
+- **覆盖 `NAMESPACE`**：从父 Pod 路径解析（而非容器行 path），所以 `NAMESPACE` 是 Pod 所在 namespace
+- **注入 `POD`**：父 Pod 名
+- `NAME` 保持 `defaultEnv()` 设置的**容器名**（没有被覆盖）
+- `COL-<列名>` 和 `RESOURCE_*` 变量全部保留
 
 适用视图：从 Pod 详情进入的 Containers 子列表视图。
 
-#### （4）`SetEnvFn` 为空实现的视图
+---
 
-以下视图虽然实现了 `ResourceViewer` 接口，但 `SetEnvFn` 是空操作，即**不支持外部注入**自定义环境函数（各自内部有默认实现）：
+#### （4）`Pulse` 视图——不支持插件
 
-```go
-// Pulse 脉冲健康视图
-func (*Pulse) SetEnvFn(EnvFunc) {}
-// Xray 视图（内部固定使用 x.k9sEnv，不接受外部覆盖）
-func (*Xray) SetEnvFn(EnvFunc) {}
+**关键代码事实**：
+- `Pulse.SetEnvFn(EnvFunc)` 是空实现 [pulse.go#L372](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/pulse.go#L372)
+- 更重要的是：**Pulse 没有实现 `EnvFn() EnvFunc` 方法**，因为它没有内嵌 `*Table`，也没有自己定义 `envFn` 字段
+- 所以 `pluginAction()` 中 `r.EnvFn() == nil` 会直接返回，**Pulse 视图完全无法运行插件**
+
+---
+
+#### 视图层 EnvFn 注册与覆盖机制（修正后）
+
+```
+Runner 接口要求 EnvFn() EnvFunc
+     │
+     ├─ Table（t.envFn 字段）
+     │    │
+     │    ├─ NewTable() 时 t.envFn = t.defaultEnv
+     │    ├─ SetEnvFn(f) { t.envFn = f }  ← 可外部覆盖
+     │    │
+     │    └─ Browser（内嵌 *Table，复用其 EnvFn/SetEnvFn）
+     │         │
+     │         └─ Pod/DP/STS/SVC 等资源视图（通过 Browser + Extender 链）
+     │              └─ Extender 不覆盖 SetEnvFn，一路委托到 Table
+     │
+     ├─ Xray（x.envFn 字段）
+     │    │
+     │    ├─ Init() 时 x.envFn = x.k9sEnv
+     │    ├─ SetEnvFn(EnvFunc) {}  ← 空实现，不允许外部覆盖
+     │    └─ EnvFn() { return x.envFn }  ← 插件可用，但无法覆盖
+     │
+     ├─ Container（内嵌 ResourceViewer = LogsExtender(Browser(Table))）
+     │    │
+     │    └─ NewContainer() 时 c.SetEnvFn(c.k9sEnv) → 替换 Table.defaultEnv
+     │
+     └─ Pulse（无 envFn 字段）
+          └─ EnvFn() 返回 nil → 插件无法运行
 ```
 
-#### 视图层 EnvFn 注册与覆盖机制
+**Extender 装饰器链说明**：`NewLogsExtender(NewBrowser(gvr), ...)` 中，Extender 本身不定义 `envFn` 字段，调用 `SetEnvFn` 会一路委托给内层的 Browser→Table，所以最终设置的是 `Table.envFn`。
 
-```
-ResourceViewer 接口 [types.go#L82-L102]
-    │
-    ├─ SetEnvFn(EnvFunc)          // 允许外部注入自定义环境函数
-    │
-    Table（默认 envFn = t.defaultEnv）   // NewTable() 时绑定默认实现
-    │   └─ Browser（内嵌 *Table，未覆盖）→ 使用 Table.defaultEnv()
-    │       └─ Pod/DP/STS/SVC 等资源视图（通过 Browser + Extender 装饰链）
-    │
-    Xray（envFn = x.k9sEnv）       // Xray.Init() 时绑定自己的实现
-    │
-    Container（c.SetEnvFn(c.k9sEnv)） // NewContainer() 中覆盖默认实现
-    │
-    LogsExtender / PortForwardExtender / ImageExtender / ...
-    （装饰器模式，内嵌 ResourceViewer，SetEnvFn 透明委托给被包装对象）
-```
+---
 
-**Extender 装饰器链说明**：例如 `NewLogsExtender(NewBrowser(gvr), ...)`，Extender 本身不定义 EnvFn，调用 `SetEnvFn` 会一路委托给内层的 Browser→Table，所以最终仍然是 `Table.defaultEnv()` 生效。
+#### 各视图环境变量对照表（修正后）
 
-#### 各视图环境变量对照表
-
-| 变量 | Table.defaultEnv | Xray.k9sEnv | Container.k9sEnv |
-|---|---|---|---|
-| CONTEXT/CLUSTER/USER/GROUPS/KUBECONFIG | ✓（k8sEnv） | ✓（k8sEnv） | ✓（k8sEnv） |
-| NAMESPACE | ✓（选中资源 ns） | ✓（节点 ns） | ✓（**父 Pod ns，覆盖默认值**） |
-| NAME | ✓（选中资源名） | ✓（节点名 / 容器名） | ✓（容器名，默认值） |
-| POD | ✗ | ✓（仅 Container 节点） | ✓（**父 Pod 名**） |
-| CONTAINER | ✗ | ✓（仅 Container 节点） | ✗ |
-| COL-*（列值） | ✓ | ✗ | ✓ |
-| FILTER | ✓（命令缓冲或 name） | ✓（命令缓冲或节点 name） | ✓（默认值） |
-| RESOURCE_GROUP/VERSION/NAME | ✓（GVR 三段） | ✗ | ✓（默认值） |
-| INPUT_*（用户输入） | ✓（executePlugin 统一注入，与视图无关） | ✓ | ✓ |
+| 变量 | Table.defaultEnv | Xray.k9sEnv | Container.k9sEnv | Pulse |
+|---|---|---|---|---|
+| CONTEXT/CLUSTER/USER/GROUPS/KUBECONFIG | ✓（k8sEnv） | ✓（k8sEnv） | ✓（k8sEnv） | ✗ |
+| NAMESPACE | ✓（选中资源 ns） | ✓（节点 ns / Pod ns） | ✓（**父 Pod ns，覆盖默认值**） | ✗ |
+| NAME | ✓（选中资源名） | ✓（节点名 / **容器名**，Container 节点覆盖） | ✓（容器名，来自 defaultEnv） | ✗ |
+| POD | ✗ | ✓（仅 Container 节点） | ✓（**父 Pod 名**） | ✗ |
+| CONTAINER | ✗ | ✓（仅 Container 节点） | ✗ | ✗ |
+| COL-*（列值） | ✓ | ✗ | ✓ | ✗ |
+| FILTER | ✓（命令缓冲或 name） | ✓（命令缓冲或节点 name） | ✓（默认值） | ✗ |
+| RESOURCE_GROUP/VERSION/NAME | ✓（GVR 三段） | ✗ | ✓（默认值） | ✗ |
+| INPUT_*（用户输入） | ✓（executePlugin 统一注入） | ✓ | ✓ | ✗ |
+| 插件是否可用 | 是 | 是（但不可覆盖 envFn） | 是 | 否（EnvFn 返回 nil） |
 
 ### 2.6 占位符替换引擎：`Env.Substitute()`
 
@@ -655,13 +734,30 @@ return cmds[last].Wait()
 
 ### 3.4 管道命令子进程的结束边界与回收机制
 
-这是最容易产生误解的部分：多命令管道链中「谁先结束？谁被等待？中间进程怎么回收？context 取消时怎么传播？」以下逐层拆解。
+这是最容易产生误解的部分。我之前的分析有多处与代码事实不符，现在结合真实代码逐一澄清。
 
-#### 3.4.1 进程创建阶段：所有子进程共享同一个 context
+#### 3.4.1 关键代码事实核对（修正前的错误）
+
+先澄清几个核心错误：
+
+| 我之前的说法 | 代码事实 |
+|---|---|
+| `pipe()` 使用传入的 `context.Context` | ❌ `pipe(_ context.Context, ...)` 第一个参数是 `_`，**完全没有被使用**！ |
+| context 通过 `pipe()` 传递给子进程 | ❌ context 只在 `execute()` 中通过 `exec.CommandContext(ctx, ...)` 绑定到每个 Cmd |
+| 管道模式下 `statusChan` 会被 close | ❌ 只有单命令模式 close `statusChan`，管道模式**既不写也不 close** |
+| 管道模式下 `o, e Buffer` 捕获输出 | ❌ 管道模式下 I/O 直连终端，Buffer 完全没用 |
+| Go Cmd finalizer 自动 Wait 收尸 | ❌ finalizer 只调用 `Process.Release()`，**不调用 Wait()** |
+| 后台模式支持管道命令 | ❌ 管道模式代码路径不区分前后台，后台模式只有单命令生效 |
+| 中间进程不会变成僵尸 | ❌ 只 Start 不 Wait 的子进程退出后**会变成僵尸进程**，直到 k9s 退出 |
+
+---
+
+#### 3.4.2 进程创建阶段：exec.CommandContext 绑定 context
 
 **位置**: [exec.go#L199-L226](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L199-L226)
 
 ```go
+// ──── 在 execute() 中创建，不是在 pipe() 中 ────
 ctx, cancel := context.WithCancel(context.Background())
 defer func() {
     if !opts.background {
@@ -669,11 +765,11 @@ defer func() {
     }
 }()
 
-// 主命令
+// 主命令：通过 CommandContext 绑定 ctx
 cmd := exec.CommandContext(ctx, opts.binary, opts.args...)
 cmds = append(cmds, cmd)
 
-// 管道链命令（共享同一个 ctx）
+// 管道链命令：全部绑定同一个 ctx
 for _, p := range opts.pipes {
     tokens := strings.Split(p, " ")
     if len(tokens) < 2 { continue }
@@ -682,23 +778,52 @@ for _, p := range opts.pipes {
 }
 ```
 
-**关键点**：
-- 无论是主命令还是管道后续命令，全部使用 `exec.CommandContext(ctx, ...)` 创建
-- `ctx` 在以下三种情况下被取消：
-  1. **前台模式函数返回**：`defer cancel()` 触发（正常退出或 panic 都会触发）
+**context 绑定机制（代码事实）**：
+- 所有子进程（主命令 + 管道命令）在 `execute()` 中通过 `exec.CommandContext(ctx, ...)` 创建
+- `ctx` 取消触发路径：
+  1. **前台模式 `execute()` 返回**：`defer cancel()` 触发（正常退出或 panic 都会触发）
   2. **收到信号**：`os.Interrupt` (Ctrl+C) 或 `syscall.SIGTERM` → signal goroutine 调用 `cancel()`
-  3. **后台模式外部逻辑触发**（当前代码中后台模式不会自动 cancel，依赖子进程自行结束）
+  3. **后台模式永不自动 cancel**：依赖子进程自行结束
 
-Go 标准库的 `exec.CommandContext` 行为：当 `ctx.Done()` 触发时，会向子进程发送 `os.Kill`（Unix 上是 SIGKILL，Windows 是 TerminateProcess）。这是**不可捕获、不可忽略**的强杀信号。
+`exec.CommandContext` 的行为（Go 标准库）：
+- `Start()` 时启动一个内部 goroutine 监听 `ctx.Done()`
+- `ctx.Done()` 触发时，调用 `cmd.Process.Kill()` 发送 `os.Kill`（SIGKILL，不可捕获）
+- **重要**：Kill 之后**不会自动调用 `Wait()`**，需要调用方自己调用 `Wait()` 来回收
 
-#### 3.4.2 管道连接阶段：io.Pipe 串联 Stdout→Stdin
+---
+
+#### 3.4.3 `pipe()` 函数签名分析：被忽略的 context
+
+**位置**: [exec.go#L549](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L549)
+
+```go
+// 第一个参数 context.Context 是 _，完全未使用！
+func pipe(_ context.Context, opts *shellOpts, statusChan chan<- string, w, e *bytes.Buffer, cmds ...*exec.Cmd) error {
+```
+
+**`pipe()` 的两条执行路径**：
+
+| 路径 | 触发条件 | statusChan | Buffer 使用 |
+|---|---|---|---|
+| **单命令** | `len(cmds) == 1` | 写入 + close | 后台模式使用（捕获 stdout） |
+| **管道模式** | `len(cmds) > 1` | **既不写入也不 close** | 完全不使用（I/O 直连终端） |
+
+这是一个真实的代码缺陷：
+
+1. **goroutine 泄漏**：`executePlugin()` 中 `for st := range statusChan` 会永远阻塞，因为管道模式下 `statusChan` 永不 close
+2. **Buffer 无意义**：`execute()` 中 `var o, e bytes.Buffer` 被创建并传入 `pipe()`，但管道模式下完全没用
+3. **错误信息丢失**：`execute()` 中 `errors.Join(err, fmt.Errorf("%s", e.String()))` 的 `e` 在管道模式下永远是空字符串
+
+---
+
+#### 3.4.4 管道连接阶段：io.Pipe 串联 Stdout→Stdin
 
 **位置**: [exec.go#L597-L606](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L597-L606)
 
 ```go
 last := len(cmds) - 1
 for i := range cmds {
-    cmds[i].Stderr = os.Stderr        // 所有进程 stderr 直通终端（用户能看到错误）
+    cmds[i].Stderr = os.Stderr        // 所有进程 stderr 直通终端
     if i+1 < len(cmds) {
         r, w := io.Pipe()             // 每对相邻进程创建一个内存管道
         cmds[i].Stdout, cmds[i+1].Stdin = w, r
@@ -707,16 +832,19 @@ for i := range cmds {
 cmds[last].Stdout = os.Stdout          // 末进程 stdout → 终端
 ```
 
-**数据流向**（以 `Pipes: ["grep foo", "wc -l"]`，即主命令 + 2 条管道共 3 个进程为例）：
+**数据流向**（以 `Pipes: ["grep foo", "wc -l"]` 共 3 个进程为例）：
 ```
-  os.Stdin → cmd[0].Stdin
   cmd[0].Stdout → io.Pipe#1(w) ──io.Pipe#1(r)→ cmd[1].Stdin
   cmd[1].Stdout → io.Pipe#2(w) ──io.Pipe#2(r)→ cmd[2].Stdin
   cmd[2].Stdout → os.Stdout
   所有 cmd[i].Stderr → os.Stderr
 ```
 
-#### 3.4.3 启动阶段：全部 Start，仅 Wait 最后一个
+注意：管道模式下首进程没有设置 `Stdin`，所以 `cmd[0].Stdin` 是 nil，无法从终端读取输入。
+
+---
+
+#### 3.4.5 启动与结束边界：全部 Start，仅 Wait 最后一个
 
 **位置**: [exec.go#L607-L614](file:///d:/fz/0601-2/solo-dogfeeding/code/11-k9s/internal/view/exec.go#L607-L614)
 
@@ -730,69 +858,64 @@ for _, cmd := range cmds {
 return cmds[len(cmds)-1].Wait()   // 只等待最后一个进程！
 ```
 
-这是最关键的「结束边界」设计：
+这是最关键的「结束边界」设计，带来三个真实问题：
 
-| 行为 | 说明 |
-|---|---|
-| **全部 Start()** | 所有子进程几乎同时启动（并发运行），这是管道语义的要求 |
-| **只 Wait() 末进程** | `pipe()` 只调用 `cmds[last].Wait()`，中间进程和首进程**不会被显式 Wait** |
-| **返回值** | 函数返回值 = 最后一个进程的退出状态（bash 的 `$?` 类似） |
+##### 问题 1：中间进程会变成僵尸进程吗？
 
-这就引出了三个重要问题：
+**答案：会，而且直到 k9s 退出才会被回收**。
 
-##### 问题 1：中间进程怎么回收？会变成僵尸进程吗？
+Unix 下的进程回收规则：
+- 子进程退出后，父进程必须调用 `wait()` / `waitpid()` 回收，否则子进程变成**僵尸进程（Z 状态）**
+- Go 的 `exec.Cmd.Wait()` 就是调用 `waitpid()`
+- K9s 代码中**只 `Wait()` 最后一个进程**，中间进程和首进程**永远不会被 `Wait()`**
+- Go 的 `exec.Cmd` 确实有 finalizer，但只调用 `Process.Release()`，**不调用 `Wait()`**
+- 僵尸进程会一直存在，直到**父进程（k9s）退出**，由 init 进程领养并回收
 
-答案：**不会变成僵尸进程，但有一个微妙的时序窗口**。
-
-- Go runtime 内部会为每个 `*exec.Cmd` 在 `Start()` 时注册一个 finalizer（详见 Go 源码 `os/exec/exec.go`），当 Cmd 对象被 GC 回收时自动调用 `Wait()` 来收尸
-- 但是 `cmds` 切片在 `execute()` 的整个生命周期内都持有所有 `*exec.Cmd` 的引用，这些 Cmd 对象不会被 GC
-- **直到 `execute()` 返回**，`cmds` 局部变量出栈，Cmd 变成可 GC，finalizer 才会最终回收中间进程
-
-**结论**：中间进程在「末进程 Wait 完成」到「execute 函数返回 + GC 触发」之间，可能短暂处于僵尸态（Z）。由于前台模式下 `execute()` 返回极快，实际几乎不可感知。
+**代码验证**：如果你运行一个管道命令，然后 `ps aux | grep Z`，可以看到中间进程处于 Z 状态。
 
 ##### 问题 2：末进程先结束，中间进程还在写管道怎么办？
 
-这是典型的 Unix 管道行为，不是 K9s 特有问题：
+这是标准 Unix 管道行为：
 
-1. 末进程 `cmd[last]` 先退出 → 其 `Stdin`（即 `io.Pipe#N` 的读端 r）被关闭
-2. 中间进程 `cmd[last-1]` 继续往 `io.Pipe#N` 的写端 w 写 → 收到 `EPIPE` / `syscall.EPIPE` 信号
-3. 中间进程默认行为：收到 SIGPIPE → 终止（大多数 Unix 命令如此）
-4. 如果中间进程捕获 SIGPIPE 并忽略，则 `Write()` 返回错误，进程如何处理取决于其自身逻辑
-
-注意：Go 的 `io.Pipe` 是内存管道，不涉及真实文件描述符信号，但语义一致——读端关闭后写端 Write 立即返回 `io.ErrClosedPipe`。
+1. 末进程 `cmd[last]` 先退出 → 其 `Stdin`（`io.Pipe#N` 读端 r）被 Go runtime 关闭
+2. 中间进程 `cmd[last-1]` 继续往写端 w 写 → `io.Pipe.Write()` 返回 `io.ErrClosedPipe`
+3. 如果中间进程检查 Write 错误，它会自己退出；如果不检查，可能继续运行
+4. 注意：Go 的 `io.Pipe` 是内存管道，不触发 SIGPIPE 信号（和真实文件管道不同）
 
 ##### 问题 3：首进程或中间进程先结束，末进程会怎样？
 
-1. 中间进程退出 → 其 `Stdout`（即写端 w）关闭 → 下一进程的 `Stdin` 读端 r 读到 EOF
-2. 末进程从管道读 EOF 后，根据其自身逻辑决定是否退出（如 `grep` / `wc -l` 读到 EOF 就正常退出）
-3. 末进程退出 → `cmds[last].Wait()` 返回 → `pipe()` 返回 → `execute()` 继续后续逻辑
+1. 中间进程退出 → 其 `Stdout`（写端 w）关闭 → 下一进程的 `Stdin` 读端 r 读到 EOF
+2. 末进程从管道读 EOF 后，根据自身逻辑决定是否退出（`grep` / `wc -l` 读到 EOF 正常退出）
+3. 末进程退出 → `cmds[last].Wait()` 返回 → `pipe()` 返回 → `execute()` 继续
 
-#### 3.4.4 Context 取消时的全链路回收
+---
 
-**触发路径**：
+#### 3.4.6 Context 取消时的回收路径
+
+**触发路径（代码事实）**：
 ```
 用户 Ctrl+C
     │
     ▼
-signal.Notify → sigChan 收到 os.Interrupt
+signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
     │
     ▼
-signal goroutine 调用 cancel()   [exec.go#L187-L197]
+signal goroutine 收到信号，调用 cancel()   [exec.go#L187-L197]
     │
     ▼
-所有 cmd[i] = exec.CommandContext(ctx, ...) 的内部 ctx.Done() 被触发
+每个 exec.CommandContext 内部的 goroutine 检测到 ctx.Done()
     │
     ▼
-Go 标准库向每个子进程发送 os.Kill (SIGKILL)
+每个 cmd.Process.Kill() → 向所有子进程发送 SIGKILL（不可捕获）
     │
     ▼
-cmds[last].Wait() 以信号错误返回（!ex.Exited()）
+cmds[last].Wait() 以 ExitError 返回（!ex.Exited() 表示信号终止）
     │
     ▼
-pipe() → execute() 返回 err
+pipe() 返回 err
     │
     ▼
-execute() 中 interrupted=true → 错误被忽略（不算失败）
+execute() 中 interrupted=true → 错误被忽略，返回 nil
 ```
 
 **重要细节**：`interrupted` 标记
@@ -802,49 +925,71 @@ var interrupted bool
 go func(cancel context.CancelFunc) {
     select {
     case sig := <-sigChan:
+        slog.Debug("Command canceled with signal", slogs.Sig, sig)
         cancel()
     case <-ctx.Done():
+        slog.Debug("Signal context canceled!")
     }
     interrupted = true   // 无论哪个分支，标记为已中断
 }(cancel)
 
+// pipe() 的第一个参数 ctx 被忽略！
 err := pipe(ctx, opts, statusChan, &o, &e, cmds...)
 if err != nil && !interrupted {
+    // 非中断错误才返回，e.String() 在管道模式下永远是空！
     return errors.Join(err, fmt.Errorf("%s", e.String()))
 }
 return nil   // 中断时不返回错误
 ```
 
-这保证用户按 Ctrl+C 中断管道时，k9s 不会显示「命令失败」的错误提示。
+注意：`pipe()` 的第一个参数 `ctx` 被命名为 `_`，完全没有被使用。context 的作用完全通过 `exec.CommandContext` 在进程创建时绑定。
 
-#### 3.4.5 后台模式 vs 前台模式的回收差异
+---
 
-| 维度 | 前台模式（background=false） | 后台模式（background=true） |
-|---|---|---|
-| UI 行为 | `Halt()` → `Suspend()` 切换终端原始模式 | 不挂起 UI，直接执行 |
-| Context cancel 时机 | `defer cancel()`：execute 返回立即触发 | **永不自动 cancel**，ctx 直到进程自然结束或 k9s 退出才释放 |
-| 进程 I/O | Stdin/Stdout/Stderr 全部直连终端 | Stdout/Stderr 写入 bytes.Buffer，完成后解析为 `[output]` 行 |
-| 子进程回收 | execute 返回后 GC 触发 Cmd finalizer 回收中间进程 | goroutine 持有 Cmd 引用直到进程结束，结束后回收 |
-| statusChan 关闭时机 | pipe() 内同步 close | goroutine 内 Run() 返回后 close |
-| 信号转发 | Ctrl+C → cancel() → 所有子进程 SIGKILL | Ctrl+C 不触发（信号由前台 UI 处理，后台进程不接收） |
+#### 3.4.7 后台模式的真实情况
 
-**后台模式的一个风险点**：后台模式下如果子进程挂死（死循环、网络阻塞等），由于 ctx 永不 cancel，**该子进程会一直存在直到 k9s 进程退出**。没有超时或手动终止机制。
+后台模式（`background: true`）**只在单命令模式下生效**。管道模式的代码路径（`len(cmds) > 1`）完全不检查 `opts.background`，所以：
 
-#### 3.4.6 管道子进程生命周期时序图（3 进程管道示例）
+- 管道命令永远是前台模式（挂起 UI，切换终端原始模式）
+- 后台模式下如果设置了 `pipes`，实际上管道不会生效，只会执行主命令
+
+**前后台模式对比表（修正后）**：
+
+| 维度 | 单命令前台 | 单命令后台 | 管道命令（永远前台） |
+|---|---|---|---|
+| UI 挂起 | 是 | 否 | 是 |
+| context cancel 时机 | defer cancel() | 永不 | defer cancel() |
+| I/O 连接 | 直连终端 | Buffer 捕获 | 直连终端 |
+| statusChan | 同步 close | goroutine 内 close | 永不 close（泄漏） |
+| 进程回收 | Wait() 回收 | Wait() 回收 | 只回收末进程，中间进程变僵尸 |
+| 信号转发 | Ctrl+C → SIGKILL | 不转发 | Ctrl+C → SIGKILL |
+
+**后台模式风险**：后台模式下 `ctx` 永不 cancel，如果子进程挂死，会一直存在直到 k9s 退出，没有超时或手动终止机制。
+
+---
+
+#### 3.4.8 管道子进程生命周期时序图（3 进程管道，修正后）
 
 ```
   时间轴 ─────────────────────────────────────────────────────────────►
 
-  主线程         execute()  pipe()
-    │              │          │
-    │              ├─ ctx,cancel := WithCancel()
-    │              ├─ cmds = [cmd0, cmd1, cmd2]   （都绑定 ctx）
+  主线程         execute()                  pipe()
+    │              │                          │
+    │              ├─ ctx, cancel := WithCancel()
+    │              ├─ cmds = [cmd0, cmd1, cmd2]  （每个都用 CommandContext 绑定 ctx）
+    │              │     ├─ cmd0: exec.CommandContext(ctx, binary, args)
+    │              │     ├─ cmd1: exec.CommandContext(ctx, "grep", "foo")
+    │              │     └─ cmd2: exec.CommandContext(ctx, "wc", "-l")
     │              ├─ signal.Notify(sigChan)
-    │              │   └── signal goroutine 启动，等待中断
+    │              │   └── signal goroutine 启动
     │              │
-    │              └─► pipe(cmds)
+    │              └─► pipe(ctx, opts, statusChan, &o, &e, cmds...)
+    │                     │  (ctx 被忽略，o/e Buffer 未使用)
     │                     │
     │                     ├── 连接 io.Pipe: cmd0→cmd1→cmd2
+    │                     ├── cmd0.Stdin = nil （管道模式不连终端）
+    │                     ├── 所有 cmd[i].Stderr = os.Stderr
+    │                     └── cmd2.Stdout = os.Stdout
     │                     │
     │                     ├── cmd0.Start() ───┐
     │                     ├── cmd1.Start() ───┼── 3 个子进程并发运行
@@ -852,29 +997,43 @@ return nil   // 中断时不返回错误
     │                                          │
     │                     ┌── cmd2.Wait() ◄───┘  (阻塞等待末进程)
     │                     │
-    │  (正常结束场景)      │  cmd0 输出完成 → 关闭管道写端
-    │                     │  cmd1 读到 EOF → 处理完退出
+    │  (正常结束场景)      │  cmd0 输出完成 → 关闭 Pipe#1 写端
+    │                     │  cmd1 读到 EOF → 处理完退出（变成僵尸！）
     │                     │  cmd2 读到 EOF → 退出
     │                     │
-    │                     └── cmd2.Wait() 返回 nil
+    │                     └── cmd2.Wait() 返回 nil  （只有 cmd2 被回收）
     │              │
-    │              ├─ defer: cancel()（非后台）
-    │              │         └─ ctx.Done() 触发
-    │              │            └─ cmd0/cmd1 已结束，无影响
-    │              │
+    │              ├─ defer cancel()（ctx.Done() 触发，cmd0/cmd1 已死，无影响）
+    │              ├─ cmds 切片出栈，Cmd 对象可 GC
+    │              │     └─ finalizer 调用 Process.Release()，但不 Wait()
+    │              │        → cmd0/cmd1 仍然是僵尸进程，直到 k9s 退出
     │              └─ 返回
     │
   (Ctrl+C 场景)
-    │              │          │
-    │  用户 Ctrl+C │          │
+    │              │                          │
+    │  用户 Ctrl+C │                          │
     │              │   signal goroutine: cancel()
-    │              │          │
-    │              │          └─ cmd0/cmd1/cmd2 全部收到 SIGKILL
-    │              │                 └─ cmd2.Wait() 返回 ExitError(!ex.Exited())
+    │              │                          │
+    │              │                          └─ 每个 cmd 内部 goroutine 检测到 ctx.Done()
+    │              │                                └─ 所有进程收到 SIGKILL
+    │              │                                      └─ cmd2.Wait() 返回 ExitError
     │              │
     │              ├─ interrupted=true → 错误被吞掉
     │              └─ 返回 nil
 ```
+
+---
+
+#### 3.4.9 管道模式的已知缺陷总结
+
+基于代码事实，管道模式存在以下真实缺陷：
+
+1. **中间进程僵尸化**：只 `Wait()` 末进程，中间进程退出后变成僵尸，直到 k9s 退出
+2. **goroutine 泄漏**：`statusChan` 永不 close，`executePlugin()` 中的消费 goroutine 永远阻塞
+3. **Buffer 无意义**：`o, e bytes.Buffer` 在管道模式下完全没用，白白分配内存
+4. **无法捕获标准输出**：`overwriteOutput: true` 在管道模式下无效，因为 stdout 直连终端
+5. **首进程无法读终端**：管道模式下 `cmd[0].Stdin` 是 nil，无法从终端读取输入
+6. **后台管道不生效**：`background: true` 只对单命令有效，管道命令永远前台
 
 ### 3.5 完成后状态处理：`executePlugin()` 后半段
 
@@ -963,6 +1122,6 @@ func (p *Plugin) ShouldConfirm() bool {
 
 ---
 
-## 一句话总结
+## 一句话总结（修正后）
 
-K9s 插件系统 = **多源 YAML 配置合并** → **`Env` 字典按视图类型（Table/Xray/Container）承载不同的上下文变量** → **`Substitute()` 正则替换占位符** → **`exec.CommandContext` 共享 ctx 绑定所有管道子进程 + 信号 goroutine 确保 Ctrl+C 可回收** → **仅 Wait 末进程的结束边界 + GC finalizer 兜底回收中间进程** → **管道链/后台两种 I/O 模式通过 statusChan 回传结果**。
+K9s 插件系统 = **多源 YAML 配置合并** → **`Env` 字典按视图类型（Table/Xray/Container/Pulse）承载不同的上下文变量，其中 Xray 有 `SetEnvFn` 空实现但 `EnvFn()` 正常返回，Pulse 因无 `envFn` 字段完全无法运行插件** → **`Substitute()` 正则替换占位符** → **`exec.CommandContext` 在 `execute()` 中绑定 ctx 到所有子进程（`pipe()` 的第一个 ctx 参数被完全忽略）** → **管道模式下「全部 Start、仅 Wait 末进程」的结束边界导致中间进程变成僵尸直到 k9s 退出，同时 `statusChan` 永不 close 造成 goroutine 泄漏** → **单命令模式的后台/前台两种 I/O 模式通过 statusChan 回传结果，但管道模式的 statusChan 和 Buffer 完全无用**。
