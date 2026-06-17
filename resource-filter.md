@@ -636,6 +636,134 @@ func IsLabelSelector(s string) bool {
 
 ---
 
+### 7.4 Fuzzy 前缀多词处理与三种空格写法对比
+
+#### 7.4.1 Fuzzy 前缀接多个词的代码分析
+
+Fuzzy 过滤的类型判断由 `IsFuzzySelector` 函数完成，其核心是一个正则表达式：
+
+```go
+// internal/helpers.go:14
+var fuzzyRx = regexp.MustCompile(`\A-f\s?([\w-]+)\b`)
+
+// internal/helpers.go:38-45
+func IsFuzzySelector(s string) (string, bool) {
+    mm := fuzzyRx.FindStringSubmatch(s)
+    if len(mm) != 2 {
+        return "", false
+    }
+    return mm[1], true
+}
+```
+
+**正则表达式拆解**：
+- `\A` — 字符串开头锚点
+- `-f` — 字面量 `-f` 前缀
+- `\s?` — 可选的**一个**空白字符（只能有 0 或 1 个空格）
+- `([\w-]+)` — 捕获组：**一个或多个**单词字符（字母、数字、下划线）或连字符 `-`
+- `\b` — 单词边界
+
+**关键特性**：
+1. **只捕获第一个词**：`[\w-]+` 不包含空格，遇到空格就停止匹配
+2. **忽略后续内容**：`FindStringSubmatch` 只找第一个匹配，后面的词不会被捕获，也不会报错
+3. **静默丢弃**：多出来的词没有任何处理，也没有任何提示
+
+#### 7.4.2 Fuzzy 前缀 + 空格 + 多词的完整执行路径
+
+以输入 `-f nginx pod` 为例，完整调用链如下：
+
+```
+用户输入 "-f nginx pod"
+    │
+    ▼
+cmdBuff 接收完整字符串
+    │
+    ▼
+TableData.Filter() 被调用
+    │
+    ├─ 1. Toast 过滤（可选）
+    │
+    ├─ 2. IsLabelSelector("-f nginx pod") ?
+    │    ├─ labelRx (\A\-l) 不匹配（-f 不是 -l）
+    │    ├─ 含空格 → !ContainsSpace = false
+    │    └─ 返回 false → 继续
+    │
+    ├─ 3. IsFuzzySelector("-f nginx pod") ?
+    │    ├─ fuzzyRx 匹配：FindStringSubmatch 找到 "-f nginx"
+    │    ├─ 捕获组 mm[1] = "nginx"（只取第一个词）
+    │    └─ 返回 ("nginx", true)
+    │
+    └─ 4. 执行 fuzzyFilter("nginx")
+         ├─ 只对 Row.ID 列进行 fuzzy 匹配
+         ├─ "pod" 这个词被完全忽略，没有任何警告
+         └─ 返回匹配结果
+```
+
+**多词输入的行为对照表**：
+
+| 输入 | 捕获到的 fuzzy 关键词 | 实际过滤行为 | 其余内容的命运 |
+|------|---------------------|-------------|--------------|
+| `-f nginx` | `nginx` | 正常 fuzzy 匹配名称列 | - |
+| `-f nginx pod` | `nginx` | 只按 `nginx` fuzzy 匹配 | **pod 被静默丢弃** |
+| `-f nginx pod svc` | `nginx` | 只按 `nginx` fuzzy 匹配 | **pod、svc 全部静默丢弃** |
+| `-f nginx-pod` | `nginx-pod` | 按 `nginx-pod` fuzzy 匹配（连字符 `-` 属于 `[\w-]` 字符集） | - |
+| `-f  nginx`（两空格） | -（匹配失败） | 不进入 fuzzy 路径 | 整体落入 rxFilter → 空格短路 → 全量显示 |
+
+**关于 `\s?` 边界的推导**：
+
+正则 `\A-f\s?([\w-]+)\b` 中，`\s?` 只匹配 0 或 1 个空白字符。当 `-f` 后有两个空格时：
+1. `\A-f` 匹配 `-f`
+2. `\s?` 匹配第一个空格（贪心匹配 1 个）
+3. 此时游标指向第二个空格，`[\w-]+` 无法匹配空格字符
+4. 又因为 `[\w-]+` 是**至少一个**字符的贪婪匹配，不能匹配空串
+5. 整个正则匹配失败，`FindStringSubmatch` 返回空切片
+
+**结论**：**`-f` 后接两个或更多空格时，`IsFuzzySelector` 返回 `false`**，输入会走到 `rxFilter` 路径，然后因为含空格被短路返回全量数据。用户输入 `-f  nginx`（多打了一个空格）时，实际效果等于没有筛选。
+
+#### 7.4.3 三种空格写法的横向对比
+
+将三类筛选遇到空格时的行为放在一起对比：
+
+| 维度 | 普通带空格查询 | Fuzzy 前缀 + 空格 + 多词 | 标签选择器 + 空格 |
+|------|--------------|----------------------|-----------------|
+| **示例** | `nginx pod` | `-f nginx pod` | `-l app=nginx, env=prod` |
+| **类型判断** | 非标签非 fuzzy | fuzzy 匹配（提取第一个词） | 标签选择器（`-l` 前缀优先） |
+| **空格处理位置** | `rxFilter` 开头短路 | `fuzzyRx` 正则中只捕获第一个词 | `ExtractLabelSelector` 去掉 `-l` 后交 K8s 解析 |
+| **代码位置** | `internal/model1/table_data.go:167-169` | `internal/helpers.go:14` | `internal/ui/table_helper.go:62-69` |
+| **过滤层面** | 客户端 | 客户端 | 服务器端 |
+| **空格后的内容** | 整个查询失效，返回全量 | 后面的词被静默丢弃 | 空格后的内容参与标签解析 |
+| **用户感知** | 无提示，表格显示全部 | 无提示，只按第一个词筛选 | 正常工作，支持 in/notin |
+| **最终效果** | **等于没有筛选** | **部分筛选（只按首词）** | **完整筛选** |
+
+#### 7.4.4 四种空格相关输入的完整行为矩阵
+
+| 输入 | `IsLabelSelector` | `IsFuzzySelector` | 最终路径 | 实际效果 |
+|------|-------------------|-------------------|---------|---------|
+| `nginx` | `false` | `("", false)` | rxFilter（正则） | 所有列匹配 nginx |
+| `nginx pod` | `false`（含空格） | `("", false)` | rxFilter → 空格短路 | **全量显示（无过滤）** |
+| `-f nginx` | `false` | `("nginx", true)` | fuzzyFilter | 名称列 fuzzy 匹配 nginx |
+| `-f nginx pod` | `false`（含空格） | `("nginx", true)` | fuzzyFilter("nginx") | **只匹配 nginx，pod 被丢弃** |
+| `-f  nginx`（两空格） | `false` | `("", false)`（匹配失败） | rxFilter → 空格短路 | **全量显示（无过滤）** |
+| `app=nginx` | `true` | - | 服务器端标签过滤 | 按 app=nginx 拉取 |
+| `app=nginx, env=prod` | `false`（含空格） | - | rxFilter → 空格短路 | **全量显示（无过滤）** |
+| `-l app=nginx, env=prod` | `true`（`-l` 优先） | - | 服务器端标签过滤 | 按两个标签组合过滤 |
+| `-l app=nginx,  env=prod`（两空格） | `true`（`-l` 优先） | - | 服务器端标签过滤（K8s 解析） | 取决于 labels.Parse 是否容忍多余空格 |
+
+#### 7.4.5 代码层面的三种空格处理策略总结
+
+| 策略 | 实现方式 | 所在位置 | 适用场景 |
+|------|---------|---------|---------|
+| **空格即短路** | `strings.Contains(q, " ")` → 直接返回全量 | `rxFilter` in `internal/model1/table_data.go` | 文本/正则过滤 |
+| **空格分词取首词** | `[\w-]+\b` 正则只捕获第一个词 | `fuzzyRx` in `internal/helpers.go` | Fuzzy 过滤 |
+| **空格参与解析** | 去掉前缀后交给专业解析器（labels.Parse） | `ExtractLabelSelector` in `internal/ui/table_helper.go` | 标签选择器（仅 `-l` 前缀路径） |
+
+> **为什么三种策略不一样？**
+> - 正则过滤：多列匹配，空格会导致正则语义模糊，干脆短路
+> - Fuzzy 过滤：本来就只匹配名称列，设计上就假设是单个关键词
+> - 标签选择器（-l）：利用 K8s 官方库的完整解析能力，支持复杂表达式
+
+---
+
 ## 八、总结
 
 ### 8.1 为什么容易混淆？
@@ -646,6 +774,8 @@ func IsLabelSelector(s string) bool {
 4. **互斥性不直观**：标签选择器和文本过滤不能同时生效，但用户可能期望它们叠加
 5. **空格是隐形杀手**：含空格的输入在正则路径被静默忽略，在标签路径则改变类型判断
 6. **非法正则无反馈**：编译失败时静默回退到全量数据，用户无从得知输入有误
+7. **Fuzzy 多词静默丢弃**：`-f nginx pod` 中第二个词被悄悄忽略，用户可能以为多词更精确
+8. **三种空格策略不统一**：正则短路、Fuzzy 取首词、标签全解析，行为不一致
 
 ### 8.2 设计思路
 
@@ -661,3 +791,5 @@ func IsLabelSelector(s string) bool {
 - 可视化的筛选状态展示
 - 空格和非法正则的 UI 反馈提示
 - 标签选择器解析失败时的状态重置策略
+- Fuzzy 多词支持或多词时的提示
+- 统一三种筛选的空格处理策略，减少用户心智负担
