@@ -37,6 +37,22 @@ func saveTable(dir, title, path string, mdata *model1.TableData) (string, error)
 - 输入：目录路径、资源标题、资源路径、表格数据
 - 输出：保存的文件路径
 
+**调用入口**（[table.go#L215-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table.go#L215-L223)）：
+
+```go
+saveTable(
+    t.app.Config.K9s.ContextScreenDumpDir(),  // 目录
+    t.GVR().R(),                               // title: 资源名，如 "pods", "nodes"
+    t.Path,                                    // path: 来自 KeyPath，通常是选中资源的 FQN
+    t.GetFilteredData(),                       // 表格数据
+)
+```
+
+**`t.Path` 参数说明**：
+- 来自 context 中的 `internal.KeyPath`（[browser.go#L266-L267](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/browser.go#L266-L267)）
+- 通常是选中资源的 FQN（完全限定名），如 `"default/nginx-pod"`
+- 在顶层列表视图（无具体资源选中）下为空字符串 `""`
+
 **命名空间预处理（关键逻辑）**：
 
 ```go
@@ -51,7 +67,7 @@ if client.IsClusterWide(ns) {
 - 完整流程：
   1. 获取表格的命名空间 `ns`
   2. 如果 `ns` 是集群范围相关值，统一转换为 `"all"`
-  3. 通过 `computeFilename` 计算文件名
+  3. 通过 `computeFilename` 计算文件名（传入转换后的 ns）
   4. 以 `0600` 权限创建文件
   5. 使用 `csv.Writer` 写入列名和所有行数据
   6. 刷新缓冲区并返回文件路径
@@ -141,16 +157,18 @@ if ns == ClusterScope {    // 判断 ns == "-"
 
 位置：[table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/view/table_helper.go#L22-L43)
 
-核心逻辑：
+核心逻辑（注意 `path` 对文件名的影响）：
 
 ```go
 func computeFilename(dumpPath, ns, title, path string) (string, error) {
     now := time.Now().UnixNano()
     
-    // 构建名称主体
+    // 构建名称主体：分两种情况
+    // 情况1：path 为空（顶层列表视图）→ name = title
+    // 情况2：path 非空（选中了具体资源）→ name = title + "-" + SanitizeFileName(path)
     name := title + "-" + data.SanitizeFileName(path)
     if path == "" {
-        name = title
+        name = title  // ← 此时不会出现多余的 "-"
     }
 
     // 由于 saveTable 中的转换，ns 只能是具体命名空间或 "all"
@@ -165,6 +183,16 @@ func computeFilename(dumpPath, ns, title, path string) (string, error) {
 }
 ```
 
+**path 参数对文件名的影响详解**：
+
+| path 取值 | 来源场景 | `name` 构建方式 | `name` 结果（以 pods 为例） |
+|----------|---------|----------------|---------------------------|
+| `""` | 顶层列表视图、未选中具体资源 | `name = "pods"` | `"pods"` |
+| `"default/nginx-pod"` | 选中了 default 命名空间下的 nginx-pod | `name = "pods-" + "default-nginx-pod"` | `"pods-default-nginx-pod"` |
+| `"workload-abc"` | 选中了某个非 namespaced 路径（如 workload） | `name = "pods-" + "workload-abc"` | `"pods-workload-abc"` |
+
+`SanitizeFileName` 会把 path 中的 `/` 替换为 `-`。
+
 ### 3.5 文件名格式常量
 
 位置：[table_helper.go](file:///d:/fz/0601-2/solo-dogfeeding/code/17-k9s/internal/ui/table_helper.go#L35-L39)
@@ -174,15 +202,25 @@ func computeFilename(dumpPath, ns, title, path string) (string, error) {
 | `FullFmat` | `%s-%s-%d.csv` | **所有表格快照**（包括集群范围资源） |
 | `NoNSFmat` | `%s-%d.csv` | 定义但未使用（死代码） |
 
-### 3.6 三种场景的实际命名
+最终文件名格式统一为：`{name}-{ns}-{timestamp}.csv`，其中 `{name}` 取决于 path 是否为空。
 
-| 场景 | 原始 ns | saveTable 转换后 | 文件名格式 | 示例 |
-|-----|---------|----------------|-----------|------|
-| 具体命名空间（如 default） | `"default"` | `"default"` | `{title}-{path}-{ns}-{timestamp}.csv` | `pods-nginx-default-1620000000000000000.csv` |
-| 所有命名空间视图 | `"all"` | `"all"` | `{title}-{path}-all-{timestamp}.csv` | `pods--all-1620000000000000000.csv` |
-| 集群范围资源（如 nodes） | `"-"` | `"all"` | `{title}-all-{timestamp}.csv` | `nodes-all-1620000000000000000.csv` |
+### 3.6 三种命名空间场景 × 两种 path 情况的实际命名
 
-**注意**：集群范围资源（如 nodes、namespaces）的快照文件名中也会包含 `-all-` 命名空间部分，这是代码转换的结果。
+共产生 **6 种组合**的文件名：
+
+| 场景 | 原始 ns | 转换后 ns | path 取值 | `name` | 最终文件名格式 | 示例 |
+|-----|---------|----------|----------|--------|--------------|------|
+| 具体命名空间 | `"default"` | `"default"` | `""`（空） | `"pods"` | `{title}-{ns}-{timestamp}.csv` | `pods-default-1620000000000000000.csv` |
+| 具体命名空间 | `"default"` | `"default"` | `"default/nginx-pod"` | `"pods-default-nginx-pod"` | `{name}-{ns}-{timestamp}.csv` | `pods-default-nginx-pod-default-1620000000000000000.csv` |
+| all 命名空间视图 | `"all"` | `"all"` | `""`（空） | `"pods"` | `{title}-all-{timestamp}.csv` | `pods-all-1620000000000000000.csv` |
+| all 命名空间视图 | `"all"` | `"all"` | `"default/nginx-pod"` | `"pods-default-nginx-pod"` | `{name}-all-{timestamp}.csv` | `pods-default-nginx-pod-all-1620000000000000000.csv` |
+| 集群范围资源 | `"-"` | `"all"` | `""`（空） | `"nodes"` | `{title}-all-{timestamp}.csv` | `nodes-all-1620000000000000000.csv` |
+| 集群范围资源 | `"-"` | `"all"` | `"node-1"` | `"nodes-node-1"` | `{name}-all-{timestamp}.csv` | `nodes-node-1-all-1620000000000000000.csv` |
+
+**关键说明**：
+- **all 命名空间 + path 为空**：文件名格式为 `{title}-all-{timestamp}.csv`，注意**没有双横杠**，因为 `path == ""` 时 `name = title`，不会拼接多余的 `-`
+- **all 命名空间 + path 非空**：path 会被清洗后拼接到 title 后，再追加 `-all-{timestamp}.csv`
+- **集群范围资源**：ns 被转换为 `"all"`，所以文件名中也会包含 `-all-`
 
 ### 3.7 时间戳
 
@@ -200,17 +238,20 @@ func SanitizeFileName(name string) string {
 }
 ```
 
-将 `:` 和 `/` 替换为 `-`，确保文件名合法。
+将 `:` 和 `/` 替换为 `-`，确保文件名合法。这也会影响资源 path 的拼接结果。
 
 ### 3.9 不同类型的文件命名总结
 
-| 视图类型 | 命名模式 | 示例 |
-|---------|---------|------|
-| 表格（所有场景） | `{title}-{path}-{ns}-{timestamp}.csv` | `pods-nginx-default-1620000000000000000.csv` |
-| 表格（all 命名空间） | `{title}-{path}-all-{timestamp}.csv` | `pods--all-1620000000000000000.csv` |
-| 表格（集群范围资源） | `{title}-all-{timestamp}.csv` | `nodes-all-1620000000000000000.csv` |
-| 日志 | `{fqn}-{timestamp}.log` | `default-nginx-7f-1620000000000000000.log` |
-| YAML 详情 | `{name}--{timestamp}.yaml` | `pod-nginx--1620000000.yaml` |
+| 类型 | 说明 | 命名模式 | 示例 |
+|-----|------|---------|------|
+| 表格（具体命名空间，path 空） | 列表视图、选中 default ns | `{title}-{ns}-{timestamp}.csv` | `pods-default-1620000000000000000.csv` |
+| 表格（具体命名空间，path 非空） | 选中某资源后保存 | `{title}-{sanitized_path}-{ns}-{timestamp}.csv` | `pods-default-nginx-pod-default-1620000000000000000.csv` |
+| 表格（all 命名空间，path 空） | 列表视图、选中 all ns | `{title}-all-{timestamp}.csv` | `pods-all-1620000000000000000.csv` |
+| 表格（all 命名空间，path 非空） | all ns 下选中某资源 | `{title}-{sanitized_path}-all-{timestamp}.csv` | `pods-default-nginx-pod-all-1620000000000000000.csv` |
+| 表格（集群范围资源，path 空） | nodes 列表视图 | `{title}-all-{timestamp}.csv` | `nodes-all-1620000000000000000.csv` |
+| 表格（集群范围资源，path 非空） | 选中某 node 后保存 | `{title}-{sanitized_path}-all-{timestamp}.csv` | `nodes-node-1-all-1620000000000000000.csv` |
+| 日志 | 保存容器日志 | `{fqn}-{timestamp}.log` | `default-nginx-7f-1620000000000000000.log` |
+| YAML 详情 | 保存资源 YAML | `{name}--{timestamp}.yaml` | `pod-nginx--1620000000.yaml` |
 
 ---
 
@@ -387,18 +428,28 @@ func (*ScreenDump) List(ctx context.Context, _ string) ([]runtime.Object, error)
 table.go: saveCmd()
     ↓
 table_helper.go: saveTable(dir, title, path, mdata)
+    ├─ title = GVR().R()  (如 "pods", "nodes")
+    ├─ path = t.Path       (来自 KeyPath，空或资源 FQN)
     ├─ ns = mdata.GetNamespace()
-    ├─ if IsClusterWide(ns) { ns = "all" }   ← 关键转换
+    └─ if IsClusterWide(ns) { ns = "all" }   ← 关键转换
     ↓
 table_helper.go: computeFilename(dumpPath, ns, title, path)
-    ├─ 构建 name = title + "-" + SanitizeFileName(path)
-    ├─ ns 只能是具体命名空间或 "all"（永远不会是 "-"）
-    └─ 始终使用 FullFmat: name + "-" + ns + "-" + timestamp + ".csv"
+    ├─ 步骤A: 构建 name
+    │   ├─ path == "" → name = title
+    │   └─ path != "" → name = title + "-" + SanitizeFileName(path)
+    ├─ 步骤B: ns 只能是具体命名空间或 "all"（永远不会是 "-"）
+    └─ 步骤C: 始终使用 FullFmat: name + "-" + ns + "-" + timestamp + ".csv"
     ↓
-创建 CSV 文件，写入数据
+strings.ToLower(完整路径) → 最终文件路径全部小写
+    ↓
+创建 CSV 文件（权限 0600），写入数据
     ↓
 Flash 提示保存成功
 ```
+
+**路径为空 vs 非空的关键差异**：
+- path 为空（顶层列表保存）：`{title}-{ns}-{ts}.csv`（无多余横杠）
+- path 非空（选中资源后保存）：`{title}-{sanitized_path}-{ns}-{ts}.csv`
 
 ### 6.2 读取链路
 
