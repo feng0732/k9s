@@ -1,5 +1,9 @@
 # K9s 应用退出资源释放分析（对照代码事实）
 
+> 本文所有代码位置采用仓库相对路径表示，格式：`相对路径:行号范围`（例如 `internal/view/app.go:L185-L193`），可在任意本地克隆或 GitHub/GitLab Web 界面中定位。
+
+---
+
 ## 一、应用退出代码路径总览
 
 ### 1.1 正常退出路径（Ctrl+C）
@@ -7,17 +11,17 @@
 ```
 tcell.KeyCtrlC 键盘事件
   ↓
-quitCmd() [app.go#L698-L712]
+quitCmd()  internal/view/app.go:L698-L712
   ↓
-BailOut(0) [app.go#L533-L547]
-  ├─ nukeK9sShell() [exec.go#L381-L405]     删除 k9s-shell pod（500ms 超时）
-  ├─ stopImgScanner() [app.go#L146-L150]    vul.ImgScanner.Stop()
-  ├─ factory.Terminate() [factory.go#L60-L72]
+BailOut(0)  internal/view/app.go:L533-L547
+  ├─ nukeK9sShell()       internal/view/exec.go:L381-L405   删除 k9s-shell pod（500ms 超时）
+  ├─ stopImgScanner()     internal/view/app.go:L146-L150    vul.ImgScanner.Stop()
+  ├─ factory.Terminate()  internal/watch/factory.go:L60-L72
   │   ├─ close(f.stopChan)                    通知所有 informer 停止
   │   ├─ delete(f.factories, k)               从 map 移除引用（无等待）
-  │   └─ forwarders.DeleteAll() [forwarders.go#L85-L92]
+  │   └─ forwarders.DeleteAll()  internal/watch/forwarders.go:L85-L92
   │       └─ 遍历 f.Stop() → close(pf.stopChan)
-  └─ ui.App.BailOut(exitCode) [ui/app.go#L155-L162]
+  └─ ui.App.BailOut(exitCode)  internal/ui/app.go:L155-L162
       ├─ Config.Save()
       ├─ Application.Stop() → tcell.Screen.Fini() 恢复终端
       └─ os.Exit(exitCode)
@@ -26,15 +30,15 @@ BailOut(0) [app.go#L533-L547]
 ### 1.2 连接丢失退出路径
 
 ```
-clusterUpdater() [app.go#L364-L395] 每 15s 轮询
+clusterUpdater()  internal/view/app.go:L364-L395   每 15s 轮询
   ↓
-refreshCluster() [app.go#L397-L446]
+refreshCluster()  internal/view/app.go:L397-L446
   ↓
 conRetry >= MaxConnRetry
   ↓
 ExitStatus = "Lost K8s connection..."
   ↓
-BailOut(1)  （同上清理流程）
+BailOut(1)   （同上清理流程）
 ```
 
 ### 1.3 SIGHUP 信号退出（无清理）
@@ -42,7 +46,7 @@ BailOut(1)  （同上清理流程）
 ```
 syscall.SIGHUP
   ↓
-initSignals() goroutine [app.go#L185-L193]
+initSignals() goroutine  internal/view/app.go:L185-L193
   ↓
 os.Exit(0)   ⚠️  完全跳过所有清理
 ```
@@ -51,16 +55,16 @@ os.Exit(0)   ⚠️  完全跳过所有清理
 
 以下位置直接调用 `os.Exit()`，完全跳过清理流程：
 
-| 位置 | 触发条件 |
-|------|----------|
-| [app.go#L278](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L278) | toggleHeader flex view 类型断言失败 |
-| [app.go#L294](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L294) | toggleCrumbs flex view 类型断言失败 |
-| [root.go#L72](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/cmd/root.go#L72) | cobra rootCmd.Execute() 返回错误 |
-| [ui/table_helper.go#L46](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/table_helper.go#L46) | 屏幕转储目录创建失败 |
-| [render/context.go#L93](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/render/context.go#L93) | 上下文 YAML 加载失败 |
-| [config/helpers.go#L65](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/config/helpers.go#L65) | 配置数据目录创建失败 |
-| [client/helpers.go#L95](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/client/helpers.go#L95) | kubeconfig 加载失败 |
-| [main.go#L27-L40](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/main.go#L27-L40) | klog flag 设置失败（panic） |
+| 代码位置 | 触发条件 |
+|----------|----------|
+| `internal/view/app.go:L278` | toggleHeader flex view 类型断言失败 |
+| `internal/view/app.go:L294` | toggleCrumbs flex view 类型断言失败 |
+| `cmd/root.go:L72` | cobra rootCmd.Execute() 返回错误 |
+| `internal/ui/table_helper.go:L46` | 屏幕转储目录创建失败 |
+| `internal/render/context.go:L93` | 上下文 YAML 加载失败 |
+| `internal/config/helpers.go:L65` | 配置数据目录创建失败 |
+| `internal/client/helpers.go:L95` | kubeconfig 加载失败 |
+| `main.go:L27-L40` | klog flag 设置失败（panic） |
 
 ---
 
@@ -68,7 +72,7 @@ os.Exit(0)   ⚠️  完全跳过所有清理
 
 ### 2.1 应用级信号注册
 
-[app.go#L185-L193](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L185-L193)
+`internal/view/app.go:L185-L193`
 
 ```go
 func (*App) initSignals() {
@@ -89,7 +93,7 @@ func (*App) initSignals() {
 
 ### 2.2 Ctrl+C 键盘事件处理
 
-键盘事件绑定 [app.go#L254-L266](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L254-L266)：
+键盘事件绑定 `internal/view/app.go:L254-L266`：
 
 ```go
 func (a *App) bindKeys() {
@@ -100,7 +104,7 @@ func (a *App) bindKeys() {
 }
 ```
 
-quitCmd 实现 [app.go#L698-L712](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L698-L712)：
+quitCmd 实现 `internal/view/app.go:L698-L712`：
 
 ```go
 func (a *App) quitCmd(evt *tcell.EventKey) *tcell.EventKey {
@@ -122,7 +126,7 @@ func (a *App) quitCmd(evt *tcell.EventKey) *tcell.EventKey {
 
 在执行外部命令期间（kubectl exec/edit 等），会临时接管信号：
 
-[exec.go#L184-L197](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/exec.go#L184-L197)
+`internal/view/exec.go:L184-L197`
 
 ```go
 sigChan := make(chan os.Signal, 1)
@@ -151,7 +155,7 @@ go func(cancel context.CancelFunc) {
 
 ### 3.1 BailOut 主清理流程
 
-[app.go#L533-L547](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L533-L547)
+`internal/view/app.go:L533-L547`
 
 ```go
 func (a *App) BailOut(exitCode int) {
@@ -171,11 +175,11 @@ func (a *App) BailOut(exitCode int) {
 }
 ```
 
-**注意顺序**：先清理 k8s 资源（pod/端口转发），再恢复终端退出。任何一步 panic 都被外层 recover 捕获，但不会阻止后续步骤继续执行完——因为每一步是顺序调用，panic 只影响当前 goroutine，后续步骤不会执行。实际上 `defer recover` 在 BailOut 函数返回时才执行，如果 `nukeK9sShell` panic，后面三行不会被执行。
+**注意顺序**：先清理 k8s 资源（pod/端口转发），再恢复终端退出。外层 `defer recover` 在 BailOut 函数返回时才执行，如果 `nukeK9sShell` panic，后面三行不会被执行。
 
 ### 3.2 Halt / Resume 事件循环控制
 
-[app.go#L333-L362](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L333-L362)
+`internal/view/app.go:L333-L362`
 
 ```go
 func (a *App) Halt() {
@@ -208,7 +212,7 @@ func (a *App) Resume() {
 
 ### 3.3 clusterUpdater 协程退出方式
 
-[app.go#L364-L395](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L364-L395)
+`internal/view/app.go:L364-L395`
 
 ```go
 func (a *App) clusterUpdater(ctx context.Context) {
@@ -244,7 +248,7 @@ func (a *App) clusterUpdater(ctx context.Context) {
 
 #### 4.1.1 Factory 结构与 stopChan
 
-[factory.go#L28-L35](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/factory.go#L28-L35)
+`internal/watch/factory.go:L28-L35`
 
 ```go
 type Factory struct {
@@ -258,7 +262,7 @@ type Factory struct {
 
 #### 4.1.2 Terminate 实际行为（与 WaitForCacheSync 无关）
 
-[factory.go#L60-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/factory.go#L60-L72)
+`internal/watch/factory.go:L60-L72`
 
 ```go
 func (f *Factory) Terminate() {
@@ -285,7 +289,7 @@ func (f *Factory) Terminate() {
 
 `WaitForCacheSync` **不是终止时用的**，它是**启动时**用的：
 
-公有方法 [factory.go#L162-L173](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/factory.go#L162-L173)：
+公有方法 `internal/watch/factory.go:L162-L173`：
 ```go
 func (f *Factory) WaitForCacheSync() {
     for ns, fac := range f.factories {
@@ -298,7 +302,7 @@ func (f *Factory) WaitForCacheSync() {
 }
 ```
 
-私有方法 `waitForCacheSync(ns)` [factory.go#L140-L159](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/factory.go#L140-L159)：
+私有方法 `waitForCacheSync(ns)` `internal/watch/factory.go:L140-L159`：
 ```go
 func (f *Factory) waitForCacheSync(ns string) {
     // ...
@@ -312,6 +316,7 @@ func (f *Factory) waitForCacheSync(ns string) {
 ```
 
 **区分要点**：
+
 | 方法 | 用途 | 传入 channel | 何时被调用 |
 |------|------|-------------|-----------|
 | `Terminate()` | 终止所有 informer | 关闭 `f.stopChan` | 应用退出时 |
@@ -322,7 +327,7 @@ func (f *Factory) waitForCacheSync(ns string) {
 
 #### 4.1.4 Informer 启动方式
 
-[factory.go#L46-L57](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/factory.go#L46-L57) 和 [factory.go#L250-L270](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/factory.go#L250-L270)
+`internal/watch/factory.go:L46-L57` 和 `internal/watch/factory.go:L250-L270`
 
 ```go
 func (f *Factory) Start(ns string) {
@@ -345,7 +350,7 @@ func (f *Factory) ForResource(ns string, gvr *client.GVR) (informers.GenericInfo
 
 #### 4.2.1 PortForwarder Stop
 
-[dao/port_forwarder.go#L102-L108](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/dao/port_forwarder.go#L102-L108)
+`internal/dao/port_forwarder.go:L102-L108`
 
 ```go
 func (p *PortForwarder) Stop() {
@@ -361,7 +366,7 @@ func (p *PortForwarder) Stop() {
 
 #### 4.2.2 批量释放 DeleteAll
 
-[watch/forwarders.go#L85-L92](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/watch/forwarders.go#L85-L92)
+`internal/watch/forwarders.go:L85-L92`
 
 ```go
 func (ff Forwarders) DeleteAll() {
@@ -382,7 +387,7 @@ func (ff Forwarders) DeleteAll() {
 
 #### 4.3.1 tview Application.Stop()
 
-[ui/app.go#L155-L162](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/app.go#L155-L162)
+`internal/ui/app.go:L155-L162`
 
 ```go
 func (a *App) BailOut(exitCode int) {
@@ -403,7 +408,7 @@ func (a *App) BailOut(exitCode int) {
 
 #### 4.3.2 Exec 期间的 Suspend/Resume
 
-[exec.go#L99-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/exec.go#L99-L122)
+`internal/view/exec.go:L99-L122`
 
 ```go
 func run(a *App, opts *shellOpts) (ok bool, errC chan error, outC chan string) {
@@ -426,7 +431,7 @@ Suspend 工作流程（tview/tcell 库内部）：
 
 ### 4.4 K9s Shell Pod 清理
 
-[exec.go#L381-L405](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/exec.go#L381-L405)
+`internal/view/exec.go:L381-L405`
 
 ```go
 func nukeK9sShell(a *App) error {
@@ -466,7 +471,7 @@ func nukeK9sShell(a *App) error {
 
 ### 5.1 WorkerPool —— 唯一有 Drain/Wait 的地方
 
-[internal/pool.go](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/pool.go)
+`internal/pool.go`
 
 ```go
 type WorkerPool struct {
@@ -497,7 +502,7 @@ func (p *WorkerPool) Drain() []error {
 
 以 Browser 组件为例：
 
-[browser.go#L164-L200](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/browser.go#L164-L200)
+`internal/view/browser.go:L164-L200`
 
 ```go
 func (b *Browser) Start() {
@@ -523,7 +528,7 @@ func (b *Browser) Stop() {
 }
 ```
 
-Table model Watch 启动协程 [model/table.go#L121-L128](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/model/table.go#L121-L128)：
+Table model Watch 启动协程 `internal/model/table.go:L121-L128`：
 
 ```go
 func (t *Table) Watch(ctx context.Context) error {
@@ -535,7 +540,7 @@ func (t *Table) Watch(ctx context.Context) error {
 }
 ```
 
-Table model updater [model/table.go#L203-L221](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/model/table.go#L203-L221)：
+Table model updater `internal/model/table.go:L203-L221`：
 
 ```go
 func (t *Table) updater(ctx context.Context) {
@@ -560,7 +565,7 @@ func (t *Table) updater(ctx context.Context) {
 
 ### 5.3 文件 Watcher 的退出
 
-以 CustomViewsWatcher 为例 [ui/config.go#L63-L99](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/config.go#L63-L99)：
+以 CustomViewsWatcher 为例 `internal/ui/config.go:L63-L99`：
 
 ```go
 func (c *Configurator) CustomViewsWatcher(ctx context.Context, s synchronizer) error {
@@ -594,7 +599,7 @@ func (c *Configurator) CustomViewsWatcher(ctx context.Context, s synchronizer) e
 
 ### 5.4 PageStack 页面切换时的 Stop
 
-[page_stack.go#L44-L47](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/page_stack.go#L44-L47)
+`internal/view/page_stack.go:L44-L47`
 
 ```go
 func (p *PageStack) StackPopped(o, top model.Component) {
@@ -609,23 +614,23 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 
 | 协程 | 启动位置 | 停止触发 | 有 WaitGroup？ |
 |------|----------|----------|---------------|
-| clusterUpdater | [app.go#L346](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L346) | Halt cancel ctx | ❌ |
-| SIGHUP handler | [app.go#L189](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L189) | os.Exit | ❌ |
-| flash.Watch | [app.go#L168](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L168) | ctx.Done() | ❌ |
-| clusterModel.Refresh | [app.go#L121](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L121) | 自行退出 | ❌ |
-| vul.ImgScanner.Init | [app.go#L163](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L163) | stopImgScanner() | ❌ |
-| command.Reset | [app.go#L435](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/app.go#L435) | 自行退出 | ❌ |
-| Table.updater | [model/table.go#L125](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/model/table.go#L125) | component Stop cancel ctx | ❌ |
-| Log.updateLogs | [model/log.go#L239](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/model/log.go#L239) | Log.Stop() cancel ctx | ❌ |
-| Tree.updater | [model/tree.go#L88](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/model/tree.go#L88) | component Stop cancel ctx | ❌ |
-| ConfigWatcher goroutine | [ui/config.go#L197](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/config.go#L197) | Halt cancel ctx | ❌ |
-| SkinsDirWatcher goroutine | [ui/config.go#L163](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/config.go#L163) | Halt cancel ctx | ❌ |
-| CustomViewsWatcher goroutine | [ui/config.go#L69](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/config.go#L69) | Halt cancel ctx | ❌ |
-| CustomJumpsWatcher goroutine | [ui/config.go#L115](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/ui/config.go#L115) | Halt cancel ctx | ❌ |
-| Exec 信号监听 goroutine | [exec.go#L187](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/exec.go#L187) | exec ctx cancel | ❌ |
-| Exec 后台命令 goroutine | [exec.go#L557](file:///d:/fz/0601-2/solo-dogfeeding/code/20-k9s/internal/view/exec.go#L557) | 自行退出 | ❌ |
-| client-go informer goroutines | factory.Start / ForResource | close(f.stopChan) | ❌（由 client-go 内部管理） |
-| k8s port-forward goroutines | PortForwarder.Start | close(pf.stopChan) | ❌（由 k8s.io/client-go 内部管理） |
+| clusterUpdater | `internal/view/app.go:L346` | Halt cancel ctx | ❌ |
+| SIGHUP handler | `internal/view/app.go:L189` | os.Exit | ❌ |
+| flash.Watch | `internal/view/app.go:L168` | ctx.Done() | ❌ |
+| clusterModel.Refresh | `internal/view/app.go:L121` | 自行退出 | ❌ |
+| vul.ImgScanner.Init | `internal/view/app.go:L163` | stopImgScanner() | ❌ |
+| command.Reset | `internal/view/app.go:L435` | 自行退出 | ❌ |
+| Table.updater | `internal/model/table.go:L125` | component Stop cancel ctx | ❌ |
+| Log.updateLogs | `internal/model/log.go:L239` | Log.Stop() cancel ctx | ❌ |
+| Tree.updater | `internal/model/tree.go:L88` | component Stop cancel ctx | ❌ |
+| ConfigWatcher goroutine | `internal/ui/config.go:L197` | Halt cancel ctx | ❌ |
+| SkinsDirWatcher goroutine | `internal/ui/config.go:L163` | Halt cancel ctx | ❌ |
+| CustomViewsWatcher goroutine | `internal/ui/config.go:L69` | Halt cancel ctx | ❌ |
+| CustomJumpsWatcher goroutine | `internal/ui/config.go:L115` | Halt cancel ctx | ❌ |
+| Exec 信号监听 goroutine | `internal/view/exec.go:L187` | exec ctx cancel | ❌ |
+| Exec 后台命令 goroutine | `internal/view/exec.go:L557` | 自行退出 | ❌ |
+| client-go informer goroutines | internal/watch/factory.go Start / ForResource | close(f.stopChan) | ❌（由 client-go 内部管理） |
+| k8s port-forward goroutines | internal/dao/port_forwarder.go Start | close(pf.stopChan) | ❌（由 k8s.io/client-go 内部管理） |
 
 ---
 
@@ -682,26 +687,26 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 ```
 1. 用户按键 Ctrl+C
    └─ tcell 从 stdin 读取到 ^C，转换为 tcell.KeyCtrlC 事件
-      └─ tview Application 事件分发给 App.keyboard [app.go#L246-L252]
-         └─ [app.go#L264] KeyMap 匹配 → 调用 quitCmd
-            └─ [app.go#L698-L712] quitCmd
+      └─ tview Application 事件分发  internal/view/app.go:L246-L252
+         └─ internal/view/app.go:L264 KeyMap 匹配 → 调用 quitCmd
+            └─ internal/view/app.go:L698-L712 quitCmd
                └─ NoExitOnCtrlC=false 时 → a.BailOut(0)
-                  └─ [app.go#L533-L547] BailOut
-                     ├─ [exec.go#L381-L405] nukeK9sShell
+                  └─ internal/view/app.go:L533-L547 BailOut
+                     ├─ internal/view/exec.go:L381-L405 nukeK9sShell
                      │   └─ K8s API DELETE /api/v1/namespaces/<ns>/pods/k9s-shell-<pid>
                      │      timeout=500ms
-                     ├─ [app.go#L146-L150] stopImgScanner
+                     ├─ internal/view/app.go:L146-L150 stopImgScanner
                      │   └─ vul.ImgScanner.Stop()
-                     ├─ [factory.go#L60-L72] factory.Terminate
+                     ├─ internal/watch/factory.go:L60-L72 factory.Terminate
                      │   ├─ close(f.stopChan)
                      │   │   └─ client-go informer 内部所有 reflector 检测到 channel 关闭
                      │   │      停止 ListWatch，退出 goroutine
                      │   ├─ for k := range f.factories { delete }
-                     │   └─ [forwarders.go#L85-L92] forwarders.DeleteAll
+                     │   └─ internal/watch/forwarders.go:L85-L92 forwarders.DeleteAll
                      │       └─ for each: f.Stop() → close(pf.stopChan)
                      │          └─ k8s portforward 库检测到 stopChan 关闭
                      │             关闭 SPDY 连接，停止本地监听
-                     └─ [ui/app.go#L155-L162] ui.App.BailOut
+                     └─ internal/ui/app.go:L155-L162 ui.App.BailOut
                         ├─ Config.Save(true) 写 YAML 到磁盘
                         ├─ a.Stop() → tview.Application.Stop()
                         │   └─ tcell.Screen.Fini()
@@ -714,9 +719,9 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 ### 7.2 连接丢失退出链
 
 ```
-1. [app.go#L346] Resume() 中启动 go a.clusterUpdater(ctx)
-   └─ for 循环每 15s [app.go#L377-L394]
-      └─ [app.go#L397-L446] refreshCluster
+1. internal/view/app.go:L346 Resume() 中启动 go a.clusterUpdater(ctx)
+   └─ for 循环每 15s  internal/view/app.go:L377-L394
+      └─ internal/view/app.go:L397-L446 refreshCluster
          └─ a.Conn().CheckConnectivity() 失败
             └─ atomic.AddInt32(&a.conRetry, 1)
                └─ count >= MaxConnRetry 时
@@ -731,8 +736,8 @@ func (p *PageStack) StackPopped(o, top model.Component) {
 1. 终端关闭 / kill -HUP <pid>
    └─ 内核发送 SIGHUP 给进程
       └─ Go runtime 分发信号
-         └─ [app.go#L187] signal.Notify(sig, syscall.SIGHUP)
-            └─ goroutine [app.go#L189-L192] 从 sig channel 读出
+         └─ internal/view/app.go:L187 signal.Notify(sig, syscall.SIGHUP)
+            └─ goroutine internal/view/app.go:L189-L192 从 sig channel 读出
                └─ os.Exit(0)
                   ├─ ⚠️  不执行任何 defer（包括 cmd/root.go 中的 logFile.Close）
                   ├─ ⚠️  不恢复终端
