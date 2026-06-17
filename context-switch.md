@@ -1033,13 +1033,14 @@ Table.Start()
      ├── Config.Save(true)           （保存旧配置快照）
      │
      ├── dao.Context.Switch("prod")
-     │   └── APIClient.SwitchContext("prod")  [APIClient.mx 内部保护]
-     │       ├── Config.SwitchContext()        [Config.mx.Lock]
-     │       ├── reset()                        [APIClient.mx 各 setter]
-     │       ├── ResetMetrics()                 (全局单例指针替换，原子)
-     │       ├── CheckConnectivity()            [APIClient.mx getter/setter]
-     │       ├── DynDial()                      [APIClient.mx.Lock]
-     │       └── invalidateCache()
+     │   └── APIClient.SwitchContext("prod")  [⚠️ 非全部有锁]
+     │       ├── Config.SwitchContext()        [❌ 无 Config.mx — 裸替换 flags 指针]
+     │       ├── reset()                        [部分有锁：6 个 setter 走 APIClient.mx.Lock；cache/nsClient 直接替换]
+     │       ├── ResetMetrics()                 [❌ 全局变量 MetricsDial = nil，无任何锁]
+     │       ├── a.config = NewConfig(...)      [❌ 无 APIClient.mx — 裸替换 config 指针]
+     │       ├── CheckConnectivity()            [client/connOK 经 mx；connOK L320 裸写不一致]
+     │       ├── DynDial()                      [getDClient(RLock) → 创建 → setDClient(Lock)]
+     │       └── invalidateCache()              [getCachedClient(RLock)]
      │
      ├── App.switchContext(ci, force=true)
      │   │
@@ -1125,62 +1126,71 @@ if a.command.alias != nil {
 │       ├── app.Content.Top().Stop()           // 停止当前视图
 │       ├── dao.Context.Switch("prod")
 │       │   └── APIClient.SwitchContext("prod")
-│       │       ├── Config.SwitchContext("prod")   // 新建 ConfigFlags
-│       │       ├── APIClient.reset()              // 清空所有客户端+缓存
-│       │       ├── ResetMetrics()                 // 重置全局 Metrics 单例
-│       │       ├── NewConfig(flags)               // 用新 flags 重建 Config
-│       │       ├── CheckConnectivity()            // 连通性检查 + 预热 Dial 客户端
-│       │       ├── DynDial()                      // 预热 Dynamic 客户端
-│       │       └── invalidateCache()              // Discovery 缓存失效
+│       │       ├── Config.SwitchContext("prod")   // ❌ 无 Config.mx，裸替换 flags 指针
+│       │       ├── APIClient.reset()              // 部分锁：6 setter 经 APIClient.mx；cache/nsClient ❌ 直接替换
+│       │       ├── ResetMetrics()                 // ❌ 全局变量 MetricsDial = nil，无锁
+│       │       ├── a.config = NewConfig(flags)    // ❌ 无 APIClient.mx，裸替换 config 指针
+│       │       ├── CheckConnectivity()            // client/connOK ✅ mx；connOK L320 裸写不一致；cache ❌
+│       │       ├── DynDial()                      // getDClient(RLock) → 新建 → setDClient(Lock) ✅
+│       │       └── invalidateCache()              // getCachedClient(RLock) ✅；磁盘 Invalidate 内部锁
 │       │
 │       └── App.switchContext(ci, force=true)
 │           ├── Halt()                             // 取消 context → 停止后台 goroutine
-│           ├── Config.Reset()                     // 清空活跃上下文名
+│           ├── Config.Reset()                     // K9s.mx 各 setter ✅
 │           ├── Config.ActivateContext("prod")
 │           │   ├── K9s.ActivateContext("prod")
 │           │   │   ├── ks.GetContext("prod")       // 获取 kubeconfig 上下文
 │           │   │   ├── dir.Load("prod", ct)        // 加载/生成 k9s 上下文配置
-│           │   │   ├── 设置 Proxy（如有）
+│           │   │   ├── 设置 Proxy（如有）            // Config.proxy 直接赋值 ❌
 │           │   │   └── 设置 Active Namespace
 │           │   │       ├── kubeconfig ctx.namespace → 优先
 │           │   │       └── "default" → 兜底
-│           │   └── 验证命名空间合法性
+│           │   └── 验证命名空间合法性（IsValidNamespace → cache）
 │           ├── Config.Save(true)                  // 持久化配置
-│           ├── Factory.Terminate()                // 关闭旧 informer + stopChan
-│           ├── Factory.Start(ns)                  // 重建 informer
-│           ├── Command.Reset(aliasesPath, nuke=true) // 重置别名
+│           ├── Factory.Terminate()                // Factory.mx.Lock → close(stopChan) + clear map
+│           ├── Factory.Start(ns)                  // Factory.mx → 新建 stopChan
+│           ├── Command.Reset(aliasesPath, nuke=true) // Command.mx.Lock → Aliases.mx 各操作
 │           ├── ReloadStyles()                     // 重载皮肤
-│           ├── gotoResource(activeView)           // 导航到活跃视图
-│           ├── clusterModel.Reset(factory)         // 异步重置集群模型
-│           └── Resume()                           // 重启后台 goroutine
+│           ├── gotoResource(activeView)           // 导航到活跃视图（主 goroutine 串行）
+│           ├── go clusterModel.Reset(factory)     // 异步重置集群模型，与 Resume 后 clusterUpdater 重叠
+│           └── Resume()                           // 新建 ctx → 重启 clusterUpdater / ConfigWatcher 等
 │
 └── 刷新上下文列表视图
 ```
 
 ---
 
-## 九、缓存层次总结
+## 九、缓存层次总结（按真实锁保护方式）
 
-| 缓存层 | 位置 | 重建方式 | 生命周期 |
-|--------|------|----------|----------|
-| LRU Auth 缓存 | `APIClient.cache` | `reset()` 重建新实例 | 每次 SwitchContext |
-| Discovery 磁盘缓存 | `~/.kube/cache/discovery/<host>/` | `Invalidate()` 清除 | 每次 SwitchContext |
-| HTTP 缓存 | `~/.kube/cache/http/` | 随 Discovery 重建 | 每次 SwitchContext |
-| Metrics 缓存 | `MetricsServer.cache` | `ResetMetrics()` → nil | 每次 SwitchContext |
-| Informer 本地缓存 | `Factory.factories[ns]` | `Terminate()` 清空 map | 每次 SwitchContext |
-| K9s 上下文配置 | `K9s.activeConfig` | `Reset()` → `ActivateContext()` | 每次 SwitchContext |
-| 命令别名 | `Command.alias` | `Reset(nuke=true)` 清空重建 | 每次 SwitchContext |
+| 缓存层 | 位置 | 重建方式 | 真实锁保护方式 | 生命周期 |
+|--------|------|----------|----------------|----------|
+| LRU Auth 缓存 | `APIClient.cache` | `reset()` 中 `a.cache = New...` **直接替换指针** | ❌ **无 `APIClient.mx`**；指针替换靠原子性；内部 LRU map 操作由 `LRUExpireCache` 自带 mutex 保护 | 每次 SwitchContext |
+| Discovery 磁盘缓存 | `~/.kube/cache/discovery/<host>/` | `CachedDiscovery().Invalidate()` | ✅ 路径：`getCachedClient(RLock)` → `Invalidate()`（disk cache 自带内部互斥） | 每次 SwitchContext |
+| HTTP 缓存 | `~/.kube/cache/http/` | 随 Discovery 重建 | — | 每次 SwitchContext |
+| Metrics 缓存 | `MetricsServer.cache`（独立 LRU） | `ResetMetrics()` → 全局 `MetricsDial = nil` **直接替换** | ❌ **全局变量无任何锁**；`MetricsServer.cache` 内部 LRU map 操作靠自带 mutex | 每次 SwitchContext |
+| Informer 本地缓存 | `Factory.factories[ns]` | `Terminate()` → `close(stopChan)` + `delete(map, k)` | ✅ `Factory.mx.Lock` 全程保护 | 每次 SwitchContext |
+| K9s 上下文配置 | `K9s.activeConfig` | `Reset()` → `ActivateContext()` | ✅ `K9s.mx` getter/setter（`setActiveConfig`/`getActiveConfig`） | 每次 SwitchContext |
+| 命令别名 map | `Aliases.Alias`（在 `Command.alias.Aliases.Alias` 内） | `Reset(nuke=true)` → `Clear()` 删全部 + `Ensure()` 重建 | ✅ `Command.mx.Lock`（外层）→ `Aliases.mx`（内层 Get/Define/Clear） | 每次 SwitchContext |
 
 ---
 
-## 十、关键设计洞察
+## 十、关键设计洞察（按代码事实修正）
 
-1. **懒初始化**：`reset()` 只清空不重建，客户端在首次 `Dial()` 时按需创建。`SwitchContext` 主动预热了 `Dial`（通过 `CheckConnectivity`）和 `DynDial`，因为这两个是后续操作最常用的。
+1. **懒初始化 + 主动预热**：`reset()` 只清空不重建，客户端在首次 `Dial()` 时按需创建。`SwitchContext` 主动预热了 `Dial`（通过 `CheckConnectivity`）和 `DynDial`，因为这两个是后续操作最常用的。
 
-2. **ConfigFlags 重建而非修改**：`SwitchContext` 创建全新的 `genericclioptions.ConfigFlags` 实例，避免了修改共享状态可能引发的并发问题。`UsePersistentConfig=true` 启用了客户端传输层缓存。
+2. **ConfigFlags 重建而非修改，但** **❌ 完全无锁保护**：`Config.SwitchContext` 创建全新的 `genericclioptions.ConfigFlags` 实例（`NewConfigFlags(UsePersistentConfig=true)`），避免修改共享状态——但这不是锁的功劳，而是**时序保障**：`Halt()` 先停止所有后台 goroutine，之后才执行 `SwitchContext`。`Config.mx` 几乎是虚设的，仅在 `ConfigAccess()` 一处使用了读锁。`UsePersistentConfig=true` 启用了客户端传输层缓存（HTTP/Disk）。
 
-3. **Halt/Resume 模式**：通过 `context.WithCancel` 实现优雅的启停，而不是用锁阻塞。这确保切换期间不会有旧集群的请求或回调干扰新集群的状态。
+3. **Halt/Resume 模式是并发安全的基石**：通过 `context.WithCancel` 实现优雅的启停，而不是用锁阻塞。这确保切换期间不会有旧集群的请求或回调干扰新集群的状态。如果没有 Halt/Resume，多个无锁指针替换（config/flags/cache/MetricsDial）都会立即变成竞态。
 
-4. **ToggleContextSwitch 标志**：防止配置文件 watcher 在上下文切换中间状态触发 `Reload()`，导致配置被覆盖。
+4. **ToggleContextSwitch 标志**：防止配置文件 watcher 在上下文切换中间状态触发 `Reload()`，导致配置被覆盖。这是 `K9s.mx` 保护的布尔标志。
 
 5. **Discovery 缓存天然隔离**：不同集群的缓存路径基于 API Server 地址，但 `Invalidate()` 仍然必要——如果同一 API Server 有不同认证上下文，旧的缓存可能导致权限错误。
+
+6. **锁策略不一致是遗留问题**：
+   - `connOK`：`CheckConnectivity:L320` 裸写 vs `setConnOK()` 用 mx.Lock
+   - `ConnectionOK()` 裸读 vs `getConnOK()` 用 mx.RLock
+   - 6 个客户端字段都经 setter/getter 加锁，但 `cache` 和 `nsClient` 直接赋值
+   - `Config.mx` 声明了但几乎不用
+   这些不一致在当前时序下（Halt 保证切换时无并发）没有实际问题，但未来若引入并行初始化/切换场景，会是隐患。
+
+7. **`nsClient` 是死代码**：在 `reset()` 中被置 nil，整个代码库从未被读取。如果被清理，不会影响功能。
