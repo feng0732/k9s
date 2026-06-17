@@ -5,24 +5,24 @@
 Pulses 健康指示系统采用四层架构，从数据采集到界面展示的分层结构：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                  界面展示层 (View)                               │
-│  internal/view/pulse.go  Pulse 视图组件                        │
-│  ├─ Gauge 仪表盘：资源健康状态 (OK/Fault 计数)                 │
-│  └─ SparkLine 折线图：CPU/内存使用时间序列                      │
-├─────────────────────────────────────────────────────────────────┤
-│                  数据模型层 (Model)                              │
-│  internal/model/pulse.go        Pulse 模型 (Watch 分发)        │
-│  internal/model/pulse_health.go PulseHealth 健康检查器          │
-├─────────────────────────────────────────────────────────────────┤
-│                  健康检查层 (Render)                             │
-│  internal/render/*.go   各资源 Healthy() 方法                  │
-│  internal/health/check.go  Check 数据结构                      │
-├─────────────────────────────────────────────────────────────────┤
-│                  数据采集层 (DAO)                                │
-│  internal/dao/recorder.go  Recorder 指标采集器                 │
-│  internal/dao/factory.go   Factory 资源访问工厂                │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                  界面展示层 (View)                            │
+│  internal/view/pulse.go  Pulse 视图组件                     │
+│  ├─ Gauge 仪表盘：资源健康状态 (OK/Fault 计数)              │
+│  └─ SparkLine 折线图：CPU/内存使用时间序列                   │
+├──────────────────────────────────────────────────────────────┤
+│                  数据模型层 (Model)                           │
+│  internal/model/pulse.go        Pulse 模型 (Watch 分发)     │
+│  internal/model/pulse_health.go PulseHealth 健康检查器       │
+├──────────────────────────────────────────────────────────────┤
+│                  健康检查层 (Render)                          │
+│  internal/render/*.go   各资源 Healthy() 方法               │
+│  internal/health/check.go  Check 数据结构                   │
+├──────────────────────────────────────────────────────────────┤
+│                  数据采集层 (DAO)                             │
+│  internal/dao/recorder.go  Recorder 指标采集器              │
+│  internal/dao/factory.go   Factory 资源访问工厂             │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ---
