@@ -548,9 +548,15 @@ func (x *Xray) hydrate(parent *tview.TreeNode, n *xray.TreeNode) {
 
 ## 四、规模控制机制（无懒加载 / 无截断）
 
-### 重要结论：没有懒加载，没有截断
+### 重要结论：没有懒加载，没有截断，依赖 8 种机制控制规模
 
 **k9s Xray 视图不使用懒加载（lazy loading）或节点截断（truncation）。** 所有节点在每次刷新时都会**一次性完整构建**和**完整渲染**。
+
+**补充说明**：
+- ✅ **Diff 避免重绘机制实际上是有效的**（在无过滤条件下正常工作）
+- ❌ **模型层过滤几乎从不执行**（`SetFilter` 是空实现，`t.query` 永远为空）
+- ⚠️ **大树缩减完全在 UI 层进行**（每次过滤都要做 Flatten + Hydrate）
+- ⚠️ **没有增量更新**，每次刷新要么不重绘（Diff 相同），要么全量重建（Diff 不同）
 
 证据：
 1. `hydrate()` 是递归全量转换，没有分页或分批
@@ -622,7 +628,168 @@ func (t *TreeNode) Filter(q string, filter func(q, path string) bool) *TreeNode 
 
 **重建的树只包含匹配叶子的祖先链**，其他分支被剪掉，从而大幅减少显示的节点数。
 
-### 5. 差异更新（Diff 机制）
+### 4.1 两层过滤机制：模型层 + UI 层
+
+过滤机制实际上涉及**两层过滤**，但只有一层真正生效。
+
+#### 4.1.1 模型层的过滤（几乎从不执行）
+
+位置：[model/tree.go#L228-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go#L228-L234)
+
+```go
+root.Sort()
+if t.query != "" {              // 检查模型层是否有过滤条件
+    t.root = root.Filter(t.query, rxMatch)  // 保存过滤后的树
+}
+if t.root == nil || t.root.Diff(root) {  // ⚠️ 比较对象是关键
+    t.root = root              // 有差异就把 t.root 覆盖为全量树
+    t.fireTreeChanged(t.root)  // 传给 UI 的永远是全量树
+}
+```
+
+**关键问题**：
+
+1. **`SetFilter` 是空实现**：[view/xray.go#L60](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L60)
+   ```go
+   func (*Xray) SetFilter(string, bool) {}  // 空函数，什么都不做
+   ```
+
+2. **只有 `ClearFilter` 被调用**：[view/xray.go#L501](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L501)
+   - 仅在用户按 `esc` 清空命令模式时调用，把 `t.query` 设为 `""`
+   - 正常过滤场景下，`t.query` 永远是空字符串
+
+3. **即便 `t.query` 不为空，逻辑也有 bug**：
+   - 第 3 行：`t.root = root.Filter(...)` → 保存过滤后的树
+   - 第 4 行：`t.root.Diff(root)` → 用**过滤后的树**和**全量树**比较 → **永远不相等**
+   - 第 5 行：`t.root = root` → 过滤结果被全量树覆盖，白做了
+   - 第 6 行：传给 UI 的是全量树，过滤结果从未送达 UI
+
+#### 4.1.2 UI 层的过滤（真正生效的过滤）
+
+位置：[view/xray.go#L530-L546](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L530-L546) 和 [view/xray.go#L607-L611](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L607-L611)
+
+```go
+// TreeChanged 是模型层通知的入口
+func (x *Xray) TreeChanged(node *xray.TreeNode) {
+    x.Count = node.Count(x.gvr)
+    x.update(x.filter(node))  // 调用 UI 层的 filter
+    x.UpdateTitle()
+}
+
+// UI 层 filter 用 CmdBuff 文本进行过滤
+func (x *Xray) filter(root *xray.TreeNode) *xray.TreeNode {
+    q := x.CmdBuff().GetText()  // 从命令缓冲区取过滤文本
+    if x.CmdBuff().Empty() || internal.IsLabelSelector(q) {
+        return root
+    }
+    if f, ok := internal.IsFuzzySelector(q); ok {
+        return root.Filter(f, fuzzyFilter)    // /前缀
+    }
+    if internal.IsInverseSelector(q) {
+        return root.Filter(q, rxInverseFilter) // !前缀
+    }
+    return root.Filter(q, rxFilter)           // 默认正则
+}
+```
+
+**过滤条件来源**：用户在命令模式（按 `/` 进入）输入的文本，保存在 `CmdBuff` 中。
+
+#### 4.1.3 两层过滤的完整调用链
+
+```
+用户输入过滤文本（/nginx）
+    ↓
+CmdBuff 保存 "nginx"
+    ↓
+触发 Start() → refresh()
+    ↓
+模型层 reconcile()
+    ├─ 构建全量树 root
+    ├─ t.query = ""（因为 SetFilter 是空实现）
+    ├─ 跳过模型层过滤
+    ├─ t.root.Diff(root) → 比较两次全量树（正确）
+    └─ 有变化则 fireTreeChanged(root) → 传全量树
+        ↓
+UI 层 TreeChanged(node)
+    └─ x.filter(node) → 用 CmdBuff 文本过滤全量树
+        ├─ Flatten() → 展平所有叶子（1000+ 节点）
+        ├─ 逐个检查匹配（路径 + 状态）
+        └─ Hydrate() → 从匹配节点重建树（可能只剩 100 节点）
+            ↓
+update(filteredRoot) → 只渲染过滤后的树
+```
+
+### 4.2 Flatten + Hydrate 的工作原理
+
+**Filter 内部是「展平-过滤-重建」三步曲**：
+
+位置：[tree_node.go#L310-L323](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/tree_node.go#L310-L323)
+
+```go
+func (t *TreeNode) Filter(q string, filter func(q, path string) bool) *TreeNode {
+    specs := t.Flatten()                    // 1. 展平：递归收集所有叶子节点的 Spec
+    matches := make([]NodeSpec, 0, len(specs))
+    for _, s := range specs {
+        if filter(q, s.AsPath()+s.AsStatus()) {  // 2. 过滤：按路径+状态匹配
+            matches = append(matches, s)
+        }
+    }
+    if len(matches) == 0 {
+        return nil
+    }
+    return Hydrate(matches)                // 3. 重建：从匹配的 Spec 重建树
+}
+```
+
+**Flatten 实现** [tree_node.go#L219-L229](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/tree_node.go#L219-L229)：
+```go
+func (t *TreeNode) Flatten() []NodeSpec {
+    refs := make([]NodeSpec, 0, len(t.Children))
+    for _, c := range t.Children {
+        if c.IsLeaf() {
+            refs = append(refs, c.Spec())  // 叶子节点直接收集
+            continue
+        }
+        refs = append(refs, c.Flatten()...) // 非叶子递归
+    }
+    return refs
+}
+```
+
+**Hydrate 重建** [tree_node.go#L237-L259](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/tree_node.go#L237-L259)：
+```go
+func Hydrate(specs []NodeSpec) *TreeNode {
+    root := NewTreeNode(client.NoGVR, "")
+    nav := root
+    for _, spec := range specs {
+        for i := len(spec.Paths) - 1; i >= 0; i-- {  // 从根到叶子倒序遍历
+            if nav.Blank() {
+                nav.GVR, nav.ID, nav.Extras[StatusKey] = spec.GVRs[i], spec.Paths[i], spec.Statuses[i]
+                continue
+            }
+            c := NewTreeNode(spec.GVRs[i], spec.Paths[i])
+            c.Extras[StatusKey] = spec.Statuses[i]
+            if n := nav.Find(spec.GVRs[i], spec.Paths[i]); n == nil {
+                nav.Add(c)     // 节点不存在则新增
+                nav = c        // 下移到子节点
+            } else {
+                nav = n        // 节点已存在则复用
+            }
+        }
+        nav = root  // 重置到根，处理下一条 Spec
+    }
+    return root
+}
+```
+
+**大树缩减效果**：
+- 100 个 Pod × 3 个 Container × 2 个 ConfigMap = 600 个叶子节点
+- 过滤 "nginx" 后可能只剩 5 个 Pod 相关的 Spec（30 个节点）
+- 重建后的树只包含这些匹配 Pod 的祖先链，其他分支全部剪掉
+
+---
+
+### 5. 差异更新（Diff 机制）与刷新判断
 
 位置：[tree_node.go#L173-L191](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/tree_node.go#L173-L191)
 
@@ -643,15 +810,81 @@ func (t *TreeNode) Diff(d *TreeNode) bool {
 }
 ```
 
-调用位置 [model/tree.go#L231-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go#L231-L234)：
+#### 5.1 两种场景下的 Diff 行为
+
+**场景 1：无过滤条件（正常情况）**
+
+位置：[model/tree.go#L227-L234](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go#L227-L234)
+
 ```go
+root.Sort()
+if t.query != "" {  // t.query = ""，跳过
+    t.root = root.Filter(...)
+}
 if t.root == nil || t.root.Diff(root) {
+    // t.root 是上一次的全量树，root 是新的全量树
+    // 只有真正变化时才返回 true
     t.root = root
-    t.fireTreeChanged(t.root)  // 只有变化时才通知 UI
+    t.fireTreeChanged(t.root)
 }
 ```
 
-**作用**：树结构没变化时不触发 UI 重绘，减少渲染开销。
+✅ **Diff 机制有效**：只有当资源真正变化（Pod 增删、状态变化等）时才通知 UI，避免不必要的重绘。
+
+**场景 2：有过滤条件（理论上，实际不发生）**
+
+```go
+root.Sort()
+if t.query != "" {  // 假设 t.query = "nginx"
+    t.root = root.Filter(...)  // t.root 是过滤后的树（100 节点）
+}
+if t.root == nil || t.root.Diff(root) {
+    // ⚠️ t.root（100 节点）和 root（1000 节点）比较 → 永远不相等！
+    t.root = root              // 过滤结果被全量树覆盖
+    t.fireTreeChanged(t.root)  // 每次都通知 UI
+}
+```
+
+❌ **Diff 机制完全失效**：每次刷新都认为有变化，都会通知 UI 重绘。
+
+> **注意**：场景 2 在实际运行中几乎不会发生，因为 `Xray.SetFilter` 是空实现，`t.query` 永远为空。
+
+#### 5.2 Diff 比较的是什么？
+
+Diff 递归比较以下内容：
+1. 子节点数量 `CountChildren()`
+2. 节点 ID、GVR
+3. 节点 Extras（包括 status、info 等）
+4. 递归比较所有子节点
+
+**不比较的内容**：
+- 父节点指针（Parent）
+- 子节点的顺序（因为每次 Sort 后顺序一致）
+
+#### 5.3 有过滤条件时为什么还需要 UI 层二次过滤？
+
+因为模型层的过滤结果永远不会传给 UI，原因是：
+1. 模型层的 `SetFilter` 是空实现，过滤条件从未设置到模型层
+2. 即便设置了，过滤结果也会被 `t.root = root` 覆盖
+3. `fireTreeChanged` 永远传递全量树
+
+所以 UI 层必须自己再过滤一次，这是唯一真正生效的过滤。
+
+#### 5.4 对大树缩减和避免重绘的实际影响
+
+| 机制 | 无过滤条件时 | 有过滤条件时（实际运行） |
+|------|-------------|-------------------------|
+| **模型层 Diff 避免重绘** | ✅ 有效，仅真变化时通知 UI | ✅ 仍有效（因为 t.query 为空，比较两次全量树） |
+| **大树缩减时机** | ❌ 无缩减，传全量树到 UI | ⚠️ 仅在 UI 层过滤时缩减 |
+| **每次刷新的计算量** | 构建全量树 → Diff → （变化时）UI hydrate 全量树 | 构建全量树 → Diff → UI Flatten + Hydrate + hydrate |
+| **Flatten + Hydrate 开销** | ❌ 无（不调用 Filter） | ✅ 每次都要做（O(N) 复杂度） |
+| **UI hydrate 开销** | 全量树大小（100%） | 过滤后树大小（可能 10%~50%） |
+
+**关键结论**：
+- **Diff 避免重绘机制在实际运行中是有效的**，因为 `t.query` 永远为空，模型层比较的是两次全量树
+- **大树缩减完全在 UI 层进行**，每次刷新都要做完整的 Flatten + Hydrate
+- 过滤条件下的性能瓶颈是 `Filter()` 中的 Flatten 和 Hydrate，不是 UI 渲染
+- 没有增量更新，每次刷新要么不重绘（Diff 相同），要么全量重建（Diff 不同）
 
 ### 6. 并发渲染（性能优化）
 
@@ -787,14 +1020,26 @@ if status != "OK" {
    ↓
 5. root.Sort() 自然排序所有子节点
    ↓
-6. root.Diff(oldRoot) 比较树是否变化
-   ├─ 无变化 → 直接返回，不通知 UI
-   └─ 有变化 → t.root = root → fireTreeChanged()
+6. 模型层过滤与 Diff 比较（关键逻辑）
+   ├─ t.query 几乎总是 ""（因为 SetFilter 是空实现）
+   ├─ 跳过模型层过滤（if t.query != "" 不成立）
+   ├─ t.root.Diff(root) 比较两次全量树
+   │   ├─ 比较子节点数量
+   │   ├─ 比较节点 ID、GVR、Extras（status 等）
+   │   └─ 递归比较所有子节点
+   ├─ 无变化 → 直接返回，不通知 UI（节省重绘）
+   └─ 有变化 → t.root = root → fireTreeChanged(t.root) 【传全量树】
    ↓
-7. Xray.TreeChanged() 接收通知
+7. Xray.TreeChanged() 接收通知（模型传的是全量树）
    ├─ x.Count = node.Count(gvr) 更新计数
-   ├─ filter() 应用过滤条件（如有）
-   └─ update() 更新 UI
+   ├─ UI 层二次过滤（唯一真正生效的过滤）
+   │   ├─ 检查 CmdBuff 是否有过滤文本
+   │   ├─ 无过滤 → node 直接传入 update()
+   │   └─ 有过滤 → node.Filter(q, filterFunc)
+   │       ├─ Flatten() → 展平所有叶子节点（O(N)）
+   │       ├─ 逐个匹配过滤条件（路径+状态）
+   │       └─ Hydrate() → 从匹配节点重建过滤树
+   └─ update(filteredRoot) 更新 UI
       ├─ makeTreeNode() 创建 tview 根节点
       ├─ hydrate() 递归转换所有 xray.TreeNode → tview.TreeNode
       ├─ SetRoot(root) 挂到 UI 上
@@ -812,7 +1057,7 @@ if status != "OK" {
 
 | 文件 | 作用 |
 |------|------|
-| [internal/xray/tree_node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/tree_node.go) | 树节点核心数据结构、Spec/Hydrate/Filter/Diff |
+| [internal/xray/tree_node.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/tree_node.go) | 树节点核心数据结构、Spec/Hydrate/Filter/Diff/Flatten |
 | [internal/xray/pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/pod.go) | Pod 渲染器，含容器/Volume/SA 三条关系链 |
 | [internal/xray/dp.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/dp.go) | Deployment 渲染器，含 locatePods |
 | [internal/xray/svc.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/svc.go) | Service 渲染器 |
@@ -821,9 +1066,11 @@ if status != "OK" {
 | [internal/xray/sts.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/sts.go) | StatefulSet 渲染器 |
 | [internal/xray/ds.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/ds.go) | DaemonSet 渲染器 |
 | [internal/xray/rs.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/rs.go) | ReplicaSet 渲染器 |
-| [internal/model/tree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go) | 树模型、reconcile、Diff、并发渲染 |
+| [internal/xray/generic.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/xray/generic.go) | 通用资源渲染器 |
+| [internal/render/container.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/render/container.go) | ContainerRes 定义（类型系统问题根源） |
+| [internal/model/tree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go) | 树模型、reconcile、两层过滤、Diff、并发渲染 |
 | [internal/model/registry.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/registry.go) | 资源渲染器注册表 |
-| [internal/view/xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go) | Xray 视图 UI 逻辑、update/hydrate/选中状态 |
+| [internal/view/xray.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go) | Xray 视图 UI 逻辑、update/hydrate/选中状态/UI 层过滤 |
 | [internal/ui/tree.go](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/ui/tree.go) | 树 UI 组件基类、expandNodes、toggleCollapse |
 
 ---
