@@ -529,3 +529,451 @@ views:
 3. **nil 对象安全**：`hydrate(nil, ...)` 返回 `NAValue`，不 panic
 4. **Spec 解析失败**：`parseSpecs()` 直接返回错误，不部分生效（非降级容错）
 5. **列名引用不存在**：hydrate 返回 `NAValue` + slog.Warn，不中断渲染
+
+---
+
+## 十一、补充：无表达式列复用默认值时的属性设置细节
+
+### 11.1 问题的核心矛盾
+
+当用户在自定义列中写 `"STATUS"` （无 Spec，无表达式），[hydrate()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L155-L175) 的 `parser == nil` 分支**用默认表头的 HeaderColumn 覆盖了用户自定义的 HeaderColumn 属性**：
+
+```go
+// hydrate() L155-L175, parser == nil 分支
+if parser == nil {
+    ix, ok := rh.IndexOf(cc[idx].Header.Name, true)
+    if !ok {
+        cols[idx] = RenderedCol{
+            Header: cc[idx].Header,   // ← 用自定义的 Header（找不到默认列时）
+            Value:  NAValue,
+        }
+        continue
+    }
+    var v string
+    if ix >= len(row.Fields) {
+        v = NAValue
+    } else {
+        v = row.Fields[ix]
+    }
+    cols[idx] = RenderedCol{
+        Header: rh[ix],              // ← 关键：用默认表头的 Header 替换！
+        Value:  v,
+    }
+    continue
+}
+```
+
+**属性被替换，而非合并**：此处 `Header: rh[ix]` 直接用默认表头的 `HeaderColumn` 覆盖了 `cc[idx].Header`（用户自定义的属性）。这意味着用户在无 Spec 列上设置的 FLAGS（如 `|TR`、`|W`、`|H` 等）**在 hydrate 阶段被完全丢弃**。
+
+### 11.2 两阶段属性博弈
+
+属性不是完全丢失，而是经历了两阶段的"博弈"：
+
+| 阶段 | 位置 | 操作 | 属性来源 |
+|------|------|------|---------|
+| ① 表头合并 | [ColumnSpecs.Header()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L94-L110) | 自定义列属性与默认列属性 Merge | 自定义优先 + 默认兜底 |
+| ② 行数据填充 | [hydrate()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L155-L175) parser=nil | **Header 直接替换为 rh[ix]** | 默认列属性覆盖自定义 |
+
+**最终效果**：对无 Spec 列，hydrate 输出的 `RenderedCol.Header` 来自默认表头 `rh[ix]`，**而非**阶段 ① 合并后的结果。也就是说，阶段 ① 的 Merge 产出被阶段 ② 覆盖了。
+
+### 11.3 实际影响与具体示例
+
+以 Pod 视图为例，用户配置 `"RESTARTS|TR"`（加 Time 标志和右对齐）：
+
+```
+阶段① ColumnSpecs.Header() 合并结果:
+  RESTARTS → Attrs{Time:true, Align:Right, Wide:false}
+  (Time 来自用户 FLAGS "TR"；Align=Right 从默认 RESTARTS Merge 过来)
+
+阶段② hydrate() parser=nil:
+  rh.IndexOf("RESTARTS") → 找到默认 defaultPodHeader[6]
+  cols[idx] = RenderedCol{
+      Header: rh[6],    // → Attrs{Align:Right, Wide:false} ← Time=true 丢失！
+      Value:  row.Fields[6],
+  }
+
+最终 RenderedCol:
+  RESTARTS → Attrs{Align:Right, Wide:false}  ← Time 标志丢失
+```
+
+**结论**：对无 Spec 列，用户在 FLAGS 中设置的 `T`(Time)、`W`(Wide)、`S`(Show)、`H`(Hide) 等属性在 hydrate 阶段被默认表头属性覆盖。但 `N`(Number/Capacity) 和 `R`(Right Align) 如果恰好与默认属性一致则无明显差异。
+
+### 11.4 有 Spec 列的属性保留对比
+
+有 Spec 的列（如 `"RESTARTS:.status.restartCount|TR"`）走 `parser != nil` 分支：
+
+```go
+cols[idx] = RenderedCol{
+    Header: cc[idx].Header,   // ← 保留自定义的 Header，属性不丢失
+    Value:  strings.Join(values, ","),
+}
+```
+
+有 Spec 列**完整保留用户自定义属性**，因为 `Header` 直接取 `cc[idx].Header`。
+
+### 11.5 对比总结表
+
+| 列类型 | hydrate 中 Header 来源 | 用户 FLAGS 是否生效 |
+|--------|----------------------|-------------------|
+| 无 Spec + 默认头中找到 | `rh[ix]`（默认表头） | **否**，被默认属性覆盖 |
+| 无 Spec + 默认头中找不到 | `cc[idx].Header`（自定义） | 是 |
+| 有 Spec + Unstructured 对象 | `cc[idx].Header`（自定义） | 是 |
+| 有 Spec + 结构化对象 | `cc[idx].Header`（自定义） | 是 |
+
+---
+
+## 十二、补充：默认列回补的字段索引对应机制
+
+### 12.1 前提：row.Fields 的顺序保证
+
+[realize()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L112-L146) 接收的 `row` 参数由各渲染器的 `defaultRow()` 方法填充。**`row.Fields` 的索引严格对应 `defaultXxxHeader`（即参数 `rh`）的列序号**。
+
+以 [Pod.defaultRow()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/pod.go#L152-L211) 为例：
+
+```go
+row.Fields = model1.Fields{
+    ns,                    // [0]  → NAMESPACE
+    n,                     // [1]  → NAME
+    computeVulScore(...),  // [2]  → VS
+    "●",                   // [3]  → PF
+    ...,                   // [5]  → STATUS
+    ...,                   // [6]  → RESTARTS
+    ...,                   // [25] → AGE
+}
+```
+
+而 `rh`（defaultPodHeader）的列定义顺序与上述完全一致。
+
+### 12.2 阶段二回补的索引查找逻辑
+
+```go
+for _, hc := range rh {                              // 遍历默认表头每个 HeaderColumn
+    if vv.HasHeader(hc.Name) {                       // 是否已在 hydrate 结果中
+        continue
+    }
+    if idx, ok := rh.IndexOf(hc.Name, true); ok {    // 在默认头中查找列名→索引
+        rc := RenderedCol{
+            Header: hc,                              // 默认头自身（含完整属性）
+            Value:  row.Fields[idx],                  // 用同一个 idx 取 row.Fields
+        }
+        rc.Header.Wide = true                         // 强制标记 Wide
+        vv = append(vv, rc)
+    }
+}
+```
+
+**关键保证**：`rh.IndexOf(hc.Name, true)` 返回的 `idx` 与 `row.Fields` 数组索引**一一对应**，因为 `row.Fields` 本身就是按 `rh` 的顺序由 `defaultRow()` 生成的。
+
+### 12.3 Header.IndexOf() 的 Wide 参数影响
+
+[Header.IndexOf()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/model1/header.go#L244-L255)：
+
+```go
+func (h Header) IndexOf(colName string, includeWide bool) (int, bool) {
+    for i, c := range h {
+        if c.Wide && !includeWide {
+            continue       // Wide 列在 includeWide=false 时被跳过
+        }
+        if c.Name == colName {
+            return i, true
+        }
+    }
+    return -1, false
+}
+```
+
+在 realize() 和 hydrate() 中，所有 `IndexOf` 调用均传 `includeWide=true`，因此：
+- **不会因为 Wide 属性跳过任何列**
+- 默认头中标记 `Wide=true` 的列（如 Pod 的 `LAST RESTART`、`SERVICE-ACCOUNT`）同样可以通过列名找到正确的 `row.Fields` 索引
+
+### 12.4 字段索引越界保护
+
+在 hydrate() 的 parser=nil 分支中：
+
+```go
+var v string
+if ix >= len(row.Fields) {   // 索引越界保护
+    v = NAValue
+} else {
+    v = row.Fields[ix]
+}
+```
+
+**何时可能越界**：当 `rh`（默认表头）中的列数多于 `row.Fields` 实际长度时。理论上两者应一致，但防御性编码处理了：
+- 渲染器 defaultRow() 未填充全部字段的情况
+- CRD/自定义资源的 ServerSideTable 列定义与实际数据行不匹配的情况
+
+### 12.5 realize() 阶段二跳过条件 HasHeader() 的精确语义
+
+```go
+func (rr RenderedCols) HasHeader(n string) bool {
+    for _, r := range rr {
+        if r.has(n) {          // r.Header.Name == n
+            return true
+        }
+    }
+    return false
+}
+```
+
+**注意**：`HasHeader` 是按列名精确匹配，不区分列的属性差异。也就是说：
+
+- 如果用户自定义了 `"STATUS"` （无 Spec），hydrate 阶段产出的 `RenderedCol.Header.Name = "STATUS"`，**虽然 Header 属性来自默认表头，但 Name 匹配成功**，阶段二跳过该列
+- 如果用户自定义了 `"STATUS:.status.phase"`（有 Spec），hydrate 产出的 `RenderedCol.Header.Name = "STATUS"`，同样匹配，阶段二跳过
+- 只有默认头中的列在 hydrate 结果里**完全不存在**时，阶段二才会追加
+
+---
+
+## 十三、补充：JQ 解析失败降级 JSONPath 的边界情况
+
+### 13.1 三层降级机制全路径
+
+以 Unstructured 对象为例，有 Spec 列的完整求值路径：
+
+```
+cc[idx].Spec 非空
+    │
+    ├─ realize() 预处理: parser = jsonpath.New().Parse(cc[idx].Spec)
+    │     │
+    │     ├─ Parse 成功 && !isJQSpec → parser 正常，后续走 JSONPath
+    │     ├─ Parse 成功 && isJQSpec  → parser 正常但后续优先走 JQ
+    │     └─ Parse 失败 && !isJQSpec → slog.Warn，parser 仍非 nil，后续走 JSONPath (FindResults 会再失败)
+    │     └─ Parse 失败 && isJQSpec  → 不告警！parser 仍非 nil，后续优先走 JQ
+    │
+    └─ hydrate() 运行时:
+          │
+          ├─ Unstructured 对象? → 是
+          │     │
+          │     ├─ jqParse(cc[idx].Spec, unstructured.UnstructuredContent())
+          │     │     │
+          │     │     ├─ !isJQSpec(spec) → return "", false → 跳过 JQ
+          │     │     │     (非 JQ 格式，直接走 JSONPath)
+          │     │     │
+          │     │     ├─ gojq.Parse(exp) 失败 → slog.Warn, return "", false
+          │     │     │     → 降级走 JSONPath
+          │     │     │
+          │     │     ├─ gojq.Run() 迭代中遇 error → slog.Error, continue
+          │     │     │     → 非中断，继续迭代其余结果
+          │     │     │
+          │     │     ├─ 迭代完但 rr 为空 → return "", false
+          │     │     │     → 降级走 JSONPath
+          │     │     │
+          │     │     └─ 迭代有结果 → return strings.Join(rr,","), true
+          │     │           → JQ 成功，直接返回
+          │     │
+          │     └─ JQ 返回 false → 降级走 JSONPath
+          │           parser.FindResults(unstructured.UnstructuredContent())
+          │             │
+          │             ├─ FindResults 成功 → 正常处理结果
+          │             └─ FindResults 失败 → return nil, err → hydrate 整体报错返回
+          │
+          └─ 非 Unstructured → 直接走 JSONPath，无 JQ 尝试
+```
+
+### 13.2 边界情况 1：JQ 表达式含管道符但不是 JQ 语法
+
+`isJQSpec()` 的判定仅基于管道段数：`len(strings.Split(spec, "|")) > 2`。
+
+但这与 `parse()` 阶段的 `RelaxedJSONPathExpression` 包装存在交互：
+
+```
+用户输入: "IP:.status.addresses|W"
+    │
+    ▼ parse() 正则匹配
+mm[1]="IP", mm[2]=".status.addresses", mm[3]="W"
+    │
+    ▼ RelaxedJSONPathExpression(".status.addresses")
+spec = "{.status.addresses}"
+    │
+    ▼ isJQSpec("{.status.addresses}")
+Split("{.status.addresses}", "|") → 1 段 → 不是 JQ → 走 JSONPath ✓
+```
+
+此时管道符 `|W` 在正则阶段已被截断为 FLAGS，不进入 spec 字段，所以不影响 JQ 判定。
+
+### 13.3 边界情况 2：spec 内部含管道符的"伪 JQ"
+
+```
+用户输入: "INFO:.metadata.annotations|W"
+    │
+    ▼ parse() 正则匹配
+mm[1]="INFO", mm[2]=".metadata.annotations", mm[3]="W"
+    │
+    ▼ RelaxedJSONPathExpression(".metadata.annotations")
+spec = "{.metadata.annotations}"
+    │
+    ▼ isJQSpec("{.metadata.annotations}") → 1段 → 不是 JQ → 走 JSONPath
+```
+
+但如果 spec 部分本身含多个 `|`（这是合法的 JQ 语法）：
+
+```
+用户输入: "BAD_PODS:.status.containerStatuses[]|select(.ready==false)|name|W"
+    │
+    ▼ parse() 正则匹配
+正则 ^([\w\s%/-]+):?([\w\W]*?)\|?([NTWSLRH]{0,3})$
+  → mm[1]="BAD_PODS"
+  → mm[2]=".status.containerStatusees[]|select(.ready==false)|name"
+  → mm[3]="W"   ← 最后一个 | 后面被截为 FLAGS
+    │
+    ▼ RelaxedJSONPathExpression(mm[2])
+spec = "{.status.containerStatuses[]|select(.ready==false)|name}"
+    │
+    ▼ isJQSpec(spec) → Split by "|" → 3段 > 2 → 是 JQ!
+    │
+    ▼ realize() 预处理: parser.Parse(spec)
+  → JSONPath 解析此 spec 很可能失败
+  → isJQSpec=true → 不告警，parser 仍非 nil
+    │
+    ▼ hydrate() 运行时:
+  jqParse(spec, unstructuredContent)
+    exp = spec[1:len-1] = ".status.containerStatuses[]|select(.ready==false)|name"
+    gojq.Parse(exp) → 成功
+    gojq.Run(o) → 正确求值 → 返回 JQ 结果
+```
+
+**但如果用户只写了 1 个管道符**：
+
+```
+用户输入: "MY_COL:.spec.foo|bar"
+    │
+    ▼ parse() 正则匹配
+  → mm[1]="MY_COL", mm[2]=".spec.foo", mm[3]="bar"
+  → "bar" 不在 [NTWSLRH] 中 → newColFlags 打 Warn 但不报错
+  → spec = "{.spec.foo}"
+    │
+    ▼ isJQSpec("{.spec.foo}") → 1段 → 不是 JQ
+    │
+    ▼ 走 JSONPath 求值（而非 JQ）
+```
+
+这种情况下管道符被截断为 FLAGS 部分，spec 内部没有管道符，JQ 判定为 false。
+
+### 13.4 边界情况 3：JQ 运行时错误不中断
+
+[jqParse()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L271-L300) 中的迭代错误处理：
+
+```go
+iter := jq.Run(o)
+for v, ok := iter.Next(); ok; v, ok = iter.Next() {
+    if e, cool := v.(error); cool && e != nil {
+        if errors.Is(e, new(gojq.HaltError)) {
+            break               // HaltError → 停止迭代
+        }
+        slog.Error("JQ expression evaluation failed. Check your query", slogs.Error, e)
+        continue                // 其他错误 → 记录日志，继续迭代
+    }
+    rr = append(rr, fmt.Sprintf("%v", v))
+}
+```
+
+- **gojq.HaltError**：JQ 的 `halt`/`halt_error` 语句，直接 break
+- **其他运行时错误**（如类型不匹配、字段不存在）：slog.Error + continue，继续尝试后续迭代值
+- **结果为空**（`len(rr) == 0`）：返回 `("", false)` → 降级走 JSONPath
+
+**这意味着**：JQ 表达式部分结果报错、部分成功时，成功的部分仍然被收集。例如 `.items[] | select(.status == "running") | .name` 中某些 items 缺少 status 字段时，报错的 items 被跳过，其余正常返回。
+
+### 13.5 边界情况 4：JSONPath 预解析失败但 isJQSpec=true 时的静默降级
+
+```go
+// realize() L119-L128
+parsers[ix] = jsonpath.New(fmt.Sprintf("column%d", ix)).AllowMissingKeys(true)
+if err := parsers[ix].Parse(cc[ix].Spec); err != nil && !isJQSpec(cc[ix].Spec) {
+    slog.Warn("Unable to parse custom column", ...)
+}
+```
+
+当 `isJQSpec(spec) == true` 时，即使 JSONPath Parse 失败也**不告警**。此时期望运行时走 JQ 路径，但如果 JQ 也失败（`jqParse` 返回 false），则降级到 JSONPath 的 `FindResults`——此时 **parser 内部状态是 Parse 失败后的残留状态**。
+
+`jsonpath.JSONPath.FindResults()` 在未成功 Parse 的情况下被调用，会返回错误，导致 [hydrate()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L210-L212) **整体报错返回**：
+
+```go
+if err != nil {
+    return nil, err   // ← 整行渲染失败
+}
+```
+
+**这是唯一会导致 hydrate 整体报错的路径**：JQ 格式判定为 true → JSONPath Parse 静默失败 → JQ 运行时也失败 → 降级 JSONPath FindResults 报错 → hydrate 返回 error → 渲染中断。
+
+### 13.6 边界情况 5：JQ 空结果降级后 JSONPath 有结果
+
+```go
+// hydrate() Unstructured 分支
+if vals, ok := jqParse(cc[idx].Spec, unstructured.UnstructuredContent()); ok {
+    cols[idx] = RenderedCol{Header: cc[idx].Header, Value: vals}
+    continue                   // JQ 成功，直接返回
+}
+vals, err = parser.FindResults(unstructured.UnstructuredContent())  // JQ 失败，降级
+```
+
+**场景**：JQ 表达式语法合法但匹配结果为空（如 `select(.nonexistent == "foo")`），`jqParse` 返回 `("", false)`。此时降级到 JSONPath，而 JSONPath 可能因为不同的语义匹配到数据。
+
+**示例**：
+```
+spec = "{.items[] | .name}"
+JQ:  .items[] | .name  → 如果 .items 不存在 → 空结果 → return "", false
+JSONPath: {.items[] | .name} → 可能解析失败或返回不同结果
+```
+
+这种降级不是等价替换，两种语法的语义差异可能导致**结果不一致**。
+
+### 13.7 结构化对象不经过 JQ 路径
+
+[hydrate()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/cust_cols.go#L198-L209) 中，非 Unstructured 对象直接走 JSONPath 反射求值：
+
+```go
+} else {
+    rv := reflect.ValueOf(o)
+    if !rv.IsValid() || (rv.Kind() == reflect.Ptr && rv.IsNil()) {
+        cols[idx] = RenderedCol{Header: cc[idx].Header, Value: NAValue}
+        continue
+    }
+    vals, err = parser.FindResults(rv.Elem().Interface())
+}
+```
+
+**JQ 只对 Unstructured 对象生效**。对于 Pod、Deployment 等传 `DeepCopy()` 后的类型化对象，`o.(runtime.Unstructured)` 断言失败，直接走 JSONPath 反射。但由于 [Pod.Render()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/pod.go#L143) 传的是 `pwm.Raw.DeepCopy()`（`*unstructured.Unstructured`），实际仍走 JQ 路径。
+
+而 [Service.Render()](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/svc.go#L55) 传的是 `raw`（`*unstructured.Unstructured`），同样走 JQ 路径。
+
+**Table 渲染器**的 [realize() 调用](file:///d:/fz/0601-2/solo-dogfeeding/code/13-k9s/internal/render/table.go#L99-L103) 传入 `row.Object.Object`，类型为 `runtime.Object`，可能是 Unstructured 也可能不是：
+```go
+obj := row.Object.Object
+if obj != nil {
+    obj = obj.DeepCopyObject()
+}
+cols, err := t.specs.realize(obj, t.defaultHeader(), r)
+```
+
+当 `obj == nil` 时，hydrate 中会走 `o == nil` 分支，返回 `NAValue`。
+
+### 13.8 JQ 与 JSONPath 降级全景决策树
+
+```
+有 Spec 的列 (parser ≠ nil)
+    │
+    ├─ o == nil → NAValue
+    │
+    ├─ o 是 runtime.Unstructured?
+    │     │
+    │     ├─ jqParse(spec, UnstructuredContent())
+    │     │     │
+    │     │     ├─ isJQSpec=false → return "", false → 降级 JSONPath
+    │     │     │
+    │     │     ├─ gojq.Parse 失败 → Warn + return "", false → 降级 JSONPath
+    │     │     │
+    │     │     ├─ gojq.Run 有结果 → return (result, true) → 完成 ✓
+    │     │     │
+    │     │     └─ gojq.Run 无结果 → return "", false → 降级 JSONPath
+    │     │
+    │     └─ JQ 降级 → parser.FindResults(map)
+    │           │
+    │           ├─ 成功 → 处理结果（可能 MissingValue）
+    │           └─ 失败 → hydrate 返回 error ✗
+    │
+    └─ o 非 Unstructured → parser.FindResults(reflect)
+          │
+          ├─ rv 无效/nil → NAValue
+          ├─ 成功 → 处理结果
+          └─ 失败 → hydrate 返回 error ✗
+```
