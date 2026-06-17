@@ -555,8 +555,12 @@ func (x *Xray) hydrate(parent *tview.TreeNode, n *xray.TreeNode) {
 **补充说明**：
 - ✅ **Diff 避免重绘机制实际上是有效的**（在无过滤条件下正常工作）
 - ❌ **模型层过滤几乎从不执行**（`SetFilter` 是空实现，`t.query` 永远为空）
-- ⚠️ **大树缩减完全在 UI 层进行**（每次过滤都要做 Flatten + Hydrate）
+- ⚠️ **大树缩减完全在 UI 层进行**，但 **Flatten + Hydrate 过滤不是每次刷新都发生**：
+  - 用户确认过滤时发生 1 次（直接用现有树，不调 API）
+  - 周期刷新时只有树变化了才发生
+  - 树没变化时完全不触发过滤
 - ⚠️ **没有增量更新**，每次刷新要么不重绘（Diff 相同），要么全量重建（Diff 不同）
+- ✅ **用户输入过滤时效率最高**：直接复用现有树，不调 API，不重建全量树
 
 证据：
 1. `hydrate()` 是递归全量转换，没有分页或分批
@@ -694,30 +698,165 @@ func (x *Xray) filter(root *xray.TreeNode) *xray.TreeNode {
 
 **过滤条件来源**：用户在命令模式（按 `/` 进入）输入的文本，保存在 `CmdBuff` 中。
 
-#### 4.1.3 两层过滤的完整调用链
+#### 4.1.3 两条独立的过滤生效路径
 
+过滤有**两条独立的触发路径**，用户输入过滤和周期刷新走的是完全不同的代码。
+
+##### 路径 A：用户确认过滤文本 → 直接用现有树（不触发 reconcile）
+
+触发时机：用户按 `/` 进入命令模式，输入过滤文本，按 `Enter` 确认。
+
+位置：[view/xray.go#L627-L630](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L627-L630)
+
+```go
+// BufferCompleted 是 CmdBuff 确认输入后的回调
+func (x *Xray) BufferCompleted(_, _ string) {
+    x.update(x.filter(x.model.Peek()))  // ⚠️ 直接用现有树！
+}
 ```
-用户输入过滤文本（/nginx）
+
+**完整链路**：
+```
+用户按 / 进入命令模式
     ↓
-CmdBuff 保存 "nginx"
+输入过滤文本 "nginx"
     ↓
-触发 Start() → refresh()
+按 Enter 确认
     ↓
-模型层 reconcile()
+BufferCompleted(text, "") 被调用 【关键点】
+    ↓
+x.model.Peek() → 返回 t.root（现有全量树，不重新构建）
+    ↓
+x.filter(root) → 用 CmdBuff 文本过滤现有树
+    ├─ Flatten() → 展平所有叶子
+    ├─ 逐个匹配过滤条件
+    └─ Hydrate() → 重建过滤后的树
+    ↓
+x.update(filteredRoot) → 只渲染过滤后的树
+```
+
+**关键特性**：
+- ✅ **不触发 reconcile**，不重建全量树，不调用 API
+- ✅ 直接复用模型层已有的 `t.root`
+- ✅ 过滤开销只发生一次（确认时）
+
+##### 路径 B：周期刷新 → 视 Diff 结果决定是否过滤
+
+触发时机：`updater()` 定时器触发（默认每 2 秒）。
+
+位置：[model/tree.go#L165-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go#L165-L192)
+
+```go
+func (t *Tree) updater(ctx context.Context) {
+    rate := initTreeRefreshRate  // 首次 500ms
+    for {
+        select {
+        case <-ctx.Done():
+            t.root = nil
+            return
+        case <-time.After(rate):
+            rate = t.refreshRate  // 之后 2s
+            t.refresh(ctx)        // 触发刷新
+        }
+    }
+}
+```
+
+**完整链路**：
+```
+定时器到期（每 2s）
+    ↓
+t.refresh(ctx)
+    ├─ CAS inUpdate 锁（上一次还在跑就跳过）
+    └─ t.reconcile(ctx)
+        ├─ list() 调 API 获取资源列表
+        ├─ 构建全量树 root（并发渲染）
+        ├─ t.query = ""（跳过模型层过滤）
+        └─ t.root.Diff(root) 【关键判断】
+            ├─ 相同（树无变化）
+            │   ├─ 直接 return，不做任何事
+            │   └─ ❌ 不调用 fireTreeChanged
+            │       → ❌ 不触发 TreeChanged
+            │           → ❌ 不发生过滤
+            │               → ❌ 不更新 UI
+            └─ 不同（树有变化）
+                ├─ t.root = root  ← 保存新的全量树
+                └─ fireTreeChanged(t.root)
+                    ↓
+                Xray.TreeChanged(node) 被调用
+                    ├─ x.Count = node.Count(gvr)
+                    ├─ x.filter(node) → 用 CmdBuff 文本过滤
+                    │   ├─ CmdBuff 为空 → 直接返回全量树
+                    │   └─ CmdBuff 有值 → Flatten + 匹配 + Hydrate
+                    └─ x.update(filteredRoot)
+```
+
+##### 路径 C：用户清空过滤（按 esc）
+
+触发时机：用户在命令模式下按 `esc`。
+
+位置：[view/xray.go#L495-L505](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L495-L505)
+
+```go
+func (x *Xray) resetCmd(evt *tcell.EventKey) *tcell.EventKey {
+    if !x.CmdBuff().InCmdMode() {
+        x.CmdBuff().Reset()
+        return x.app.PrevCmd(evt)
+    }
+    x.CmdBuff().Reset()       // 清空过滤文本
+    x.model.ClearFilter()     // 清空模型层 query（实际没什么用）
+    x.Start()                 // ⚠️ 重新启动 Watch
+    return nil
+}
+```
+
+`Start()` 实现 [view/xray.go#L655-L663](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/view/xray.go#L655-L663)：
+```go
+func (x *Xray) Start() {
+    x.Stop()                   // 先停止旧的 goroutine
+    x.CmdBuff().AddListener(x) // 注册监听（BufferCompleted）
+    ctx := x.defaultContext()
+    ctx, x.cancelFn = context.WithCancel(ctx)
+    x.model.Watch(ctx)         // 立即触发一次 Refresh + 启动定时 updater
+    x.UpdateTitle()
+}
+```
+
+`Watch()` 实现 [model/tree.go#L86-L89](file:///d:/fz/0601-2/solo-dogfeeding/code/7-k9s/internal/model/tree.go#L86-L89)：
+```go
+func (t *Tree) Watch(ctx context.Context) {
+    t.Refresh(ctx)    // ⚠️ 立即调用一次，不等定时器
+    go t.updater(ctx) // 启动定时循环
+}
+```
+
+**清空过滤的链路**：
+```
+用户在命令模式按 esc
+    ↓
+CmdBuff.Reset() → 过滤文本变空
+    ↓
+Start() → Stop() + Watch()
+    ↓
+model.Refresh(ctx) → 立即 reconcile
     ├─ 构建全量树 root
-    ├─ t.query = ""（因为 SetFilter 是空实现）
-    ├─ 跳过模型层过滤
-    ├─ t.root.Diff(root) → 比较两次全量树（正确）
-    └─ 有变化则 fireTreeChanged(root) → 传全量树
+    ├─ t.root.Diff(root) → 几乎总是不同（因为 Stop 把 t.root 设为 nil）
+    └─ fireTreeChanged(t.root)
         ↓
-UI 层 TreeChanged(node)
-    └─ x.filter(node) → 用 CmdBuff 文本过滤全量树
-        ├─ Flatten() → 展平所有叶子（1000+ 节点）
-        ├─ 逐个检查匹配（路径 + 状态）
-        └─ Hydrate() → 从匹配节点重建树（可能只剩 100 节点）
-            ↓
-update(filteredRoot) → 只渲染过滤后的树
+TreeChanged(node)
+    ├─ x.filter(node) → CmdBuff 为空，直接返回全量树
+    └─ x.update(fullRoot) → 渲染全量树
 ```
+
+#### 4.1.4 过滤触发时机总览
+
+| 触发场景 | 入口函数 | 触发 reconcile？ | 是否过滤 | 过滤对象 |
+|---------|---------|-----------------|---------|---------|
+| 用户确认过滤文本（按 Enter） | `BufferCompleted()` | ❌ 否 | ✅ 1次 | **现有树** `model.Peek()` |
+| 周期刷新 + 树无变化 | `updater()` → `reconcile()` | ✅ 是 | ❌ 不过滤 | - |
+| 周期刷新 + 树有变化 | `updater()` → `reconcile()` | ✅ 是 | ✅ 1次 | **新的全量树** |
+| 用户清空过滤（按 esc） | `resetCmd()` → `Start()` → `Watch()` | ✅ 是 | ✅ 1次（结果是全量树） | **新的全量树** |
+| 用户在非命令模式按 esc | `resetCmd()` | ❌ 否 | ❌ 不过滤 | - |
 
 ### 4.2 Flatten + Hydrate 的工作原理
 
@@ -872,19 +1011,63 @@ Diff 递归比较以下内容：
 
 #### 5.4 对大树缩减和避免重绘的实际影响
 
+##### 校正：过滤开销不是每次刷新都发生
+
+之前说"每次刷新都要做完整的 Flatten + Hydrate"是不准确的。正确的行为是：
+
+| 场景 | 触发 reconcile？ | 过滤（Flatten+Hydrate）发生？ | 说明 |
+|------|-----------------|------------------------------|------|
+| 用户刚输入过滤（Enter） | ❌ 否 | ✅ **1次** | BufferCompleted 直接用现有树过滤 |
+| 下一次定时刷新，树没变 | ✅ 是 | ❌ **不发生** | Diff 相同，不 fireTreeChanged |
+| 再下一次定时刷新，树还没变 | ✅ 是 | ❌ **不发生** | Diff 相同，不 fireTreeChanged |
+| 树有变化了 | ✅ 是 | ✅ **1次** | Diff 不同，fireTreeChanged → 过滤 |
+| 树又没变化 | ✅ 是 | ❌ **不发生** | Diff 相同，不 fireTreeChanged |
+
+**关键理解**：
+1. `reconcile()` **每次都执行**（每 2s 一次），每次都重新构建全量树
+2. 但 `TreeChanged()` → `filter()` **只有 Diff 不同时才执行**
+3. 用户输入过滤时完全不经过 reconcile，直接用现有树
+
+##### 性能开销对比表
+
 | 机制 | 无过滤条件时 | 有过滤条件时（实际运行） |
 |------|-------------|-------------------------|
-| **模型层 Diff 避免重绘** | ✅ 有效，仅真变化时通知 UI | ✅ 仍有效（因为 t.query 为空，比较两次全量树） |
-| **大树缩减时机** | ❌ 无缩减，传全量树到 UI | ⚠️ 仅在 UI 层过滤时缩减 |
-| **每次刷新的计算量** | 构建全量树 → Diff → （变化时）UI hydrate 全量树 | 构建全量树 → Diff → UI Flatten + Hydrate + hydrate |
-| **Flatten + Hydrate 开销** | ❌ 无（不调用 Filter） | ✅ 每次都要做（O(N) 复杂度） |
-| **UI hydrate 开销** | 全量树大小（100%） | 过滤后树大小（可能 10%~50%） |
+| **模型层 Diff 避免重绘** | ✅ 有效，仅真变化时通知 UI | ✅ 仍有效（t.query 为空，比较两次全量树） |
+| **大树缩减时机** | ❌ 无缩减，传全量树到 UI | ⚠️ 仅在以下时机缩减：<br>1. 用户确认过滤时（1次）<br>2. 树有变化 + 周期刷新时 |
+| **每次定时刷新的计算量** | 构建全量树 → Diff → （变化时）UI hydrate 全量树 | 构建全量树 → Diff → （变化时）Flatten + Hydrate + UI hydrate |
+| **Flatten + Hydrate 频率** | ❌ 从不调用 | ⚠️ **仅用户确认时 + 树变化时**，不是每次刷新 |
+| **UI hydrate 开销** | 变化时：全量树（100%） | 变化时：过滤后树（10%~50%）<br>不变时：0 |
+
+##### 性能瓶颈分析
+
+**有过滤条件 + 树高频变化的集群**：
+```
+每 2s 循环：
+├─ list() API 调用（网络 I/O）
+├─ 构建全量树（并发渲染）
+├─ Diff() （通常不同，因为树在变）
+├─ fireTreeChanged → TreeChanged
+│   ├─ x.filter() → Flatten + Hydrate（O(N)）
+│   └─ x.update() → hydrate() 递归转换（O(M)，M 是过滤后大小）
+```
+瓶颈：**每次变化都要 Flatten + Hydrate**，N 大时开销大。
+
+**有过滤条件 + 树稳定的集群**：
+```
+每 2s 循环：
+├─ list() API 调用（网络 I/O）
+├─ 构建全量树（并发渲染）
+└─ Diff() 相同 → 直接 return，不做任何事
+```
+瓶颈：**只有 API 调用和全量树构建**，过滤开销为 0。
 
 **关键结论**：
-- **Diff 避免重绘机制在实际运行中是有效的**，因为 `t.query` 永远为空，模型层比较的是两次全量树
-- **大树缩减完全在 UI 层进行**，每次刷新都要做完整的 Flatten + Hydrate
-- 过滤条件下的性能瓶颈是 `Filter()` 中的 Flatten 和 Hydrate，不是 UI 渲染
-- 没有增量更新，每次刷新要么不重绘（Diff 相同），要么全量重建（Diff 不同）
+- ✅ **Diff 避免重绘机制在实际运行中是有效的**，因为 `t.query` 永远为空，模型层比较的是两次全量树
+- ✅ **大树缩减完全在 UI 层进行**，但 **Flatten + Hydrate 不是每次刷新都发生**
+- ✅ **过滤开销只在以下情况发生**：用户确认过滤时，或树有变化 + 周期刷新时
+- ⚠️ 树高频变化 + 过滤条件下的性能瓶颈是 `Filter()` 中的 Flatten + Hydrate
+- ❌ 没有增量更新，每次刷新要么不重绘（Diff 相同），要么全量重建（Diff 不同）
+- ✅ 用户输入过滤时最划算：直接复用现有树，不调 API，不重建全量树
 
 ### 6. 并发渲染（性能优化）
 
@@ -1027,10 +1210,14 @@ if status != "OK" {
    │   ├─ 比较子节点数量
    │   ├─ 比较节点 ID、GVR、Extras（status 等）
    │   └─ 递归比较所有子节点
-   ├─ 无变化 → 直接返回，不通知 UI（节省重绘）
+   ├─ 【关键】无变化 → 直接 return：
+   │   ├─ ❌ 不调用 fireTreeChanged
+   │   ├─ ❌ 不调用 TreeChanged
+   │   ├─ ❌ 不执行过滤
+   │   └─ ❌ 不更新 UI（全部跳过！）
    └─ 有变化 → t.root = root → fireTreeChanged(t.root) 【传全量树】
    ↓
-7. Xray.TreeChanged() 接收通知（模型传的是全量树）
+7. Xray.TreeChanged() 接收通知（仅 Diff 不同时才到这里）
    ├─ x.Count = node.Count(gvr) 更新计数
    ├─ UI 层二次过滤（唯一真正生效的过滤）
    │   ├─ 检查 CmdBuff 是否有过滤文本
@@ -1049,6 +1236,28 @@ if status != "OK" {
          └─ 找到 selectedItem 匹配的节点 → SetExpanded(true) + SetCurrentNode
    ↓
 8. 定时循环：等待 refreshRate → 回到步骤 4
+
+---
+
+### 用户确认过滤的独立路径（不触发 reconcile）
+
+**与周期刷新完全分开的代码路径**：
+
+```
+用户按 / 进入命令模式 → 输入 "nginx" → 按 Enter
+    ↓
+BufferCompleted(text, "") 被调用 【view/xray.go#L628】
+    ↓
+x.model.Peek() → 返回 t.root（复用现有全量树！）
+    ↓
+x.filter(root) → 用 CmdBuff 文本过滤
+    ├─ Flatten() → 展平所有叶子
+    ├─ 逐个匹配 "nginx"
+    └─ Hydrate() → 重建过滤后的树
+    ↓
+x.update(filteredRoot) → 更新 UI
+    ↓
+【结束】不调 API，不重建全量树，不触发 reconcile
 ```
 
 ---
