@@ -1,6 +1,6 @@
 # K9s 容器文件 CP 传输路径代码分析
 
-依赖版本依据：[go.mod:41](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/go.mod#L41-L41) 声明 `k8s.io/kubectl v0.35.1`；本文 kubectl cp 的代码片段全部来自该版本。
+依赖版本依据：[go.mod:41](go.mod#L41-L41) 声明 `k8s.io/kubectl v0.35.1`；本文 kubectl cp 的代码片段全部来自该版本。
 
 ---
 
@@ -30,7 +30,7 @@ K9s 与 kubectl cp 之间的调用边界是 **进程边界**，边界数据是�
 
 ### 2.1 按键绑定
 
-[pod.go:109-115](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L109-L115) 将 `T` 键标记为危险操作并绑定 `transferCmd`：
+[pod.go:109-115](internal/view/pod.go#L109-L115) 将 `T` 键标记为危险操作并绑定 `transferCmd`：
 
 ```go
 ui.KeyT: ui.NewKeyActionWithOpts(
@@ -42,13 +42,13 @@ ui.KeyT: ui.NewKeyActionWithOpts(
     }),
 ```
 
-绑定入口由 [bindDangerousKeys](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L86-L124) 管理，仅在非只读模式下注册（[pod.go:126-134](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L126-L134)）。
+绑定入口由 [bindDangerousKeys](internal/view/pod.go#L86-L124) 管理，仅在非只读模式下注册（[pod.go:126-134](internal/view/pod.go#L126-L134)）。
 
 ### 2.2 transferCmd：对话框弹出 + ack 回调
 
-[transferCmd](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L286-L353) 是全部 CP 逻辑的入口。它做两件事：
+[transferCmd](internal/view/pod.go#L286-L353) 是全部 CP 逻辑的入口。它做两件事：
 
-**(1) 拉取 Pod 信息并准备对话框选项** ([pod.go:334-350](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L334-L350))
+**(1) 拉取 Pod 信息并准备对话框选项** ([pod.go:334-350](internal/view/pod.go#L334-L350))
 
 ```go
 pod, err := fetchPod(p.App().factory, path)
@@ -64,9 +64,9 @@ opts := dialog.TransferDialogOpts{
 dialog.ShowUploads(&d, p.App().Content.Pages, &opts)
 ```
 
-默认重试次数由常量 `defaultTxRetries = 999` 控制（[pod.go:41](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L41-L41)）。
+默认重试次数由常量 `defaultTxRetries = 999` 控制（[pod.go:41](internal/view/pod.go#L41-L41)）。
 
-**(2) ack 回调构造 kubectl cp 参数** ([pod.go:293-332](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L293-L332))
+**(2) ack 回调构造 kubectl cp 参数** ([pod.go:293-332](internal/view/pod.go#L293-L332))
 
 ```go
 ack := func(args dialog.TransferArgs) bool {
@@ -104,11 +104,11 @@ ack := func(args dialog.TransferArgs) bool {
 }
 ```
 
-注意 [pod.go:314](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L314-L314) 存在一个参数重复 bug：`--retries` 在 [pod.go:309](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L309-L309) 和 [pod.go:314](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L314-L314) 被追加了两次。
+注意 [pod.go:314](internal/view/pod.go#L314-L314) 存在一个参数重复 bug：`--retries` 在 [pod.go:309](internal/view/pod.go#L309-L309) 和 [pod.go:314](internal/view/pod.go#L314-L314) 被追加了两次。
 
 ### 2.3 对话框参数收集
 
-[ShowUploads](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/ui/dialog/transfer.go#L34-L123) 是纯 UI 层，负责收集用户输入：
+[ShowUploads](internal/ui/dialog/transfer.go#L34-L123) 是纯 UI 层，负责收集用户输入：
 
 | 字段 | 类型 | 默认值 | 对应 kubectl 参数 |
 |------|------|--------|-------------------|
@@ -119,7 +119,7 @@ ack := func(args dialog.TransferArgs) bool {
 | CO | string | 首个容器名 | `-c=<container>` |
 | Retries | int | 999 | `--retries` |
 
-**方向切换逻辑** ([transfer.go:55-65](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/ui/dialog/transfer.go#L55-L65))：
+**方向切换逻辑** ([transfer.go:55-65](internal/ui/dialog/transfer.go#L55-L65))：
 
 ```go
 f.AddCheckbox("Download:", args.Download, func(_ string, flag bool) {
@@ -132,7 +132,7 @@ f.AddCheckbox("Download:", args.Download, func(_ string, flag bool) {
 
 默认 `Download=true`，即从容器复制到本地。切换为上传时，From/To 自动互换。
 
-[TransferArgs](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/ui/dialog/transfer.go#L19-L23) 结构体：
+[TransferArgs](internal/ui/dialog/transfer.go#L19-L23) 结构体：
 
 ```go
 type TransferArgs struct {
@@ -144,7 +144,7 @@ type TransferArgs struct {
 
 ### 2.4 shellOpts：命令执行的内部结构
 
-[shellOpts](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L45-L51) 是 K9s 执行外部命令的统一选项载体：
+[shellOpts](internal/view/exec.go#L45-L51) 是 K9s 执行外部命令的统一选项载体：
 
 ```go
 type shellOpts struct {
@@ -162,7 +162,7 @@ CP 场景只用到 `background=true` 和 `args` 两个字段。
 
 ## 三、runK：参数注入 + 进程调度边界
 
-[runK](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L57-L97) 是 K9s 与外部 kubectl 进程之间的最后一道代码。它完成：
+[runK](internal/view/exec.go#L57-L97) 是 K9s 与外部 kubectl 进程之间的最后一道代码。它完成：
 
 ### 3.1 查找 kubectl 二进制
 
@@ -176,7 +176,7 @@ if err != nil {
 }
 ```
 
-### 3.2 注入集群认证参数 ([exec.go:65-81](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L65-L81))
+### 3.2 注入集群认证参数 ([exec.go:65-81](internal/view/exec.go#L65-L81))
 
 ```go
 args := []string{opts.args[0]}  // "cp"
@@ -217,7 +217,7 @@ kubectl cp \
 
 ### 3.3 run：后台/前台调度
 
-[run](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L99-L122) 根据 `opts.background` 决定执行模式：
+[run](internal/view/exec.go#L99-L122) 根据 `opts.background` 决定执行模式：
 
 ```go
 if opts.background {
@@ -234,7 +234,7 @@ CP 场景下 `background=true`，因此不会挂起 UI，命令在 goroutine 中
 
 ### 3.4 execute：构造 exec.Cmd
 
-[execute](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L172-L239) 创建 Go 的 `os/exec.Cmd`：
+[execute](internal/view/exec.go#L172-L239) 创建 Go 的 `os/exec.Cmd`：
 
 ```go
 cmds := make([]*exec.Cmd, 0, 1)
@@ -246,7 +246,7 @@ err := pipe(ctx, opts, statusChan, &o, &e, cmds...)
 
 ### 3.5 pipe：真正运行命令
 
-[pipe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L549-L615) 中单命令后台模式代码路径 ([exec.go:556-572](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L556-L572))：
+[pipe](internal/view/exec.go#L549-L615) 中单命令后台模式代码路径 ([exec.go:556-572](internal/view/exec.go#L556-L572))：
 
 ```go
 if opts.background {
@@ -603,7 +603,7 @@ K9s 没有实现传输进度条，只有"发起 → 等待 → 结束"三态：
 
 - **发起**：无特殊通知，对话框关闭即表示已提交
 - **等待**：用户完全看不到进度，UI 上无任何反馈
-- **结束**：成功走 [pod.go:329](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L329-L329) `Flash().Infof(...)`，失败走 [pod.go:327](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L327-L327) `cowCmd(err.Error())`
+- **结束**：成功走 [pod.go:329](internal/view/pod.go#L329-L329) `Flash().Infof(...)`，失败走 [pod.go:327](internal/view/pod.go#L327-L327) `cowCmd(err.Error())`
 
 ```go
 if err := runK(p.App(), &cliOpts); err != nil {
@@ -613,7 +613,7 @@ if err := runK(p.App(), &cliOpts); err != nil {
 }
 ```
 
-后台模式下，[pipe](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L556-L572) 会通过 `statusChan` 发送 stdout 行，但 K9s 的 [runK](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L88-L90) 只做了 debug 日志，没有推给用户 UI：
+后台模式下，[pipe](internal/view/exec.go#L556-L572) 会通过 `statusChan` 发送 stdout 行，但 K9s 的 [runK](internal/view/exec.go#L88-L90) 只做了 debug 日志，没有推给用户 UI：
 
 ```go
 for v := range stChan {
@@ -705,18 +705,18 @@ fmt.Printf("Resuming copy at %d bytes, retry %d/%d\n", t.bytesRead, t.retries, t
 
 | 文件 | 行号 | 功能 |
 |------|------|------|
-| [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L41-L42) | L41 | `defaultTxRetries = 999` |
-| [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L109-L115) | L109-L115 | T 键绑定 transferCmd |
-| [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L286-L353) | L286-L353 | transferCmd 主函数 |
-| [pod.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/pod.go#L293-L332) | L293-L332 | ack 回调：参数构造 + runK 调用 |
-| [transfer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/ui/dialog/transfer.go#L19-L23) | L19-L23 | TransferArgs 结构 |
-| [transfer.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/ui/dialog/transfer.go#L34-L123) | L34-L123 | ShowUploads 对话框 |
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L45-L51) | L45-L51 | shellOpts 结构 |
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L57-L97) | L57-L97 | runK：查找 kubectl + 注入认证 |
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L99-L122) | L99-L122 | run：后台/前台调度 |
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L172-L239) | L172-L239 | execute：构造 exec.Cmd |
-| [exec.go](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/internal/view/exec.go#L549-L615) | L549-L615 | pipe：执行命令 + 管道 |
-| [go.mod](file:///d:/fz/0601-2/solo-dogfeeding/code/15-k9s/go.mod#L41-L41) | L41 | k8s.io/kubectl v0.35.1 依赖声明 |
+| [pod.go](internal/view/pod.go#L41-L42) | L41 | `defaultTxRetries = 999` |
+| [pod.go](internal/view/pod.go#L109-L115) | L109-L115 | T 键绑定 transferCmd |
+| [pod.go](internal/view/pod.go#L286-L353) | L286-L353 | transferCmd 主函数 |
+| [pod.go](internal/view/pod.go#L293-L332) | L293-L332 | ack 回调：参数构造 + runK 调用 |
+| [transfer.go](internal/ui/dialog/transfer.go#L19-L23) | L19-L23 | TransferArgs 结构 |
+| [transfer.go](internal/ui/dialog/transfer.go#L34-L123) | L34-L123 | ShowUploads 对话框 |
+| [exec.go](internal/view/exec.go#L45-L51) | L45-L51 | shellOpts 结构 |
+| [exec.go](internal/view/exec.go#L57-L97) | L57-L97 | runK：查找 kubectl + 注入认证 |
+| [exec.go](internal/view/exec.go#L99-L122) | L99-L122 | run：后台/前台调度 |
+| [exec.go](internal/view/exec.go#L172-L239) | L172-L239 | execute：构造 exec.Cmd |
+| [exec.go](internal/view/exec.go#L549-L615) | L549-L615 | pipe：执行命令 + 管道 |
+| [go.mod](go.mod#L41-L41) | L41 | k8s.io/kubectl v0.35.1 依赖声明 |
 
 ### kubectl cp (v0.35.1)
 
