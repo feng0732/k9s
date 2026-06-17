@@ -153,89 +153,130 @@ K9s 中有两套完全独立的 shell 机制，不可混淆：
 
 普通 Pod shell 不读取 ShellPod，所以不存在此风险。以下分析**仅针对 NodeShell 功能**。
 
-#### 3.2.2 完整执行顺序与保护点
+#### 3.2.2 初始化顺序与完整执行路径
+
+##### 阶段零：配置就绪（视图创建之前）
 
 ```
-Node 视图被创建（用户切换到节点页面）
+App 启动
+  ↓ loadConfiguration()
+    config.Load()     → 全局配置文件加载 + Merge 零值破坏
+    Override()        → CLI 参数写入 manual* 字段
+    Refine()          → 上下文激活 + Validate 修复 + 命名空间确定
   ↓
-Browser.Init() → b.bindKeys() 执行
-  ↓
-【保护点 1 - 快捷键注册时】⭐  [node.go#L70-L77]
-    ct, _ := n.App().Config.K9s.ActiveContext()
-    if ct.FeatureGates.NodeShell && n.App().Config.K9s.ShellPod != nil {
-        aa.Add(ui.KeyS, ui.NewKeyAction("Shell", n.sshCmd, true))
-    }
-    → 逻辑：两个条件必须同时满足才注册快捷键
-    → ShellPod == nil 时：用户看不到 S 键，无法触发 NodeShell
-    → 这是最强的入口防护，阻止了 99.9% 的触发路径
+配置完全就绪：
+  - IsReadOnly()      → 可正确返回（三级判断：manual* > Context.ReadOnly > K9s.ReadOnly）
+  - ShellPod         → 可能为 nil（配置缺省字段时）或非 nil（自动生成配置时）
+  - FeatureGates.NodeShell → 可正确返回
+```
 
-用户选中一个 Node，按 S 键（仅在 ShellPod 非空时可触发）
+##### 阶段一：视图创建（切换到 Node 视图时）
+
+```
+用户切换到 Node 视图
+  ↓
+NewNode() [node.go#L28-L37] 被调用
+  ├─ NewBrowser(gvr)          ← 创建浏览器基类
+  ├─ n.AddBindKeysFn(n.bindKeys)  ← 注册绑定回调（注意：此时不执行，只是注册函数引用）
+  ├─ 设置 EnterFn、ContextFn
+  └─ 返回 Node 对象
+```
+
+关键点：`AddBindKeysFn` 只是把 `n.bindKeys` 这个函数引用存起来，**不立即执行**。真正的快捷键注册发生在 `Browser.Init()` 中。
+
+##### 阶段二：Browser.Init() —— 快捷键真正注册
+
+[browser.go#L86-L121](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/browser.go#L86-L121)
+
+```
+Browser.Init(ctx) 被调用
+  ├─ Table.Init()
+  ├─ 权限检查
+  ├─ b.SetReadOnly(b.app.Config.IsReadOnly())     ← 第 98 行：设置表格只读样式
+  ├─ b.SetNoIcon / SetFullGVR
+  ├─ b.bindKeys(b.Actions())                       ← 基础快捷键（浏览器通用键）
+  └─ for _, f := range b.bindKeysFn { f(b.Actions()) }  ← 第 103 行：执行所有注册的绑定函数
+       ↓
+       Node.bindKeys(aa) [node.go#L80-L88]
+         │
+         ├─ 【保护点 1A — 只读模式】⭐⭐⭐ [node.go#L81]
+         │    if !n.App().Config.IsReadOnly() {
+         │        n.bindDangerousKeys(aa)
+         │    }
+         │    → 只读模式下，整个 bindDangerousKeys 都不调用
+         │    → S 键、Cordon、Uncordon、Drain 全部不注册
+         │
+         └─ 注册安全键（YAML 查看等，始终可用）
+              ↓
+              非只读模式下才会进入 bindDangerousKeys：
+                 Node.bindDangerousKeys(aa) [node.go#L43-L78]
+                   ├─ 注册 Cordon / Uncordon / Drain 快捷键
+                   ├─ 获取 ActiveContext
+                   └─ 【保护点 1B — NodeShell FeatureGate + ShellPod】⭐ [node.go#L75]
+                        if ct.FeatureGates.NodeShell && n.App().Config.K9s.ShellPod != nil {
+                            aa.Add(ui.KeyS, ...)
+                        }
+                        → 两个条件必须同时满足才注册 S 快捷键
+                        → ShellPod 为 nil 时，即使非只读也看不到 S 键
+```
+
+**三个入口保护条件的 AND 关系**：
+
+```
+用户能看到 S 键 = !IsReadOnly() AND FeatureGates.NodeShell AND ShellPod != nil
+```
+
+三个条件缺一不可，层层递进。只读模式是最外层的闸门。
+
+##### 阶段三：用户按键触发执行
+
+```
+用户选中 Node，按 S 键（仅在上述三条件都满足时可触发）
   ↓
 Node.sshCmd() [node.go#L179-L191]
-  ↓ 无 nil 检查，但前面入口 1 已确保 ShellPod 非空
-launchNodeShell() [exec.go#L300-L324]
-  ├─ 第 301 行：nukeK9sShell(a) 清理旧 Pod
-  │     ↓
-  │   【保护点 2 - 清理旧 Pod】⭐  [exec.go#L381-L405]
-  │     ct, _ := a.Config.K9s.ActiveContext()
-  │     if !ct.FeatureGates.NodeShell || a.Config.K9s.ShellPod == nil {
-  │         return nil   // ShellPod 为 nil 时优雅返回，不做任何事
-  │     }
-  │     // 以下代码只有 ShellPod 非空时才会执行：
-  │     ns := a.Config.K9s.ShellPod.Namespace   [L390] ✅ 安全
-  │     dial.CoreV1().Pods(ns).Delete(...)       [L399] ✅ 安全
-  │
-  └─ 用户确认 dialog 后，在回调中异步执行：
+  ├─ 检查有选中项
+  └─ launchNodeShell(n, n.App(), node)
        ↓
-       launchShellPod() [exec.go#L407-L454]  ← ⚠️ 代码层面的漏洞区
-         第 409 行：spo  = a.Config.K9s.ShellPod      ❌ 无 nil 检查
-         第 410 行：spec = k9sShellPod(node, spo)     ❌ 直接传入可能 nil 的 spo
-         第 418 行：dial.Pods(spo.Namespace)          ❌ 若 spo=nil → .Namespace 访问 panic 💥
-         第 424 行：FQN(spo.Namespace, k9sShellPodName()) ❌ 同理
-           ↓
-           k9sShellPod() [exec.go#L460-L538]
-             第 467 行：cfg.Image                       ❌ 若 cfg=nil → panic 💥（先于 L418 触发，因为 L410 已调用）
-             第 476 行：cfg.Limits                      ❌ 若 cfg=nil → panic 💥
-             第 493 行：cfg.Command                     ❌ 若 cfg=nil → panic 💥
-             第 499 行：cfg.HostPathVolume              ❌ 若 cfg=nil → panic 💥
-             第 519 行：cfg.Namespace                   ❌ 若 cfg=nil → panic 💥
-             第 520 行：cfg.Labels                      ❌ 若 cfg=nil → panic 💥
-             第 527 行：cfg.ImagePullSecrets            ❌ 若 cfg=nil → panic 💥
-           ↓ Pod 创建成功
-           ↓ 启动异步 goroutine：
-       go launchPodShell() [exec.go#L326-L346]
-          ↓
-         【保护点 3 - exec 前】⭐  [exec.go#L327-L330]
-           if a.Config.K9s.ShellPod == nil {
-               slog.Error("Shell pod not configured!")
-               return   // nil 时优雅退出，不 panic
-           }
-           // 以下安全：
-           ns := a.Config.K9s.ShellPod.Namespace   [L342] ✅
-           sshIn(a, client.FQN(ns, k9sShellPodName()), k9sShell)
-             → sshIn() [exec.go#L348-L379]
-                 cfg := a.Config.K9s.ShellPod      [L349] ✅
-                 cfg.Command, cfg.Args             [L357-L359] ✅
-
-应用退出清理时
-  ↓
-App.BailOut() [app.go#L533-L547]
-  第 540 行：nukeK9sShell(a)
-    → 复用保护点 2，ShellPod nil 时安全 return ✅
+       launchNodeShell() [exec.go#L300-L324]
+         ├─ 【保护点 2 — 清理旧 Pod 前检查】⭐ [exec.go#L381-L405]
+         │    nukeK9sShell(a) 内部：
+         │    !ct.FeatureGates.NodeShell || a.Config.K9s.ShellPod == nil → return nil
+         │    → 双保险，防止配置在运行时被改变
+         │
+         └─ 弹出确认 dialog → 用户确认后异步执行
+              ↓
+              launchShellPod() [exec.go#L407-L454]  ← ⚠️ 代码漏洞区
+                第 409 行：spo = a.Config.K9s.ShellPod     ❌ 无 nil 检查
+                第 410 行：k9sShellPod(node, spo)          ❌ 直接传入可能 nil
+                第 418 行：dial.Pods(spo.Namespace)       ❌ 若 nil → panic
+                   ↓
+                   k9sShellPod() [exec.go#L460-L538]
+                     内部 8 处字段访问全部无 nil 检查
+                   ↓ Pod 创建成功
+              ↓ 异步 goroutine：
+              go launchPodShell() [exec.go#L326-L346]
+                ├─ 【保护点 3 — exec 前检查】⭐ [exec.go#L327-L330]
+                │    if a.Config.K9s.ShellPod == nil {
+                │        slog.Error("Shell pod not configured!")
+                │        return
+                │    }
+                │
+                └─ sshIn() → 执行 kubectl exec 进入 shell Pod
 ```
 
 #### 3.2.3 每一处 ShellPod 字段访问的 nil 检查清单
 
 | 代码位置 | 访问的字段 | 是否有前置 nil 检查 | 安全性 |
 |----------|-----------|-------------------|--------|
-| [node.go#L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L75) | `ShellPod != nil` 判断 | 自身即判断 | ✅ 防护点本身 |
-| [exec.go#L327](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L327) | `ShellPod != nil` 判断 | 自身即判断 | ✅ 防护点本身 |
-| [exec.go#L386](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L386) | `ShellPod != nil` 判断 | 自身即判断 | ✅ 防护点本身 |
+| [node.go#L81](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L81) | 间接影响（只读闸门） | IsReadOnly() 判断 | ✅ 保护点 1A：最外层闸门 |
+| [node.go#L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L75) | `ShellPod != nil` 判断 | 自身即判断 | ✅ 保护点 1B：快捷键注册条件 |
+| [exec.go#L327](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L327) | `ShellPod != nil` 判断 | 自身即判断 | ✅ 保护点 3：exec 前检查 |
+| [exec.go#L386](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L386) | `ShellPod != nil` 判断 | 自身即判断 | ✅ 保护点 2：清理旧 Pod 前检查 |
 | [exec.go#L342](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L342) | `.Namespace` | 是（L327 保护点 3） | ✅ 安全 |
-| [exec.go#L349](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L349) | 整体赋值 + `.Command`/`.Args` | 是（L327 保护点 3） | ✅ 安全 |
+| [exec.go#L349](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L349) | 整体 + `.Command`/`.Args` | 是（L327 保护点 3） | ✅ 安全 |
 | [exec.go#L390](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L390) | `.Namespace` | 是（L386 保护点 2） | ✅ 安全 |
 | [exec.go#L399](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L399) | `.Namespace`（通过 L390 变量） | 是（L386 保护点 2） | ✅ 安全 |
-| [exec.go#L409](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L409) | 整体赋值给 `spo` | ❌ 无检查 | ⚠️ 漏洞点 |
+| [exec.go#L409](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L409) | 整体赋值给 `spo` | ❌ 无检查 | ⚠️ 漏洞点（位于保护点 1B 和 2 之后） |
 | [exec.go#L410](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L410) | 传入 `k9sShellPod`，内部访问 `.Image` 等 | ❌ 无检查 | 💥 理论 panic 点 |
 | [exec.go#L418](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L418) | `spo.Namespace` | ❌ 无检查 | 💥 理论 panic 点（实际先被 L410 触发） |
 | [exec.go#L424](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L424) | `spo.Namespace` | ❌ 无检查 | 💥 理论 panic 点 |
@@ -243,22 +284,41 @@ App.BailOut() [app.go#L533-L547]
 
 #### 3.2.4 真实风险评估
 
-**风险等级：极低（代码层面有隐患，运行时几乎不可触发）**
+**风险等级：极低（代码层面有隐患，入口处有四层防御，运行时几乎不可触发）**
 
-触发 panic 需要同时突破三道防线：
-1. ❌ ShellPod 必须不为 nil 才能注册 S 快捷键（保护点 1）
-2. 用户看到 S 键 → 按 S → 进入 dialog 确认
-3. 在确认 dialog 后到 `launchShellPod` 执行前的时间窗口内，ShellPod 必须被**某个运行时机制**从非 nil 变成 nil
+触发理论上的 nil panic 需要同时突破所有入口保护：
+
+| 层级 | 保护条件 | 位置 | 说明 |
+|------|---------|------|------|
+| 第 1 层（最外） | `!IsReadOnly()` | [node.go#L81](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L81) | 只读模式下整个 `bindDangerousKeys` 都不执行，S 键完全不存在 |
+| 第 2 层 | `FeatureGates.NodeShell` | [node.go#L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L75) | FeatureGate 关闭时不注册 S 键 |
+| 第 3 层 | `ShellPod != nil` | [node.go#L75](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/node.go#L75) | 配置中无 ShellPod 时不注册 S 键 |
+| 第 4 层 | `nukeK9sShell` 内再检查 | [exec.go#L386](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L386) | 执行前再确认一次，防止运行时变化 |
+
+**触发 panic 的必要条件**（所有条件必须同时满足）：
+
+1. 非只读模式（`IsReadOnly() == false`）
+2. FeatureGates.NodeShell 已开启
+3. 快捷键注册时 ShellPod 非空（否则 S 键不会出现）
+4. 用户能看到并按下 S 键
+5. 从快捷键注册后到 `launchShellPod` 执行前的时间窗口内，ShellPod 被**某个运行时机制**从非空变成 nil
 
 目前代码中**没有任何运行时修改 ShellPod 的机制**：
-- 没有配置热更新功能修改 ShellPod
-- 没有用户操作可以动态置空 ShellPod
-- 没有定时任务/回调修改它
+- 无配置热更新功能
+- 无用户操作能动态置空 ShellPod
+- 无定时任务/回调修改 ShellPod
 
 **为什么目前在生产中几乎不会遇到**：
-1. 启动时 ShellPod = nil → S 键根本不注册 → 用户按不出来
-2. 启动时 ShellPod ≠ nil → 一直保持非 nil → 无任何问题
-3. 即使是自动生成的全局配置文件，也会包含完整的 shellPod 字段（自动生成时走默认值写入，不走 Merge）
+1. 只读模式：S 键根本不注册（大多数生产环境用只读模式）
+2. 非只读 + ShellPod = nil：S 键也不注册
+3. 非只读 + ShellPod ≠ nil：一直保持非 nil，全程安全
+4. 自动生成的全局配置文件包含完整的 shellPod 字段（NewConfig 默认值 → Save()，不走 Merge 破坏）
+
+**只读模式对风险的额外消除**：
+只读模式是一个非常强的安全闸门。在企业生产环境中，K9s 通常以 `--readonly` 模式部署，此时：
+- 所有危险操作（cordon、drain、shell、edit、delete 等）的快捷键都不注册
+- NodeShell 作为"危险操作"之一，在只读模式下从入口处就被完全屏蔽
+- 用户界面上根本看不到 S 键选项，无法触发
 
 #### 3.2.5 配置自动生成的特殊情况
 
@@ -527,12 +587,16 @@ run()
 
 ### 设计隐患
 
-1. **ShellPod 代码层面的 nil 防护缺失**：[launchShellPod()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L407-L454) 和 [k9sShellPod()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L460-L538) 内部共 8 处字段访问完全没有 nil 防御性检查。虽然入口处的快捷键绑定（NodeShell && ShellPod!=nil 三重 AND 判断）阻止了几乎所有实际触发路径，但如果未来新增其他调用点（如命令、脚本绑定、热更新）、或配置在 S 键注册后被动态置空，会出现 nil panic。当前风险等级极低是靠调用方纪律，不是代码自身的健壮性。
+1. **ShellPod 代码层面的 nil 防护缺失**：[launchShellPod()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L407-L454) 和 [k9sShellPod()](file:///d:/fz/0601-2/solo-dogfeeding/code/19-k9s/internal/view/exec.go#L460-L538) 内部共 8 处字段访问完全没有 nil 防御性检查。虽然入口处有四层保护（只读闸门、FeatureGate、ShellPod!=nil、执行前二次检查）阻止了几乎所有实际触发路径，但如果未来新增其他调用点（如命令、脚本绑定、热更新）、或配置在 S 键注册后被动态置空，会出现 nil panic。当前风险等级极低是靠调用方纪律，不是代码自身的健壮性。
 
-2. **bool 隐性安全**：所有 bool 默认值恰好为 false，掩盖了 Merge 破坏式赋值的问题；未来如果某 bool 默认值改成 true，会被静默破坏成 false（例如把 `DisablePodCounting` 默认改为 true 时就会出 bug）。
+2. **只读模式的"闸门"模式一致性**：所有危险操作（Shell、Edit、Delete、Cordon、Drain、Restart、Scale、SetImage 等）都遵循同一模式——`bindKeys` 中先判断 `!IsReadOnly()` 再调用 `bindDangerousKeys`。这种模式统一且可靠，是 K9s 权限控制的核心设计模式。但要注意：**只读模式只影响快捷键注册，不影响 API 层面的权限检查**——如果通过其他路径（如命令栏、插件）触发操作，只读模式可能不生效。
 
-3. **Validate 不完整的补位逻辑**：APIServerTimeout、ScreenDumpDir、DefaultView、ShellPod nil 等情况 Validate 不修复，依赖 Refine/Getter/入口保护等多种间接兜底，理解成本高，容易在重构时遗漏某一环。
+3. **初始化时序的确定性**：配置加载（Load + Merge + Override + Refine + Validate）**全部完成后**，才会创建和初始化视图。`Browser.Init()` 中调用 `bindKeys` 时，`IsReadOnly()`、`ShellPod`、`FeatureGates` 等配置已经是最终状态，不会出现"先注册快捷键、后加载配置"的竞态问题。这是一个设计良好的时序保障。
 
-4. **Merge 语义不一致**：全局 K9s.Merge 是破坏式全量赋值，上下文 data.Config.Merge 是温和增量合并且只处理 favorites，两种策略增加理解成本和维护难度。
+4. **bool 隐性安全**：所有 bool 默认值恰好为 false，掩盖了 Merge 破坏式赋值的问题；未来如果某 bool 默认值改成 true，会被静默破坏成 false（例如把 `DisablePodCounting` 默认改为 true 时就会出 bug）。
 
-5. **手写最小配置的"隐形破坏"**：用户手写最简配置文件时，功能表象正常，但内部字段经历了「默认值 → 零值覆盖 → 多道防线兜底」的复杂变化，调试困难，且未来新增字段时易出现回归。
+5. **Validate 不完整的补位逻辑**：APIServerTimeout、ScreenDumpDir、DefaultView、ShellPod nil 等情况 Validate 不修复，依赖 Refine/Getter/入口保护等多种间接兜底，理解成本高，容易在重构时遗漏某一环。
+
+6. **Merge 语义不一致**：全局 K9s.Merge 是破坏式全量赋值，上下文 data.Config.Merge 是温和增量合并且只处理 favorites，两种策略增加理解成本和维护难度。
+
+7. **手写最小配置的"隐形破坏"**：用户手写最简配置文件时，功能表象正常，但内部字段经历了「默认值 → 零值覆盖 → 多道防线兜底」的复杂变化，调试困难，且未来新增字段时易出现回归。
